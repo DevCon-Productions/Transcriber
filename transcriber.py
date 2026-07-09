@@ -65,11 +65,36 @@ from faster_whisper import WhisperModel
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
-CREDENTIALS_PATH = os.path.join(HERE, "credentials.json")
-LOG_DIR = os.path.join(HERE, "logs")
-TTS_VOICE_DIR = os.path.join(HERE, "tts_voices")   # Piper .onnx voice models
+def _resource_dir():
+    """Directory of bundled READ-ONLY resources. When frozen by PyInstaller this
+    is the app install dir (sys._MEIPASS / exe dir); in dev it's this file's dir."""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _user_data_dir():
+    """Per-user WRITABLE dir for config/credentials/logs. In a frozen install the
+    app lives in Program Files (read-only), so writable state goes to AppData.
+    In dev, everything stays in the project folder for convenience."""
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "Transcriber")
+        os.makedirs(d, exist_ok=True)
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+HERE = _resource_dir()                    # read-only resources (icons, voices)
+DATA_DIR = _user_data_dir()               # writable state
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CREDENTIALS_PATH = os.path.join(DATA_DIR, "credentials.json")
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+# Voices may be bundled (read-only, in HERE) or user-downloaded (writable, in
+# DATA_DIR). Prefer a user dir with voices; else fall back to the bundled one.
+_user_voices = os.path.join(DATA_DIR, "tts_voices")
+_bundled_voices = os.path.join(HERE, "tts_voices")
+TTS_VOICE_DIR = _user_voices if os.path.isdir(_user_voices) else _bundled_voices
 
 SAMPLE_RATE = 16000          # Whisper wants 16 kHz mono
 FRAME_MS = 30                # VAD frame size
@@ -95,7 +120,24 @@ def _no_window_kwargs():
     return {"creationflags": flags, "startupinfo": si}
 
 
+def _seed_from_example(target, example_name):
+    """On first run (installed build), copy a bundled *.example.json to the
+    writable data dir so the app has a starting config/credentials file."""
+    if os.path.exists(target):
+        return
+    src = os.path.join(HERE, example_name)
+    if os.path.exists(src):
+        try:
+            import shutil
+            shutil.copyfile(src, target)
+        except Exception:
+            pass
+
+
 def load_config(path=CONFIG_PATH):
+    # First run of an installed build: seed config + credentials from examples.
+    _seed_from_example(CONFIG_PATH, "config.example.json")
+    _seed_from_example(CREDENTIALS_PATH, "credentials.example.json")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 

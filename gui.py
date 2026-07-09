@@ -28,7 +28,9 @@ import tkinter.font as tkfont
 import transcriber as core
 
 # Branding assets (optional; splash/icons are skipped gracefully if missing).
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Use the same resource dir as the engine so this works both in dev and when
+# frozen into an installed .exe (assets live next to the executable).
+HERE = core.HERE
 SPLASH_LOGO = os.path.join(HERE, "OfficialLogo.png")
 TASKBAR_ICON = os.path.join(HERE, "OfficialTaskbarIcon.png")
 DEVELOPER_PHOTO = os.path.join(HERE, "Developer.png")
