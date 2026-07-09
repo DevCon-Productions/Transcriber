@@ -1,0 +1,34 @@
+# === Secrets — NEVER commit ===
+credentials.json
+
+# === Local dev tooling (not part of the app) ===
+.claude/
+
+# === Personal config (ships as config.example.json instead) ===
+config.json
+
+# === Environment / caches ===
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec.bak
+
+# === Output ===
+logs/
+
+# === TTS voice models (large; downloaded on demand) ===
+tts_voices/
+
+# === Windows / scratch ===
+.wheeltest/
+demo_config.json
+*.lnk
+Thumbs.db
+desktop.ini
+
+# === Installer build artifacts ===
+Output/
+installer/Output/
