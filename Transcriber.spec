@@ -34,14 +34,22 @@ datas += collect_data_files("piper")
 datas += collect_data_files("piper_phonemize", include_py_files=False) \
     if os.path.exists("./.venv/Lib/site-packages/piper_phonemize") else []
 
-# --- native binaries (CUDA/cuDNN via ctranslate2's nvidia wheels, etc.) ---
+# --- native binaries -----------------------------------------------------
+# NOTE: the large NVIDIA CUDA libraries (~1.9 GB) are deliberately NOT bundled.
+# The app downloads them into %APPDATA%\Transcriber\cuda on first run
+# (ensure_cuda_libraries), keeping the installer small enough for GitHub.
 binaries = []
-for pkg in ("ctranslate2", "onnxruntime", "soundcard", "proctap",
-            "nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_nvrtc"):
+for pkg in ("ctranslate2", "onnxruntime", "soundcard", "proctap"):
     try:
         binaries += collect_dynamic_libs(pkg)
     except Exception:
         pass
+
+# Belt-and-suspenders: drop anything from the nvidia packages if PyInstaller
+# pulled them in transitively. Entries are (src_path, dest_dir) tuples.
+binaries = [entry for entry in binaries
+            if "nvidia" not in str(entry[0]).lower().replace("\\", "/")
+            and "nvidia" not in str(entry[1]).lower().replace("\\", "/")]
 
 # --- hidden imports (dynamically-loaded modules PyInstaller can miss) -----
 hiddenimports = []
@@ -62,7 +70,11 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "pytest"],
+    excludes=["tkinter.test", "test", "pytest",
+              # CUDA libs are downloaded on first run, not bundled (keeps the
+              # installer small). See ensure_cuda_libraries().
+              "nvidia", "nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_nvrtc",
+              "nvidia.cuda_runtime", "nvidia.cufft", "nvidia.curand"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

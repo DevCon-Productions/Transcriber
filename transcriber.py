@@ -35,16 +35,111 @@ import datetime as dt
 # Environment bootstrap: make the pip-installed NVIDIA CUDA DLLs discoverable
 # by ctranslate2, and locate the bundled ffmpeg binary.
 # --------------------------------------------------------------------------
+def _nvidia_search_roots():
+    """All places CUDA DLLs might live: the dev venv site-packages, a frozen
+    bundle's _internal/nvidia, and the per-user CUDA dir the slim installer
+    downloads into on first run."""
+    roots = []
+    # Dev venv: .../Lib/site-packages/nvidia
+    roots.append(os.path.abspath(os.path.join(
+        os.path.dirname(sys.executable), "..", "Lib", "site-packages", "nvidia")))
+    # Frozen bundle (if CUDA was bundled): next to the exe
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        roots.append(os.path.join(base, "nvidia"))
+    # Slim-installer per-user download location
+    roots.append(os.path.join(_user_data_dir(), "cuda", "nvidia"))
+    return roots
+
+
 def add_nvidia_dll_dirs():
-    site = os.path.abspath(
-        os.path.join(os.path.dirname(sys.executable), "..", "Lib", "site-packages", "nvidia")
-    )
-    for bindir in glob.glob(os.path.join(site, "*", "bin")):
-        try:
-            os.add_dll_directory(bindir)
-        except (FileNotFoundError, OSError):
-            pass
-        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+    for site in _nvidia_search_roots():
+        for bindir in glob.glob(os.path.join(site, "*", "bin")):
+            try:
+                os.add_dll_directory(bindir)
+            except (FileNotFoundError, OSError):
+                pass
+            os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+
+
+def cuda_libraries_present():
+    """True if the core CUDA runtime DLLs (cublas + cudnn) are findable on the
+    search paths — i.e. the model can run on GPU without downloading anything."""
+    needed = ("cublas64", "cudnn64")
+    for site in _nvidia_search_roots():
+        found = {n for n in needed
+                 for _ in glob.glob(os.path.join(site, "*", "bin", n + "*.dll"))}
+        if len(found) == len(needed):
+            return True
+    return False
+
+
+# Package versions pinned to what this app was built/tested against.
+CUDA_PACKAGES = [
+    "nvidia-cublas-cu12==12.9.2.10",
+    "nvidia-cudnn-cu12==9.23.0.39",
+    "nvidia-cuda-nvrtc-cu12==12.9.86",
+]
+
+
+def ensure_cuda_libraries(status_cb=None):
+    """Slim-installer first run: if the CUDA runtime DLLs aren't present, fetch
+    them into the per-user data dir and put them on the DLL search path. Returns
+    (ok: bool, message: str). Needs internet the first time only. `status_cb(str)`
+    receives progress lines. No-op (returns True) if CUDA is already available."""
+    def say(m):
+        if status_cb:
+            try:
+                status_cb(m)
+            except Exception:
+                pass
+
+    if cuda_libraries_present():
+        return True, "CUDA libraries present."
+
+    target = os.path.join(_user_data_dir(), "cuda")
+    os.makedirs(target, exist_ok=True)
+    say("Downloading GPU libraries (one-time, ~1 GB)…")
+
+    # Install the pinned nvidia wheels into `target` using pip. Prefer a real
+    # python interpreter; in a frozen build fall back to pip's in-process API.
+    try:
+        py = _find_python_for_pip()
+        if py:
+            import subprocess
+            cmd = [py, "-m", "pip", "install", "--no-cache-dir",
+                   "--target", target] + CUDA_PACKAGES
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  **_no_window_kwargs())
+            if proc.returncode != 0:
+                return False, f"GPU library install failed:\n{proc.stderr[-800:]}"
+        else:
+            from pip._internal.cli.main import main as pip_main
+            rc = pip_main(["install", "--no-cache-dir", "--target", target]
+                          + CUDA_PACKAGES)
+            if rc != 0:
+                return False, "GPU library install failed (pip returned non-zero)."
+    except Exception as e:
+        return False, f"Could not install GPU libraries: {e}"
+
+    add_nvidia_dll_dirs()   # pick up the freshly-installed DLLs
+    if cuda_libraries_present():
+        say("GPU libraries ready.")
+        return True, "GPU libraries installed."
+    return False, "GPU libraries installed but still not found on the search path."
+
+
+def _find_python_for_pip():
+    """A python.exe we can call with -m pip. In dev that's sys.executable; in a
+    frozen build sys.executable is the app, so look for a system python."""
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    import shutil
+    for name in ("python.exe", "python3.exe", "py.exe"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
 
 
 def find_ffmpeg():
@@ -56,10 +151,10 @@ def find_ffmpeg():
         return "ffmpeg"  # fall back to a system ffmpeg on PATH
 
 
-add_nvidia_dll_dirs()
-
 import numpy as np
-from faster_whisper import WhisperModel
+# NOTE: faster_whisper / WhisperModel is imported LAZILY inside Engine.load_model
+# (after CUDA DLL dirs are set up, and after the slim-installer CUDA download).
+# Importing it eagerly here would force CUDA resolution at module load.
 
 
 # --------------------------------------------------------------------------
@@ -1539,17 +1634,32 @@ class Engine:
         return None
 
     # -- lifecycle ----------------------------------------------------------
+    def _make_whisper_model(self, model_name):
+        """Create a WhisperModel, handling first-run CUDA setup for GPU mode:
+        (1) download the CUDA runtime if the slim installer left it out,
+        (2) register the DLL directories, (3) lazily import + construct."""
+        device = self.cfg.get("device", "cuda")
+        if device == "cuda":
+            ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
+            if not ok:
+                self.out.status(msg + " Falling back to CPU (slower).")
+                device = "cpu"
+        add_nvidia_dll_dirs()
+        # Allow tests / callers to inject a WhisperModel via module attribute;
+        # otherwise import faster-whisper lazily (after CUDA is ready).
+        WM = globals().get("WhisperModel")
+        if WM is None:
+            from faster_whisper import WhisperModel as WM
+        compute = self.cfg.get("compute_type", "float16") if device == "cuda" else "int8"
+        return WM(model_name, device=device, compute_type=compute)
+
     def load_model(self):
         self.out.status(
             f"Loading Whisper '{self.cfg.get('model','large-v3')}' on "
             f"{self.cfg.get('device','cuda')}/{self.cfg.get('compute_type','float16')} ..."
         )
         t0 = time.time()
-        self.model = WhisperModel(
-            self.cfg.get("model", "large-v3"),
-            device=self.cfg.get("device", "cuda"),
-            compute_type=self.cfg.get("compute_type", "float16"),
-        )
+        self.model = self._make_whisper_model(self.cfg.get("model", "large-v3"))
         self.out.status(f"Model ready in {time.time()-t0:.1f}s.")
         self.transcriber = Transcriber(self.model, self.cfg, self.jobq,
                                        self.out, self.stop_evt)
@@ -1631,11 +1741,7 @@ class Engine:
         self.out.status(f"Loading Whisper '{model_name}' (streams keep running)...")
         t0 = time.time()
         try:
-            new_model = WhisperModel(
-                model_name,
-                device=self.cfg.get("device", "cuda"),
-                compute_type=self.cfg.get("compute_type", "float16"),
-            )
+            new_model = self._make_whisper_model(model_name)
         except Exception as e:
             msg = f"Model '{model_name}' failed to load: {e}"
             self.out.status(msg)
