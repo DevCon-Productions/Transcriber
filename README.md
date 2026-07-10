@@ -8,6 +8,15 @@ you stay muted. Multiple feeds run at once and share the GPU.
 
 Everything runs locally on your machine. No audio leaves your computer.
 
+## Requirements
+
+- **Windows 10/11, 64-bit (x64).** Not compatible with ARM devices (Windows on
+  ARM, Apple Silicon Macs) — those lack an NVIDIA GPU.
+- **An NVIDIA GPU with CUDA support.** The app transcribes on the GPU; it will
+  not run acceptably without one.
+- **Internet on first launch** — it downloads the CUDA runtime (~1 GB) and the
+  Whisper speech model (~3 GB) once, then runs fully offline.
+
 ## GUI (recommended)
 
 Double-click **`gui.bat`** for the desktop app. It has:
