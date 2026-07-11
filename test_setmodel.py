@@ -18,9 +18,11 @@ def run():
     core.WhisperModel = FakeModel
     results = {}
 
-    # Build an engine without touching audio/file logging/auth.
+    # Build an engine without touching audio/file logging/auth. Force the ct2
+    # backend so this exercises the WhisperModel hot-swap path regardless of the
+    # host architecture (on native ARM64 the default would be whisper.cpp).
     cfg = {"model": "large-v3", "device": "cuda", "compute_type": "float16",
-           "vad": {}, "filters": {}}
+           "engine": "ct2", "vad": {}, "filters": {}}
     eng = core.Engine(cfg, console=False, file_logging=False, enable_audio=False)
     eng.load_model()  # uses FakeModel
     results["initial_model"] = (eng.model.name == "large-v3")
