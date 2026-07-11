@@ -1,0 +1,24 @@
+# Windows-on-ARM64 (native) requirements.
+#
+# The x64 build uses faster-whisper (ctranslate2) + CUDA — neither has an ARM64
+# wheel. On ARM the transcription engine is whisper.cpp via pywhispercpp, selected
+# automatically at runtime (see select_backend() in transcriber.py). Install these
+# into a NATIVE ARM64 Python venv (not an emulated x64 one). See BUILD_ARM.md.
+#
+# Excluded vs requirements.txt (no ARM64 wheel / not used on ARM):
+#   ctranslate2, faster-whisper, nvidia-cublas-cu12, nvidia-cudnn-cu12,
+#   nvidia-cuda-nvrtc-cu12  (x64 + NVIDIA GPU only)
+#   proc-tap (per-app capture; absent on ARM — that source just won't appear)
+
+# --- pure-python / native ARM64 wheels available on PyPI ---
+numpy==2.4.6
+onnxruntime>=1.27.0            # Piper TTS backend; has a win_arm64 wheel
+huggingface_hub>=1.17.0
+tokenizers>=0.23.1
+av>=17.0.1
+imageio-ffmpeg==0.6.0          # bundled ffmpeg is x64 (runs emulated); or use a system ffmpeg on PATH
+
+# --- transcription engine (built from source; NO prebuilt ARM64 wheel) ---
+# Do NOT `pip install` this directly on ARM — it needs a clang toolchain and a
+# post-build rename. Use build_arm/build_pywhispercpp.bat instead.
+# pywhispercpp==1.5.0

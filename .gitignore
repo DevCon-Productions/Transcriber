@@ -9,6 +9,7 @@ config.json
 
 # === Environment / caches ===
 .venv/
+.venv-arm64/
 __pycache__/
 *.pyc
 *.pyo
@@ -21,6 +22,9 @@ logs/
 
 # === TTS voice models (large; downloaded on demand) ===
 tts_voices/
+
+# === whisper.cpp GGML models (ARM backend; downloaded on demand) ===
+whispercpp_models/
 
 # === Windows / scratch ===
 .wheeltest/

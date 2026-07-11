@@ -22,13 +22,37 @@ import re
 import sys
 import glob
 import json
+import math
 import time
 import queue
 import base64
+import platform
 import threading
 import subprocess
 import collections
 import datetime as dt
+
+
+# --------------------------------------------------------------------------
+# Interpreter architecture.
+#
+# On Windows-on-ARM, platform.machine() is NOT a reliable signal for the running
+# interpreter: an EMULATED x64 Python reports 'ARM64' too (machine() reflects the
+# host, not the process). The real process architecture is in
+# PROCESSOR_ARCHITECTURE -- 'AMD64' for an emulated/native x64 process, 'ARM64'
+# only for a native ARM64 one. We key CUDA and backend selection off THIS, so an
+# x64 build running emulated on an ARM box still (correctly) uses the CUDA/
+# ctranslate2 path that its amd64 wheels support.
+# --------------------------------------------------------------------------
+def interpreter_is_arm64():
+    """True only if this Python process is a native ARM64 build (not emulated x64)."""
+    proc = os.environ.get("PROCESSOR_ARCHITECTURE", "").upper()
+    if proc in ("AMD64", "X86", "X64", "IA64"):
+        return False
+    if proc in ("ARM64", "AARCH64"):
+        return True
+    # Fallback (non-Windows / unusual): trust platform.machine().
+    return platform.machine().lower() in ("arm64", "aarch64")
 
 
 # --------------------------------------------------------------------------
@@ -53,6 +77,8 @@ def _nvidia_search_roots():
 
 
 def add_nvidia_dll_dirs():
+    if interpreter_is_arm64():
+        return                      # no CUDA on ARM; whisper.cpp uses CPU/NPU
     for site in _nvidia_search_roots():
         for bindir in glob.glob(os.path.join(site, "*", "bin")):
             try:
@@ -94,6 +120,9 @@ def ensure_cuda_libraries(status_cb=None):
             except Exception:
                 pass
 
+    if interpreter_is_arm64():
+        # No CUDA on Windows-on-ARM; the whisper.cpp backend runs on CPU/NPU.
+        return True, "CUDA not applicable on ARM (using CPU/NPU backend)."
     if cuda_libraries_present():
         return True, "CUDA libraries present."
 
@@ -1523,7 +1552,164 @@ def _collapse_repeats(text):
 
 
 # --------------------------------------------------------------------------
-# Transcription worker: single shared GPU model serving all streams
+# Transcription backends.
+#
+# The rest of the app talks to ONE object with a faster-whisper-shaped
+# `.transcribe(audio, **kw) -> (segments, info)` API, where each segment exposes
+# `.text`, `.no_speech_prob`, and `.avg_logprob`. Two implementations:
+#   * faster-whisper / ctranslate2 -- default on x64 (GPU or CPU). Its
+#     WhisperModel already has exactly this shape, so it's used directly.
+#   * whisper.cpp via pywhispercpp  -- default on native ARM64, where ctranslate2
+#     has no wheel. Runs on CPU/NPU. `WhisperCppBackend` adapts it to the shape.
+# `Engine._make_whisper_model()` picks one; `Transcriber` and the anti-
+# hallucination filters are backend-agnostic because the shape is identical.
+# --------------------------------------------------------------------------
+def select_backend(cfg):
+    """'ct2' (faster-whisper) or 'whispercpp'. Explicit cfg['engine'] wins;
+    otherwise 'whispercpp' on a native-ARM64 interpreter (no ctranslate2 wheel),
+    'ct2' elsewhere. Keys off the real process arch, NOT platform.machine()
+    (see interpreter_is_arm64)."""
+    engine = str(cfg.get("engine") or "").strip().lower()
+    if engine in ("ct2", "ctranslate2", "faster-whisper", "faster_whisper"):
+        return "ct2"
+    if engine in ("whispercpp", "whisper.cpp", "whisper_cpp", "pywhispercpp"):
+        return "whispercpp"
+    return "whispercpp" if interpreter_is_arm64() else "ct2"
+
+
+# faster-whisper model id -> nearest whisper.cpp (GGML) model name. whisper.cpp
+# ships its own GGML files (see pywhispercpp AVAILABLE_MODELS); faster-whisper's
+# "distil-*" models have no GGML build, so they map to the closest standard one.
+_WHISPERCPP_MODEL_MAP = {
+    "large-v3": "large-v3", "large-v2": "large-v2", "large-v1": "large-v1",
+    "large-v3-turbo": "large-v3-turbo",
+    "medium": "medium", "medium.en": "medium.en",
+    "small": "small", "small.en": "small.en",
+    "base": "base", "base.en": "base.en",
+    "tiny": "tiny", "tiny.en": "tiny.en",
+    "distil-large-v3": "large-v3-turbo", "distil-large-v2": "large-v2",
+    "distil-medium.en": "medium.en", "distil-small.en": "small.en",
+}
+# CPU/NPU inference is far slower than the x64 GPU path, so ARM configs should
+# choose a small/quantized model; this is the fallback when a name can't be mapped.
+ARM_DEFAULT_MODEL = "small.en-q5_1"
+
+
+def whispercpp_model_name(name):
+    """Resolve an app model id to a valid whisper.cpp GGML model name."""
+    try:
+        from pywhispercpp import constants as _c
+        avail = set(getattr(_c, "AVAILABLE_MODELS", []))
+    except Exception:
+        avail = set()
+    if not avail:                       # can't validate -> best-effort passthrough
+        return _WHISPERCPP_MODEL_MAP.get(name, name)
+    if name in avail:
+        return name
+    mapped = _WHISPERCPP_MODEL_MAP.get(name)
+    if mapped in avail:
+        return mapped
+    return ARM_DEFAULT_MODEL if ARM_DEFAULT_MODEL in avail else "small.en"
+
+
+class _WCSegment:
+    """A faster-whisper-shaped segment (only the fields Transcriber reads)."""
+    __slots__ = ("text", "no_speech_prob", "avg_logprob")
+
+    def __init__(self, text, no_speech_prob, avg_logprob):
+        self.text = text
+        self.no_speech_prob = no_speech_prob
+        self.avg_logprob = avg_logprob
+
+
+def _map_whispercpp_segments(segs):
+    """Adapt pywhispercpp Segments -> faster-whisper-shaped segments.
+
+    pywhispercpp gives one confidence number per segment: `probability`, the
+    geometric mean of token probabilities in [0, 1] (NaN if not computed). Whisper
+    proper exposes two independent numbers the filters use -- avg_logprob and
+    no_speech_prob -- which whisper.cpp doesn't surface per segment. Synthesize
+    both from `probability` p:
+        avg_logprob    = log(p)   -> the min_avg_logprob gate drops low-confidence
+                                     garbage (p < e^-1 ~= 0.37 with the default).
+        no_speech_prob = 1 - p    -> keeps the phrase anti-hallucination filter
+                                     (needs no_speech_prob > 0.35) meaningful; only
+                                     marginally stricter than the logprob gate.
+    A NaN probability -> neutral scores that pass both gates, so nothing is dropped
+    merely for lacking a confidence number."""
+    out = []
+    for s in segs:
+        try:
+            p = float(getattr(s, "probability", float("nan")))
+        except (TypeError, ValueError):
+            p = float("nan")
+        if p != p:                      # NaN
+            no_speech, avg_logprob = 0.0, 0.0
+        else:
+            p = min(max(p, 0.0), 1.0)
+            no_speech = 1.0 - p
+            avg_logprob = math.log(p) if p > 0.0 else -10.0
+        out.append(_WCSegment(getattr(s, "text", ""), no_speech, avg_logprob))
+    return out
+
+
+class WhisperCppBackend:
+    """whisper.cpp (via pywhispercpp) with a faster-whisper-shaped transcribe().
+
+    Default backend on native Windows-on-ARM, where ctranslate2 (and thus
+    faster-whisper) has no wheel. Runs on CPU/NPU. GGML model files are downloaded
+    on first use into a writable models dir. `model=` lets tests inject a fake."""
+    def __init__(self, model_name, cfg, status_cb=None, model=None):
+        self.cfg = cfg
+        self._status = status_cb
+        self._n_threads = int(cfg.get("n_threads") or max(1, (os.cpu_count() or 4)))
+        self._lang = cfg.get("language", "en") or "en"
+        if model is not None:                 # injected (tests) -- skip real load
+            self._model = model
+            return
+        from pywhispercpp.model import Model
+        wname = whispercpp_model_name(model_name)
+        models_dir = cfg.get("whispercpp_models_dir") or os.path.join(
+            DATA_DIR, "whispercpp_models")
+        os.makedirs(models_dir, exist_ok=True)
+        if status_cb:
+            status_cb(f"Loading whisper.cpp model '{wname}' "
+                      f"({self._n_threads} threads)...")
+        self._model = Model(
+            model=wname, models_dir=models_dir,
+            redirect_whispercpp_logs_to=False,
+            n_threads=self._n_threads, print_progress=False,
+            print_realtime=False,
+        )
+
+    def transcribe(self, audio, language=None, initial_prompt=None,
+                   no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                   compression_ratio_threshold=2.4, **_ignored):
+        """Mirror faster-whisper's WhisperModel.transcribe signature + return
+        shape. Unmapped kwargs (beam_size, vad_filter, temperature,
+        condition_on_previous_text, no_repeat_ngram_size, ...) are accepted and
+        ignored -- whisper.cpp handles the equivalents internally or upstream."""
+        a = np.ascontiguousarray(audio, dtype=np.float32)
+        segs = self._model.transcribe(
+            a,
+            language=language or self._lang,
+            initial_prompt=initial_prompt or "",
+            no_context=True,                    # == condition_on_previous_text=False
+            translate=False,
+            print_progress=False,
+            single_segment=False,
+            no_speech_thold=float(no_speech_threshold),
+            logprob_thold=float(log_prob_threshold),
+            entropy_thold=float(compression_ratio_threshold),
+            temperature=0.0,
+            extract_probability=True,
+        )
+        info = {"language": language or self._lang, "backend": "whispercpp"}
+        return _map_whispercpp_segments(segs), info
+
+
+# --------------------------------------------------------------------------
+# Transcription worker: single shared model serving all streams
 # --------------------------------------------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, model, cfg, jobq, out, stop_evt):
@@ -1635,9 +1821,14 @@ class Engine:
 
     # -- lifecycle ----------------------------------------------------------
     def _make_whisper_model(self, model_name):
-        """Create a WhisperModel, handling first-run CUDA setup for GPU mode:
+        """Build the transcription backend for `model_name`. On native ARM64 (or
+        when cfg['engine'] selects it) this is the whisper.cpp backend; otherwise
+        faster-whisper / ctranslate2 with first-run CUDA setup:
         (1) download the CUDA runtime if the slim installer left it out,
         (2) register the DLL directories, (3) lazily import + construct."""
+        if select_backend(self.cfg) == "whispercpp":
+            return WhisperCppBackend(model_name, self.cfg, status_cb=self.out.status)
+        # -- faster-whisper / ctranslate2 (x64; GPU or CPU) --
         device = self.cfg.get("device", "cuda")
         if device == "cuda":
             ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
@@ -1654,10 +1845,16 @@ class Engine:
         return WM(model_name, device=device, compute_type=compute)
 
     def load_model(self):
-        self.out.status(
-            f"Loading Whisper '{self.cfg.get('model','large-v3')}' on "
-            f"{self.cfg.get('device','cuda')}/{self.cfg.get('compute_type','float16')} ..."
-        )
+        if select_backend(self.cfg) == "whispercpp":
+            self.out.status(
+                f"Loading Whisper '{self.cfg.get('model','large-v3')}' via "
+                f"whisper.cpp (CPU/NPU) ..."
+            )
+        else:
+            self.out.status(
+                f"Loading Whisper '{self.cfg.get('model','large-v3')}' on "
+                f"{self.cfg.get('device','cuda')}/{self.cfg.get('compute_type','float16')} ..."
+            )
         t0 = time.time()
         self.model = self._make_whisper_model(self.cfg.get("model", "large-v3"))
         self.out.status(f"Model ready in {time.time()-t0:.1f}s.")
