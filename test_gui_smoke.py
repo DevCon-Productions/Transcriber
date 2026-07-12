@@ -16,6 +16,7 @@ class FakeEngine:
         self._listen = None
         self.cfg = {"model": "tiny"}
         self.set_model_calls = []
+        self.set_device_calls = []
     def load_model(self): pass
     def start_streams(self, streams): self.added += [s["name"] for s in streams]
     def add_stream(self, s): self.added.append(s["name"]); return True
@@ -29,6 +30,12 @@ class FakeEngine:
         self.cfg["model"] = name
         if on_done:
             on_done(True, f"Switched to '{name}'.")
+    def set_device(self, device, on_done=None):
+        # Simulate success: record + update cfg + invoke callback synchronously.
+        self.set_device_calls.append(device)
+        self.cfg["device"] = device
+        if on_done:
+            on_done(True, f"Switched to {device}.")
     def change_device(self, stream, new_device):
         if isinstance(new_device, str):
             stream["output_device"] = new_device
@@ -45,7 +52,7 @@ def run():
 
     # Give it a known stream set.
     core.load_config = lambda *a, **k: {
-        "model": "tiny", "vad": {}, "filters": {},
+        "model": "tiny", "engine": "ct2", "vad": {}, "filters": {},
         "streams": [
             {"name": "West", "url": "https://audio.broadcastify.com/25008.mp3",
              "color": "cyan", "provider": "broadcastify"},
@@ -327,6 +334,21 @@ def run():
         # Selecting the already-current model is a no-op (no extra set_model call).
         app._on_model_change()
         results["no_redundant_swap"] = (app.engine.set_model_calls == ["large-v3"])
+
+        # --- Device picker (new) ---------------------------------------------
+        from gui import DEVICE_CHOICES
+        results["device_choices_present"] = (DEVICE_CHOICES == ["Auto", "GPU", "CPU"])
+        # Built on the ct2 backend (cfg engine='ct2'); hidden on whisper.cpp/ARM.
+        results["device_combo_built"] = (app.device_combo is not None)
+        app.device_var.set("CPU")
+        app._on_device_change()
+        results["device_persisted_to_cfg"] = (app.cfg.get("device") == "cpu")
+        results["device_combo_disabled_loading"] = (
+            str(app.device_combo.cget("state")) == "disabled")
+        results["set_device_called"] = (app.engine.set_device_calls == ["cpu"])
+        app._drain_events()   # process device_done -> re-enable the picker
+        results["device_combo_reenabled"] = (
+            str(app.device_combo.cget("state")) == "readonly")
 
         # --- Update check result handling (new) ------------------------------
         # Capture popups instead of showing them.

@@ -47,7 +47,54 @@ def run():
     results["model_retained_on_fail"] = (eng.model.name == "distil-large-v3")
     results["cfg_retained_on_fail"] = (eng.cfg["model"] == "distil-large-v3")
 
+    # force=True reloads even when the model name is unchanged (used by set_device).
+    before = id(eng.model)
+    outf = {}
+    eng.set_model(eng.cfg["model"], on_done=lambda ok, msg: outf.update(ok=ok), force=True)
+    results["force_reload_same_model"] = (outf.get("ok") is True and id(eng.model) != before)
+
     eng.shutdown()
+
+    # --- device resolution + CPU fallback (ct2/x64 path) --------------------
+    # A model that fails to construct on CUDA (simulates a CPU-only / Intel Arc
+    # machine). Stub ensure_cuda_libraries so the test never touches the network.
+    class GpuFailModel:
+        def __init__(self, name, device=None, compute_type=None, **k):
+            if device == "cuda":
+                raise RuntimeError("no CUDA-capable device is detected")
+            self.name, self.device, self.compute_type = name, device, compute_type
+
+    saved_ensure = core.ensure_cuda_libraries
+    core.ensure_cuda_libraries = lambda status_cb=None: (True, "stub")
+    try:
+        core.WhisperModel = GpuFailModel
+        # device 'cuda' but no usable GPU -> auto CPU fallback (no crash), int8.
+        eng_gpu = core.Engine({"model": "small", "device": "cuda", "engine": "ct2",
+                               "vad": {}, "filters": {}},
+                              console=False, file_logging=False, enable_audio=False)
+        m = eng_gpu._make_whisper_model("small")
+        results["gpu_fail_falls_back_to_cpu"] = (m.device == "cpu" and m.compute_type == "int8")
+        eng_gpu.shutdown()
+
+        # explicit device 'cpu' -> straight to CPU, no GPU probe.
+        eng_cpu = core.Engine({"model": "small", "device": "cpu", "engine": "ct2",
+                               "vad": {}, "filters": {}},
+                              console=False, file_logging=False, enable_audio=False)
+        results["device_cpu_direct"] = (eng_cpu._make_whisper_model("small").device == "cpu")
+        eng_cpu.shutdown()
+    finally:
+        core.ensure_cuda_libraries = saved_ensure
+        core.WhisperModel = FakeModel
+
+    # set_device is a no-op on the whisper.cpp backend (device fixed to CPU/NPU).
+    eng_arm = core.Engine({"model": "small", "engine": "whispercpp",
+                           "vad": {}, "filters": {}},
+                          console=False, file_logging=False, enable_audio=False)
+    eng_arm.model = "SENTINEL"
+    outd = {}
+    eng_arm.set_device("cpu", on_done=lambda ok, msg: outd.update(ok=ok))
+    results["setdevice_noop_on_whispercpp"] = (outd.get("ok") is True and eng_arm.model == "SENTINEL")
+    eng_arm.shutdown()
 
     print("RESULTS:")
     ok = True
