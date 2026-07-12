@@ -1823,26 +1823,44 @@ class Engine:
     def _make_whisper_model(self, model_name):
         """Build the transcription backend for `model_name`. On native ARM64 (or
         when cfg['engine'] selects it) this is the whisper.cpp backend; otherwise
-        faster-whisper / ctranslate2 with first-run CUDA setup:
-        (1) download the CUDA runtime if the slim installer left it out,
-        (2) register the DLL directories, (3) lazily import + construct."""
+        faster-whisper / ctranslate2. The device is resolved from cfg['device']
+        ('auto'|'cuda'/'gpu'|'cpu'): GPU mode does first-run CUDA setup and, if the
+        GPU can't actually be constructed, falls back to CPU rather than hard-
+        failing (ctranslate2's only GPU backend is CUDA/NVIDIA -- a CPU-only or
+        Intel Arc machine has no usable GPU here)."""
         if select_backend(self.cfg) == "whispercpp":
             return WhisperCppBackend(model_name, self.cfg, status_cb=self.out.status)
-        # -- faster-whisper / ctranslate2 (x64; GPU or CPU) --
-        device = self.cfg.get("device", "cuda")
-        if device == "cuda":
-            ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
-            if not ok:
-                self.out.status(msg + " Falling back to CPU (slower).")
-                device = "cpu"
-        add_nvidia_dll_dirs()
+
+        # -- faster-whisper / ctranslate2 (x64; NVIDIA GPU or CPU) --
         # Allow tests / callers to inject a WhisperModel via module attribute;
         # otherwise import faster-whisper lazily (after CUDA is ready).
         WM = globals().get("WhisperModel")
         if WM is None:
             from faster_whisper import WhisperModel as WM
-        compute = self.cfg.get("compute_type", "float16") if device == "cuda" else "int8"
-        return WM(model_name, device=device, compute_type=compute)
+
+        device = str(self.cfg.get("device", "cuda")).strip().lower()
+        want_gpu = device in ("", "auto", "cuda", "gpu")   # 'cpu' -> straight to CPU
+
+        if want_gpu:
+            ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
+            if not ok:
+                self.out.status(msg + " Falling back to CPU (slower).")
+                want_gpu = False
+        add_nvidia_dll_dirs()
+
+        if want_gpu:
+            compute = self.cfg.get("compute_type", "float16")
+            try:
+                return WM(model_name, device="cuda", compute_type=compute)
+            except Exception as e:
+                # No usable CUDA device (CPU-only or Intel Arc machine, etc.).
+                # Use CPU instead of crashing at load. Set "device": "cpu" in
+                # config to skip this probe entirely.
+                self.out.status(
+                    f"GPU unavailable ({e}); using CPU (slower). "
+                    "Tip: pick a smaller model (e.g. base.en) for good CPU speed."
+                )
+        return WM(model_name, device="cpu", compute_type="int8")
 
     def load_model(self):
         if select_backend(self.cfg) == "whispercpp":
@@ -1923,15 +1941,18 @@ class Engine:
         if self._ensure_tts():
             self.tts.say(text)
 
-    def set_model(self, model_name, on_done=None):
+    def set_model(self, model_name, on_done=None, force=False):
         """
         Swap the Whisper model at runtime WITHOUT stopping the streams. Loads the
         new model (blocking -- call this from a background thread), then atomically
         hot-swaps the reference the transcriber reads. on_done(ok, message) is
         invoked when finished. Safe because the worker reads self.model once per
         transmission, so the reference swap takes effect on its next job.
+
+        `force=True` reloads even when the model name is unchanged (used by
+        set_device, which reloads the current model on a new device).
         """
-        if model_name == self.cfg.get("model"):
+        if model_name == self.cfg.get("model") and not force:
             if on_done:
                 on_done(True, f"Already using '{model_name}'.")
             return
@@ -1955,6 +1976,17 @@ class Engine:
         self.out.status(msg)
         if on_done:
             on_done(True, msg)
+
+    def set_device(self, device, on_done=None):
+        """Change the compute device ('auto'|'cuda'/'gpu'|'cpu') and reload the
+        current model live so it takes effect. No-op on the whisper.cpp backend
+        (always CPU/NPU -- it ignores the device). Call from a background thread."""
+        self.cfg["device"] = device
+        if select_backend(self.cfg) == "whispercpp":
+            if on_done:
+                on_done(True, "Device is fixed to CPU/NPU on the whisper.cpp backend.")
+            return
+        self.set_model(self.cfg.get("model", "large-v3"), on_done=on_done, force=True)
 
     def start_streams(self, streams):
         for s in streams:

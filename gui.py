@@ -176,6 +176,14 @@ class CheckBox(tk.Label):
 # faster. Switching downloads the model once (cached) and hot-swaps live.
 MODEL_CHOICES = ["large-v3", "large-v3-turbo", "distil-large-v3", "medium", "small"]
 
+# Compute device selectable in the GUI (faster-whisper / x64 path only). "Auto"
+# tries the GPU and falls back to CPU; "GPU" forces CUDA (NVIDIA); "CPU" runs on
+# the CPU. Irrelevant on the whisper.cpp/ARM backend (always CPU/NPU), so the
+# picker is hidden there.
+DEVICE_CHOICES = ["Auto", "GPU", "CPU"]
+_DEVICE_LABEL_TO_CFG = {"Auto": "auto", "GPU": "cuda", "CPU": "cpu"}
+_DEVICE_CFG_TO_LABEL = {"auto": "Auto", "cuda": "GPU", "gpu": "GPU", "cpu": "CPU"}
+
 # Built-in catalog of feeds verified working this session (Greater Cleveland).
 # Users pick from these in "Add from catalog..." instead of pasting URLs.
 FEED_CATALOG = [
@@ -944,6 +952,8 @@ class TranscriberGUI:
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
+        self.device_var = tk.StringVar(value=_DEVICE_CFG_TO_LABEL.get(
+            str(self.cfg.get("device", "cuda")).lower(), "GPU"))
         self.listen_var = tk.StringVar(value="(none)")
         self.streams = list(self.cfg.get("streams", []))
         self.library = self._seed_library()   # persistent catalog of saved feeds
@@ -1195,6 +1205,16 @@ class TranscriberGUI:
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
         tk.Label(bar2, text="Model:", bg=BG2, fg=MUTED).pack(side="right")
 
+        # Device picker -- faster-whisper/x64 path only. On the whisper.cpp/ARM
+        # backend the device is always CPU/NPU, so don't show a control for it.
+        self.device_combo = None
+        if core.select_backend(self.cfg) != "whispercpp":
+            self.device_combo = ttk.Combobox(bar2, textvariable=self.device_var,
+                                             values=DEVICE_CHOICES, state="readonly", width=6)
+            self.device_combo.pack(side="right", padx=6, pady=3)
+            self.device_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+            tk.Label(bar2, text="Device:", bg=BG2, fg=MUTED).pack(side="right")
+
         self.update_btn = tk.Button(bar2, text="Check updates",
                                     command=self._check_updates_manual,
                                     bg=BG2, fg=FG, relief="flat")
@@ -1443,6 +1463,11 @@ class TranscriberGUI:
                     else:
                         # Revert the dropdown to whatever is actually loaded.
                         self.model_var.set(self.engine.cfg.get("model", "large-v3"))
+                    self._set_status(msg)
+                elif kind == "device_done":
+                    ok, msg, label = payload
+                    if self.device_combo is not None:
+                        self.device_combo.config(state="readonly")
                     self._set_status(msg)
                 elif kind == "update_result":
                     results, manual = payload
@@ -1788,6 +1813,25 @@ class TranscriberGUI:
 
         threading.Thread(
             target=lambda: self.engine.set_model(target, on_done=done),
+            daemon=True).start()
+
+    def _on_device_change(self, _evt=None):
+        """Switch the compute device (GPU/CPU/Auto) live. Reloads the model on a
+        bg thread; feeds keep running. Persists the choice to config.json."""
+        label = self.device_var.get()
+        device = _DEVICE_LABEL_TO_CFG.get(label, "auto")
+        self.cfg["device"] = device
+        self._save_cfg()                         # persist the choice
+        if not self.engine:
+            return
+        self.device_combo.config(state="disabled")
+        self._set_status(f"Switching to {label} (reloading model, feeds keep running)...")
+
+        def done(ok, msg):
+            self.events.put(("device_done", (ok, msg, label)))
+
+        threading.Thread(
+            target=lambda: self.engine.set_device(device, on_done=done),
             daemon=True).start()
 
     # ----- update checks ---------------------------------------------------
