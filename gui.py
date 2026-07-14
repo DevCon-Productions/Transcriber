@@ -641,8 +641,9 @@ class TTSDialog(tk.Toplevel):
         self.transient(parent)
 
         if not core.tts_available():
-            tk.Label(self, text="Text-to-speech isn't available.\nNo Piper voice "
-                     "model found in tts_voices/.", bg=BG, fg=FG, justify="left",
+            tk.Label(self, text="Text-to-speech isn't available on this system.\n"
+                     "Install a Windows voice, or add a Piper .onnx voice to "
+                     "tts_voices/.", bg=BG, fg=FG, justify="left",
                      font=("Segoe UI", 10)).pack(padx=16, pady=20)
             tk.Button(self, text="Close", command=self.destroy, bg=BG2, fg=FG,
                       relief="flat").pack(pady=8)
