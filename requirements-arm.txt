@@ -12,11 +12,13 @@
 
 # --- pure-python / native ARM64 wheels available on PyPI ---
 numpy==2.4.6
-onnxruntime>=1.27.0            # Piper TTS backend; has a win_arm64 wheel
+onnxruntime>=1.27.0            # transcription filters / Piper (if built); win_arm64 wheel
 huggingface_hub>=1.17.0
 tokenizers>=0.23.1
 av>=17.0.1
 imageio-ffmpeg==0.6.0          # bundled ffmpeg is x64 (runs emulated); or use a system ffmpeg on PATH
+sounddevice>=0.5.5            # audio playback ("listen to feed") + TTS output; win_arm64 wheel
+comtypes>=1.4.16             # Windows SAPI5 TTS backend (pure-python; Piper's espeak-ng has no ARM build)
 
 # --- transcription engine (built from source; NO prebuilt ARM64 wheel) ---
 # Do NOT `pip install` this directly on ARM — it needs a clang toolchain and a

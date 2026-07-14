@@ -689,14 +689,22 @@ class AudioPlayer:
 
 
 # --------------------------------------------------------------------------
-# Text-to-speech: reads selected transcript lines aloud in a clear neural voice
-# (Piper). A background thread pulls text off a queue and synthesizes+plays it
-# one utterance at a time so nothing overlaps. Lazy-loads Piper so the app runs
-# fine without TTS. Speaks via sounddevice (separate stream from AudioPlayer).
+# Text-to-speech: reads selected transcript lines aloud. A background thread
+# pulls text off a queue and synthesizes+plays it one utterance at a time so
+# nothing overlaps. Two engines (Piper neural voices, or Windows SAPI5 which is
+# native on ARM64); selected at runtime. Lazy so the app runs fine without TTS.
+# Speaks via sounddevice (separate stream from AudioPlayer).
 # --------------------------------------------------------------------------
-def list_tts_voices():
-    """Return [(voice_id, path)] of downloaded Piper voices (*.onnx) in the voice
-    dir. voice_id is the filename stem (e.g. 'en_US-lessac-medium')."""
+# Two synthesis engines, chosen at runtime:
+#   * Piper (neural, .onnx voices) -- default on x64; needs a compiled espeak-ng
+#     phonemizer that has NO Windows-ARM64 build.
+#   * Windows SAPI5 (via comtypes) -- native everywhere on Windows incl. ARM64,
+#     no compilation; uses the OS voices (e.g. Microsoft David / Zira).
+# The app calls list_tts_voices()/tts_available() (engine-aware) and TTSPlayer;
+# the synth backend is created ON the TTS thread (SAPI is COM -> single-threaded).
+def _piper_voices():
+    """[(voice_id, path)] of downloaded Piper voices (*.onnx). voice_id is the
+    filename stem (e.g. 'en_US-lessac-medium')."""
     out = []
     if os.path.isdir(TTS_VOICE_DIR):
         for p in sorted(glob.glob(os.path.join(TTS_VOICE_DIR, "*.onnx"))):
@@ -704,12 +712,118 @@ def list_tts_voices():
     return out
 
 
-def tts_available():
+def _piper_usable():
+    """True only if Piper can actually synthesize here: importable, a voice
+    present, AND its compiled espeak-ng phonemizer available (absent on ARM64)."""
     try:
         import piper  # noqa: F401
-        return len(list_tts_voices()) > 0
     except Exception:
         return False
+    if not _piper_voices():
+        return False
+    import importlib.util
+    return (importlib.util.find_spec("piper.espeakbridge") is not None
+            or importlib.util.find_spec("piper_phonemize") is not None)
+
+
+def _sapi_voices():
+    """[(name, name)] of installed Windows SAPI5 voices (empty off-Windows / on
+    failure). Creates a transient COM object; released immediately."""
+    try:
+        import comtypes.client
+        toks = comtypes.client.CreateObject("SAPI.SpVoice").GetVoices()
+        return [(toks.Item(i).GetDescription(), toks.Item(i).GetDescription())
+                for i in range(toks.Count)]
+    except Exception:
+        return []
+
+
+def _sapi_usable():
+    return len(_sapi_voices()) > 0
+
+
+def select_tts_engine(cfg_tts=None):
+    """'piper' or 'sapi'. Explicit tts['engine'] ('piper'|'sapi') wins; 'auto'
+    (default) prefers Piper where it can synthesize, else Windows SAPI5."""
+    pref = str((cfg_tts or {}).get("engine", "auto")).strip().lower()
+    if pref in ("piper", "sapi"):
+        return pref
+    if _piper_usable():
+        return "piper"
+    if _sapi_usable():
+        return "sapi"
+    return "piper"
+
+
+def list_tts_voices(engine=None, cfg_tts=None):
+    """Voices for the selected engine as [(voice_id, detail)]. Piper -> (stem,
+    path); SAPI -> (description, description)."""
+    engine = engine or select_tts_engine(cfg_tts)
+    return _sapi_voices() if engine == "sapi" else _piper_voices()
+
+
+def tts_available(cfg_tts=None):
+    """True if the selected TTS engine can actually speak on this system."""
+    return (_sapi_usable() if select_tts_engine(cfg_tts) == "sapi"
+            else _piper_usable())
+
+
+# -- synth backends: built and used on the TTS thread; expose synthesize(text)
+#    -> int16 mono np.ndarray and a `sample_rate` / `voice_id`. -----------------
+class _PiperSynth:
+    engine = "piper"
+
+    def __init__(self, voice_id):
+        from piper import PiperVoice
+        voices = dict(_piper_voices())
+        if not voices:
+            raise RuntimeError("no Piper voice models in tts_voices/")
+        self.voice_id = voice_id if voice_id in voices else next(iter(voices))
+        self._voice = PiperVoice.load(voices[self.voice_id])
+        self.sample_rate = self._voice.config.sample_rate
+
+    def synthesize(self, text):
+        chunks = [np.frombuffer(c.audio_int16_bytes, dtype=np.int16)
+                  for c in self._voice.synthesize(text)]
+        return np.concatenate(chunks) if chunks else np.zeros(0, np.int16)
+
+
+class _SapiSynth:
+    engine = "sapi"
+    sample_rate = 16000                       # SAFT16kHz16BitMono -> matches pipeline
+
+    def __init__(self, voice_id):
+        import comtypes.client
+        self._ct = comtypes.client
+        self._voice = comtypes.client.CreateObject("SAPI.SpVoice")
+        from comtypes.gen import SpeechLib     # generated by the CreateObject above
+        self._fmt_type = SpeechLib.SAFT16kHz16BitMono
+        toks = self._voice.GetVoices()
+        chosen = None
+        for i in range(toks.Count):
+            t = toks.Item(i)
+            if voice_id and voice_id == t.GetDescription():
+                chosen = t
+                break
+        if chosen is None and toks.Count:
+            chosen = toks.Item(0)
+        if chosen is None:
+            raise RuntimeError("no Windows SAPI voices installed")
+        self._voice.Voice = chosen
+        self.voice_id = chosen.GetDescription()
+
+    def synthesize(self, text):
+        stream = self._ct.CreateObject("SAPI.SpMemoryStream")
+        fmt = self._ct.CreateObject("SAPI.SpAudioFormat")
+        fmt.Type = self._fmt_type
+        stream.Format = fmt
+        self._voice.AudioOutputStream = stream
+        self._voice.Speak(text, 0)            # 0 = SVSFDefault (synchronous)
+        return np.frombuffer(bytes(stream.GetData()), dtype=np.int16)
+
+
+def _make_tts_synth(engine, voice_id):
+    return _SapiSynth(voice_id) if engine == "sapi" else _PiperSynth(voice_id)
 
 
 class TTSPlayer(threading.Thread):
@@ -718,41 +832,19 @@ class TTSPlayer(threading.Thread):
     Optional on_start(text)/on_end(text) callbacks fire around each utterance
     (used by the GUI to highlight the line currently being read)."""
     def __init__(self, voice_id=None, max_queue=6, out=None,
-                 on_start=None, on_end=None):
+                 on_start=None, on_end=None, engine=None):
         self.on_start = on_start
         self.on_end = on_end
         super().__init__(daemon=True, name="tts")
         self.q = queue.Queue(maxsize=max_queue)
         self.stop_evt = threading.Event()
         self.out = out
-        self._voice = None
+        self._engine = engine or select_tts_engine()
         self._voice_id = voice_id
+        self._synth = None                       # built on the TTS thread in run()
         self._sr = 22050
-        self._ok = self._load_voice(voice_id)
+        self._ok = tts_available({"engine": self._engine})
         self._muted = False
-
-    def _load_voice(self, voice_id):
-        try:
-            from piper import PiperVoice
-        except Exception as e:
-            if self.out:
-                self.out.status(f"TTS unavailable (piper not installed): {e}")
-            return False
-        voices = list_tts_voices()
-        if not voices:
-            if self.out:
-                self.out.status("TTS: no voice models in tts_voices/.")
-            return False
-        path = dict(voices).get(voice_id) or voices[0][1]
-        self._voice_id = voice_id or voices[0][0]
-        try:
-            self._voice = PiperVoice.load(path)
-            self._sr = self._voice.config.sample_rate
-            return True
-        except Exception as e:
-            if self.out:
-                self.out.status(f"TTS: failed to load voice: {e}")
-            return False
 
     @property
     def available(self):
@@ -781,26 +873,34 @@ class TTSPlayer(threading.Thread):
             pass
 
     def run(self):
-        import numpy as _np
         try:
             import sounddevice as sd
-        except Exception:
+        except Exception as e:
+            self._ok = False
+            if self.out:
+                self.out.status(f"TTS unavailable (no audio output): {e}")
+            return
+        # Build the synth engine ON this thread (required for SAPI/COM).
+        try:
+            self._synth = _make_tts_synth(self._engine, self._voice_id)
+            self._voice_id = self._synth.voice_id
+            self._sr = self._synth.sample_rate
+        except Exception as e:
+            self._ok = False
+            if self.out:
+                self.out.status(f"TTS: failed to load voice: {e}")
             return
         while not self.stop_evt.is_set():
             try:
                 text = self.q.get(timeout=0.3)
             except queue.Empty:
                 continue
-            if self._muted or not self._voice:
+            if self._muted:
                 continue
             try:
-                chunks = [
-                    _np.frombuffer(c.audio_int16_bytes, dtype=_np.int16)
-                    for c in self._voice.synthesize(text)
-                ]
-                if not chunks:
+                audio = self._synth.synthesize(text)
+                if audio is None or len(audio) == 0:
                     continue
-                audio = _np.concatenate(chunks)
                 if self.on_start:
                     try:
                         self.on_start(text)
@@ -1797,6 +1897,7 @@ class Engine:
         tts = cfg.get("tts", {})
         self.tts = None
         self.tts_enabled = bool(tts.get("enabled", False))
+        self.tts_engine = tts.get("engine", "auto")     # 'auto'|'piper'|'sapi'
         self.tts_voice = tts.get("voice")               # None -> first available
         self.tts_feeds = set(tts.get("feeds", []))      # stream names to speak
         self.tts_keywords = [k.lower() for k in tts.get("keywords", [])]
@@ -1886,19 +1987,23 @@ class Engine:
     # -- text-to-speech -----------------------------------------------------
     def _ensure_tts(self):
         """Create/start the TTS player if not running, or recreate it if the
-        chosen voice changed. Returns True if a working player is available."""
+        chosen voice or engine changed. Returns True if a working player is
+        available."""
+        engine = select_tts_engine({"engine": self.tts_engine})
         need_new = (self.tts is None or
-                    (self.tts_voice and self.tts._voice_id != self.tts_voice))
+                    (self.tts_voice and self.tts._voice_id != self.tts_voice) or
+                    self.tts._engine != engine)
         if need_new:
             if self.tts is not None:
                 self.tts.close()
             self.tts = TTSPlayer(voice_id=self.tts_voice, out=self.out,
-                                 on_start=self.tts_on_start, on_end=self.tts_on_end)
+                                 on_start=self.tts_on_start, on_end=self.tts_on_end,
+                                 engine=engine)
             if self.tts.available:
                 self.tts.start()
-                self.out.status(f"TTS ready (voice '{self.tts._voice_id}').")
+                self.out.status(f"TTS ready ({engine}).")
             else:
-                self.out.status("TTS could not start (no voice / piper).")
+                self.out.status("TTS could not start (no voice / engine unavailable).")
         return bool(self.tts and self.tts.available)
 
     def set_tts_voice(self, voice_id):
