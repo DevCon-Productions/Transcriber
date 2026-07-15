@@ -172,12 +172,35 @@ def _find_python_for_pip():
 
 
 def find_ffmpeg():
-    # Prefer the ffmpeg bundled by the imageio-ffmpeg pip package (no PATH needed).
+    """Path to an ffmpeg binary, in preference order:
+    1. the one bundled by the imageio-ffmpeg pip package (x64 only -- that package
+       has no ARM64 wheel, so this simply misses on ARM),
+    2. an ffmpeg shipped with the app (bin/ next to it, or the user data dir) --
+       this is the ARM path; see BUILD_ARM.md for staging a native ARM64 build,
+    3. whatever is on PATH."""
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
-        return "ffmpeg"  # fall back to a system ffmpeg on PATH
+        pass
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for d in (os.path.join(HERE, "bin"), HERE, os.path.join(DATA_DIR, "bin")):
+        p = os.path.join(d, exe)
+        if os.path.isfile(p):
+            return p
+    return "ffmpeg"  # fall back to a system ffmpeg on PATH
+
+
+def ffmpeg_available(ffmpeg=None):
+    """True if the resolved ffmpeg can actually be executed. URL/stream feeds need
+    it -- without it every StreamWorker just loops on 'ffmpeg launch failed', so the
+    Engine warns once up front instead."""
+    try:
+        proc = subprocess.run([ffmpeg or find_ffmpeg(), "-version"],
+                              capture_output=True, timeout=10, **_no_window_kwargs())
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 
 import numpy as np
@@ -2197,6 +2220,13 @@ class Engine:
         self.set_model(self.cfg.get("model", "large-v3"), on_done=on_done, force=True)
 
     def start_streams(self, streams):
+        # URL feeds are decoded by ffmpeg. If it's missing, say so ONCE here rather
+        # than letting every worker loop on "ffmpeg launch failed / reconnecting".
+        if any(s.get("type") not in ("pcaudio", "app") for s in streams
+               if is_enabled(s)) and not ffmpeg_available(self.ffmpeg):
+            self.out.status(
+                "WARNING: ffmpeg not found -- URL/stream feeds cannot be decoded. "
+                "Put ffmpeg.exe in the app's bin/ folder or install it on PATH.")
         for s in streams:
             if is_enabled(s):
                 self.add_stream(s)

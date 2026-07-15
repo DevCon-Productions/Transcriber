@@ -26,6 +26,9 @@ tts_voices/
 # === whisper.cpp GGML models (ARM backend; downloaded on demand) ===
 whispercpp_models/
 
+# === Bundled ffmpeg (large binary; staged per-platform, see BUILD_ARM.md) ===
+bin/
+
 # === Windows / scratch ===
 .wheeltest/
 demo_config.json

@@ -10,12 +10,31 @@ Everything runs locally on your machine. No audio leaves your computer.
 
 ## Requirements
 
-- **Windows 10/11, 64-bit (x64).** Not compatible with ARM devices (Windows on
-  ARM, Apple Silicon Macs) — those lack an NVIDIA GPU.
-- **An NVIDIA GPU with CUDA support.** The app transcribes on the GPU; it will
-  not run acceptably without one.
-- **Internet on first launch** — it downloads the CUDA runtime (~1 GB) and the
-  Whisper speech model (~3 GB) once, then runs fully offline.
+**Windows 10/11, 64-bit.** Both x64 and ARM64 are supported — the app picks its
+transcription engine to match:
+
+| | **x64 (recommended)** | **Windows on ARM (Snapdragon)** |
+|---|---|---|
+| Engine | faster-whisper (ctranslate2) | whisper.cpp (pywhispercpp) |
+| Compute | NVIDIA GPU (CUDA), or CPU | CPU |
+| Model | large-v3 works well on GPU | use a small one (`base.en` / `small.en`) |
+| Setup | `gui.bat` | build from source — see **[BUILD_ARM.md](BUILD_ARM.md)** |
+
+- **An NVIDIA GPU with CUDA support** is recommended on x64 — large-v3 across
+  several feeds needs one. Without a GPU the app now falls back to the CPU
+  automatically (pick **Device: CPU** and a smaller model in the toolbar); note
+  large-v3 on CPU runs at roughly real time or slower, so choose `base.en`/`small.en`.
+- **ARM64 has no CUDA** (there's no NVIDIA GPU); it runs whisper.cpp on the CPU,
+  which is comfortably faster than real time with a small English model.
+- **Internet on first launch** — it downloads the speech model once (and, on x64
+  GPU, the CUDA runtime ~1 GB), then runs fully offline.
+
+Text-to-speech works on both: neural **Piper** voices where available, otherwise
+the built-in **Windows voices** (WinRT/OneCore, or SAPI5).
+
+> ARM caveat: per-app ("application") audio capture is unavailable — `proc-tap`'s
+> native component has no ARM64 build. URL feeds, PC-audio loopback and Stereo Mix
+> all work.
 
 ## GUI (recommended)
 
