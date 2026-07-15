@@ -18,7 +18,15 @@ tokenizers>=0.23.1
 av>=17.0.1
 imageio-ffmpeg==0.6.0          # bundled ffmpeg is x64 (runs emulated); or use a system ffmpeg on PATH
 sounddevice>=0.5.5            # audio playback ("listen to feed") + TTS output; win_arm64 wheel
-comtypes>=1.4.16             # Windows SAPI5 TTS backend (pure-python; Piper's espeak-ng has no ARM build)
+comtypes>=1.4.16             # classic SAPI5 TTS fallback (pure-python; Piper's espeak-ng has no ARM build)
+
+# WinRT/OneCore TTS backend -- sees EVERY installed Windows voice (classic SAPI5
+# only reads the legacy hive). All have native win_arm64 wheels.
+winrt-runtime>=3.2.1
+winrt-Windows.Media.SpeechSynthesis>=3.2.1
+winrt-Windows.Storage.Streams>=3.2.1
+winrt-Windows.Foundation>=3.2.1
+winrt-Windows.Foundation.Collections>=3.2.1
 
 # --- transcription engine (built from source; NO prebuilt ARM64 wheel) ---
 # Do NOT `pip install` this directly on ARM — it needs a clang toolchain and a
