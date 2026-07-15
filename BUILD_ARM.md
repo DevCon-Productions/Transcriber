@@ -90,9 +90,18 @@ not realistic without a working NPU path.
   captures raise. `proctap_available()` checks for `_native` (not just the package),
   so the "application" source correctly stays hidden rather than failing at capture.
   Everything else (URL feeds, PC-audio loopback, Stereo Mix) is unaffected.
-- **ffmpeg**: `imageio-ffmpeg` has no ARM64 wheel. Use a system ffmpeg on PATH
-  (`find_ffmpeg()` falls back to `ffmpeg`); an x64 ffmpeg.exe also works under
-  emulation. A native ARM64 ffmpeg is the cleaner long-term answer.
+- **ffmpeg** (needed for URL/stream feeds): `imageio-ffmpeg` has no ARM64 wheel, so
+  stage a binary the app can find. `find_ffmpeg()` looks for imageio-ffmpeg, then
+  **`bin/ffmpeg.exe` next to the app** (or `<user data>/bin`), then PATH; if none
+  works the Engine warns once at startup instead of looping on reconnects.
+  Get a **native ARM64** build (recommended — an x64 ffmpeg also works, emulated):
+  ```powershell
+  # BtbN publishes winarm64 builds; grab the *-winarm64-gpl.zip and extract bin/ffmpeg.exe
+  winget show BtbN.FFmpeg.GPL --architecture arm64   # shows the current release URL
+  # -> extract   <zip>/ffmpeg-*-winarm64-gpl/bin/ffmpeg.exe   to   ./bin/ffmpeg.exe
+  ```
+  Verify it's really ARM64: the PE machine word should be `0xAA64` (not `0x8664`).
+  `bin/` is gitignored (the binary is ~76 MB).
 - **Models**: the GUI Model dropdown lists the big x64-oriented models; on ARM prefer a
   small one (`base.en`/`small.en`) — set it in config.json.
 - **NPU/GPU**: whisper.cpp here is CPU-only ("no GPU found"); the Snapdragon NPU/Adreno
