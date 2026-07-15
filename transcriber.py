@@ -1575,9 +1575,15 @@ class LoopbackWorker(threading.Thread):
 # tabs) can't be separated from each other.
 # --------------------------------------------------------------------------
 def proctap_available():
+    """True only if per-app capture can ACTUALLY run. proc-tap ships a pure-python
+    (py3-none-any) wheel whose compiled `_native` extension has no Windows-ARM64
+    build, so `import proctap` succeeds there while every capture raises. Require
+    the native extension too, otherwise the GUI would offer an 'application' source
+    that always fails."""
     try:
         import proctap  # noqa: F401
-        return True
+        import importlib.util
+        return importlib.util.find_spec("proctap._native") is not None
     except Exception:
         return False
 

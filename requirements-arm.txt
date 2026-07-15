@@ -5,10 +5,13 @@
 # automatically at runtime (see select_backend() in transcriber.py). Install these
 # into a NATIVE ARM64 Python venv (not an emulated x64 one). See BUILD_ARM.md.
 #
-# Excluded vs requirements.txt (no ARM64 wheel / not used on ARM):
+# Excluded vs requirements.txt (unusable on ARM):
 #   ctranslate2, faster-whisper, nvidia-cublas-cu12, nvidia-cudnn-cu12,
 #   nvidia-cuda-nvrtc-cu12  (x64 + NVIDIA GPU only)
-#   proc-tap (per-app capture; absent on ARM — that source just won't appear)
+#   proc-tap  -- per-app capture. NOTE: its wheel IS py3-none-any and installs on
+#     ARM, but the compiled `proctap._native` inside has no ARM64 build, so every
+#     capture raises. proctap_available() checks for _native, so the "application"
+#     source correctly stays hidden. Don't install it on ARM; it does nothing.
 
 # --- pure-python / native ARM64 wheels available on PyPI ---
 numpy==2.4.6
@@ -18,6 +21,9 @@ tokenizers>=0.23.1
 av>=17.0.1
 imageio-ffmpeg==0.6.0          # bundled ffmpeg is x64 (runs emulated); or use a system ffmpeg on PATH
 sounddevice>=0.5.5            # audio playback ("listen to feed") + TTS output; win_arm64 wheel
+soundcard>=0.4.6              # "pc audio" source: loopback-capture any output device; pure-python
+pillow>=12.3.0                # GUI logo/icons; win_arm64 wheel
+pycaw>=20251023               # enumerates apps with audio sessions; pure-python (comtypes)
 comtypes>=1.4.16             # classic SAPI5 TTS fallback (pure-python; Piper's espeak-ng has no ARM build)
 
 # WinRT/OneCore TTS backend -- sees EVERY installed Windows voice (classic SAPI5

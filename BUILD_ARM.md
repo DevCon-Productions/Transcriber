@@ -79,9 +79,21 @@ first use into `whispercpp_models/` (dev) or `%APPDATA%\Transcriber\whispercpp_m
 small model on ARM** (e.g. `base.en`, `small.en-q5_1`). Large-v3 across many feeds is
 not realistic without a working NPU path.
 
-## Not yet ported / caveats
-- **Per-app capture** (`proc-tap`) has no ARM64 wheel → the "application" audio source
-  won't appear. URL feeds, PC-audio loopback, and Stereo-Mix capture are unaffected.
-- **ffmpeg**: `imageio-ffmpeg` ships an x64 ffmpeg (runs emulated) or use a system/ARM64
-  ffmpeg on PATH.
-- **GUI deps** (PySide6 etc.) not covered here — this doc scopes the transcription engine.
+## What works on ARM (verified on the Snapdragon box)
+- Transcription (whisper.cpp), URL feeds, **PC-audio loopback** (`soundcard`),
+  Stereo-Mix capture, **"listen to feed"** playback (`sounddevice`), GUI (Tkinter —
+  stdlib, no Qt), and **text-to-speech** (WinRT/OneCore, or classic SAPI5).
+
+## Not ported / caveats
+- **Per-app capture** (`proc-tap`) does NOT work. Its wheel is `py3-none-any` and
+  installs fine, but the compiled `proctap._native` inside has no ARM64 build, so
+  captures raise. `proctap_available()` checks for `_native` (not just the package),
+  so the "application" source correctly stays hidden rather than failing at capture.
+  Everything else (URL feeds, PC-audio loopback, Stereo Mix) is unaffected.
+- **ffmpeg**: `imageio-ffmpeg` has no ARM64 wheel. Use a system ffmpeg on PATH
+  (`find_ffmpeg()` falls back to `ffmpeg`); an x64 ffmpeg.exe also works under
+  emulation. A native ARM64 ffmpeg is the cleaner long-term answer.
+- **Models**: the GUI Model dropdown lists the big x64-oriented models; on ARM prefer a
+  small one (`base.en`/`small.en`) — set it in config.json.
+- **NPU/GPU**: whisper.cpp here is CPU-only ("no GPU found"); the Snapdragon NPU/Adreno
+  is unused. Works fine with small models, but there's headroom.
