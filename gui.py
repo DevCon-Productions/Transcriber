@@ -174,7 +174,27 @@ class CheckBox(tk.Label):
 
 # Whisper models selectable in the GUI. Larger = more accurate; distil/turbo are
 # faster. Switching downloads the model once (cached) and hot-swaps live.
+# faster-whisper / x64 (GPU): the big models are practical.
 MODEL_CHOICES = ["large-v3", "large-v3-turbo", "distil-large-v3", "medium", "small"]
+# whisper.cpp / ARM: CPU-only, so offer the small English models that actually run
+# faster than real time there (roughly: tiny.en ~50x, base.en ~20x, small.en ~5x,
+# medium.en ~1-2x). Listed fastest -> most accurate. Anything in whisper.cpp's
+# catalog can still be set by hand in config.json.
+MODEL_CHOICES_WHISPERCPP = ["tiny.en", "base.en", "small.en-q5_1", "small.en",
+                            "medium.en"]
+
+
+def model_choices(cfg=None, current=None):
+    """Models to offer for the active engine. `current` (the configured model) is
+    always included, so whatever config.json is running stays re-selectable -- on
+    ARM the x64 list wouldn't contain it, which left no way back."""
+    if core.select_backend(cfg or {}) == "whispercpp":
+        choices = list(MODEL_CHOICES_WHISPERCPP)
+    else:
+        choices = list(MODEL_CHOICES)
+    if current and current not in choices:
+        choices.insert(0, current)
+    return choices
 
 # Compute device selectable in the GUI (faster-whisper / x64 path only). "Auto"
 # tries the GPU and falls back to CPU; "GPU" forces CUDA (NVIDIA); "CPU" runs on
@@ -1200,8 +1220,10 @@ class TranscriberGUI:
                             "follow just that unit)", bg=BG2, fg=MUTED).pack(side="left", padx=8)
 
         # Model picker (right side). Switching reloads Whisper live.
-        self.model_combo = ttk.Combobox(bar2, textvariable=self.model_var,
-                                        values=MODEL_CHOICES, state="readonly", width=16)
+        self.model_combo = ttk.Combobox(
+            bar2, textvariable=self.model_var,
+            values=model_choices(self.cfg, self.model_var.get()),
+            state="readonly", width=16)
         self.model_combo.pack(side="right", padx=6, pady=3)
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
         tk.Label(bar2, text="Model:", bg=BG2, fg=MUTED).pack(side="right")
@@ -1840,7 +1862,7 @@ class TranscriberGUI:
         """Background worker: query PyPI, post result to the event queue.
         manual=True -> always show a popup; manual=False -> quiet status only."""
         try:
-            results = core.check_for_updates()
+            results = core.check_for_updates(cfg=self.cfg)
         except Exception as e:
             results = [{"package": "?", "installed": None, "latest": None,
                         "update_available": False, "error": str(e)}]

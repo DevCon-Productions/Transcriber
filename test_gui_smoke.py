@@ -321,6 +321,19 @@ def run():
         from gui import MODEL_CHOICES
         results["model_choices_present"] = ("large-v3" in MODEL_CHOICES
                                             and "distil-large-v3" in MODEL_CHOICES)
+        # Model list is engine-aware: the x64 big models on ct2, small English
+        # models on whisper.cpp/ARM (the big ones are multi-GB + slow on CPU).
+        results["model_choices_ct2"] = (
+            _gui.model_choices({"engine": "ct2"}) == MODEL_CHOICES)
+        arm_choices = _gui.model_choices({"engine": "whispercpp"})
+        results["model_choices_arm_small"] = ("base.en" in arm_choices
+                                              and "large-v3" not in arm_choices)
+        # The configured model is ALWAYS selectable -- otherwise a config running
+        # base.en on ARM could never be re-picked from the x64 list (the old trap).
+        results["model_choices_keeps_current"] = (
+            "base.en" in _gui.model_choices({"engine": "ct2"}, "base.en"))
+        results["model_choices_no_dupe"] = (
+            _gui.model_choices({"engine": "ct2"}, "large-v3").count("large-v3") == 1)
         # Changing the model triggers engine.set_model with the chosen name.
         app.model_var.set("large-v3")
         app._on_model_change()
