@@ -468,12 +468,21 @@ def purge_old_logs(retention_days, log_dir=LOG_DIR):
 
 
 # --------------------------------------------------------------------------
-# Update check: compare installed faster-whisper / ctranslate2 against the
+# Update check: compare the installed transcription-engine packages against the
 # latest on PyPI. Pure stdlib (urllib), short timeout, fails silently offline.
 # Reports only -- it never installs anything (updating is a deliberate, manual
 # `pip install -U ...` step, to avoid re-triggering the Python-version wheel trap).
+# Which packages matter depends on the engine: the ct2 ones aren't even installed
+# on ARM, where whisper.cpp/pywhispercpp is what's actually running.
 # --------------------------------------------------------------------------
-UPDATE_PACKAGES = ["faster-whisper", "ctranslate2"]
+UPDATE_PACKAGES = ["faster-whisper", "ctranslate2"]      # ct2 / x64
+UPDATE_PACKAGES_WHISPERCPP = ["pywhispercpp"]            # whisper.cpp / ARM
+
+
+def update_packages(cfg=None):
+    """The packages worth version-checking for the active engine."""
+    return (list(UPDATE_PACKAGES_WHISPERCPP)
+            if select_backend(cfg or {}) == "whispercpp" else list(UPDATE_PACKAGES))
 
 
 def installed_version(pkg):
@@ -519,12 +528,15 @@ def _pypi_latest(pkg, timeout=4.0):
         return None
 
 
-def check_for_updates(packages=UPDATE_PACKAGES, timeout=4.0):
+def check_for_updates(packages=None, timeout=4.0, cfg=None):
     """
     Return a list of dicts, one per package:
       {"package", "installed", "latest", "update_available"}
     'latest' is None if PyPI couldn't be reached (offline / blocked).
+    `packages` defaults to the active engine's packages (see update_packages).
     """
+    if packages is None:
+        packages = update_packages(cfg)
     results = []
     for pkg in packages:
         cur = installed_version(pkg)
