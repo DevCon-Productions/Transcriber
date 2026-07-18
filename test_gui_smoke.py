@@ -511,7 +511,13 @@ def run():
         results["tts_highlight_line"] = ("structure fire on Fifth" in hl
                                          and "Adam 33" not in hl)
         app._highlight_spoken("structure fire on Fifth", False)
+        # After speaking: 'speaking' (green) cleared, 'spoken' (blue) persists.
         results["tts_highlight_clear"] = (len(app.unified.tag_ranges("speaking")) == 0)
+        spk = app.unified.tag_ranges("spoken")
+        results["tts_spoken_persists"] = (len(spk) > 0 and
+            "structure fire on Fifth" in app.unified.get(spk[0], spk[1]))
+        results["tts_two_colors"] = (
+            gui.TranscriberGUI._HL_SPEAKING != gui.TranscriberGUI._HL_SPOKEN)
 
         # --- TTS keyword presets: expand + combine with extras ----------------
         from gui import expand_keyword_presets, KEYWORD_PRESETS
