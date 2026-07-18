@@ -519,6 +519,30 @@ def run():
         results["tts_two_colors"] = (
             gui.TranscriberGUI._HL_SPEAKING != gui.TranscriberGUI._HL_SPOKEN)
 
+        # --- Clickable address -> map links ----------------------------------
+        app._clear_text()
+        app.view_mode.set("unified")
+        app.streams = [{"name": "West", "url": "http://x", "color": "cyan",
+                        "location": "Cleveland, OH"}]
+        app._append_line("West", "cyan", "units to 3658 East 149th Street", "15:00:00")
+        link_tags = [t for t in app.unified.tag_names() if t.startswith("addr:")]
+        results["addr_link_created"] = (len(link_tags) == 1)
+        if link_tags:
+            rng = app.unified.tag_ranges(link_tags[0])
+            results["addr_link_text"] = (
+                "3658 East 149th Street" in app.unified.get(rng[0], rng[1]))
+            results["addr_link_underlined"] = (
+                str(app.unified.tag_cget(link_tags[0], "underline")) in ("1", "True"))
+        else:
+            results["addr_link_text"] = False
+            results["addr_link_underlined"] = False
+        # Line with no address makes no new link.
+        app._append_line("West", "cyan", "copy that, clear", "15:00:01")
+        results["addr_no_false_link"] = (
+            len([t for t in app.unified.tag_names() if t.startswith("addr:")]) == 1)
+        # Feed location resolves for map query.
+        results["addr_feed_location"] = (app._feed_location("West") == "Cleveland, OH")
+
         # --- TTS keyword presets: expand + combine with extras ----------------
         from gui import expand_keyword_presets, KEYWORD_PRESETS
         results["presets_exist"] = (len(KEYWORD_PRESETS) >= 6)

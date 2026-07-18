@@ -102,6 +102,7 @@ BG2 = "#26282c"
 FG = "#e6e6e6"
 MUTED = "#9aa0a6"
 NO_UNIT_COLOR = FG          # white for lines with no detected speaker/call sign
+LINK_FG = "#6db3f2"         # blue for clickable address -> Google Maps links
 
 # Read-aloud keyword presets: each checkbox expands to several synonyms so you
 # catch variants without typing them all. Label -> list of match terms (lower).
@@ -208,19 +209,19 @@ _DEVICE_CFG_TO_LABEL = {"auto": "Auto", "cuda": "GPU", "gpu": "GPU", "cpu": "CPU
 # Users pick from these in "Add from catalog..." instead of pasting URLs.
 FEED_CATALOG = [
     {"name": "Cleveland West", "url": "https://www.broadcastify.com/listen/feed/25008",
-     "color": "cyan", "provider": "broadcastify",
+     "color": "cyan", "provider": "broadcastify", "location": "Cleveland, OH",
      "desc": "Cleveland Police - West (1st & 2nd District)"},
     {"name": "Cleveland Citywide", "url": "https://www.broadcastify.com/listen/feed/11446",
-     "color": "green", "provider": "broadcastify",
+     "color": "green", "provider": "broadcastify", "location": "Cleveland, OH",
      "desc": "Cleveland Police + Metro Housing (citywide, covers east side)"},
     {"name": "Cleveland Fire/EMS", "url": "https://www.broadcastify.com/listen/feed/23058",
-     "color": "red", "provider": "broadcastify",
+     "color": "red", "provider": "broadcastify", "location": "Cleveland, OH",
      "desc": "Cleveland Fire and EMS"},
     {"name": "Westlake/WestCom", "url": "https://www.broadcastify.com/listen/feed/15234",
-     "color": "yellow", "provider": "broadcastify",
+     "color": "yellow", "provider": "broadcastify", "location": "Westlake, OH",
      "desc": "WestCom: Westlake, Bay Village, Fairview Park, Rocky River, N. Olmsted (PD+Fire)"},
     {"name": "East Cleveland", "url": "https://www.broadcastify.com/listen/feed/42707",
-     "color": "magenta", "provider": "broadcastify",
+     "color": "magenta", "provider": "broadcastify", "location": "East Cleveland, OH",
      "desc": "East Cleveland Police and Fire Dispatch"},
 ]
 
@@ -307,6 +308,15 @@ class AddStreamDialog(simpledialog.Dialog):
         ttk.Combobox(master, textvariable=self.color, values=COLOR_CHOICES,
                      state="readonly", width=20).grid(row=5, column=1, sticky="w", padx=6)
 
+        # Location: city/state to anchor clickable address map-links for this feed.
+        tk.Label(master, text="Location (for map links)", bg=BG, fg=FG).grid(
+            row=6, column=0, sticky="w", padx=6, pady=4)
+        self.location = tk.StringVar(value=init.get("location", ""))
+        tk.Entry(master, textvariable=self.location, width=30).grid(
+            row=6, column=1, sticky="w", padx=6, pady=4)
+        tk.Label(master, text="e.g. Cleveland, OH", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8)).grid(row=7, column=1, sticky="w", padx=6)
+
         self.provider = tk.StringVar(value=init.get("provider", "broadcastify"))
         self._sync_state()
         return None
@@ -388,6 +398,9 @@ class AddStreamDialog(simpledialog.Dialog):
                 "url": self.url_var.get().strip(),
                 "provider": self.provider.get(), "color": self.color.get(),
             }
+        loc = self.location.get().strip()
+        if loc:
+            self.result["location"] = loc
 
 
 class ChangeDeviceDialog(simpledialog.Dialog):
@@ -1572,6 +1585,52 @@ class TranscriberGUI:
         widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
         widget.tag_bind(tag, "<Button-1>", lambda e, u=unit: self.set_unit_filter(u))
 
+    def _feed_location(self, name):
+        """The city/state to anchor map links for a feed (its 'location' field,
+        else the global default_location in config, else None)."""
+        s = self._find(name)
+        if s and s.get("location"):
+            return s["location"]
+        return self.cfg.get("default_location") or None
+
+    def _open_map(self, query, location):
+        import webbrowser
+        try:
+            webbrowser.open(core.maps_url(query, location))
+        except Exception:
+            pass
+
+    def _insert_message_text(self, widget, name, text, base_tags):
+        """Insert the message body into `widget`, turning detected addresses into
+        clickable Google-Maps links. `base_tags` are applied to normal text; each
+        address also gets a unique clickable link tag."""
+        addrs = core.extract_addresses(text)
+        if not addrs:
+            widget.insert("end", f"  {text}\n", base_tags)
+            return
+        widget.insert("end", "  ", base_tags)
+        pos = 0
+        location = self._feed_location(name)
+        for span, query in addrs:
+            i = text.find(span, pos)
+            if i < 0:
+                continue
+            if i > pos:
+                widget.insert("end", text[pos:i], base_tags)
+            # Unique tag per link so each opens its own address.
+            self._link_seq = getattr(self, "_link_seq", 0) + 1
+            tag = f"addr:{self._link_seq}"
+            widget.tag_config(tag, foreground=LINK_FG, underline=True)
+            widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
+            widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
+            widget.tag_bind(tag, "<Button-1>",
+                            lambda e, q=query, loc=location: self._open_map(q, loc))
+            widget.insert("end", span, base_tags + (tag,))
+            pos = i + len(span)
+        if pos < len(text):
+            widget.insert("end", text[pos:], base_tags)
+        widget.insert("end", "\n", base_tags)
+
     def _render_line(self, name, color, text, ts, unit=None, autoscroll=True):
         """
         Draw a single transcript line into the active view (no history write).
@@ -1600,7 +1659,7 @@ class TranscriberGUI:
             t.configure(state="normal")
             t.insert("end", f"[{ts}] ", ("ts",))
             t.insert("end", f"{label:<16}", (label_tag,))
-            t.insert("end", f"  {text}\n", text_tag)
+            self._insert_message_text(t, name, text, text_tag)
             if autoscroll:
                 t.see("end")
             t.configure(state="disabled")
@@ -1618,10 +1677,10 @@ class TranscriberGUI:
                 if clickable:
                     t.insert("end", f"[{ts}] ", ("ts2",))
                     t.insert("end", f"{unit}", (label_tag,))
-                    t.insert("end", f"  {text}\n", text_tag)
+                    self._insert_message_text(t, name, text, text_tag)
                 else:
                     t.insert("end", f"[{ts}] ", ("ts2",))
-                    t.insert("end", f"{text}\n", text_tag)
+                    self._insert_message_text(t, name, text, text_tag)
                 if autoscroll:
                     t.see("end")
                 t.configure(state="disabled")
