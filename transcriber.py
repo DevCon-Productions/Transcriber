@@ -393,6 +393,134 @@ def extract_callsign(text, extra_prefixes=None):
     return None
 
 
+# --------------------------------------------------------------------------
+# Address / street extraction -> clickable Google-Maps links in the transcript.
+#
+# Aggressive detection (catch numbered addresses, "Street/Ave/Blvd" mentions,
+# and "X and Y" intersections) but guarded against the many false "X and Y"
+# English phrases on scanner audio ("conscious and alert", "salt and pepper").
+# --------------------------------------------------------------------------
+STREET_TYPES = (
+    "street", "st", "avenue", "ave", "boulevard", "blvd", "road", "rd",
+    "drive", "dr", "lane", "ln", "court", "ct", "place", "pl", "way",
+    "circle", "cir", "parkway", "pkwy", "highway", "hwy", "terrace", "trail",
+    "square", "sq", "route", "rt", "expressway",
+)
+_STREET_TYPE_RE = "|".join(sorted(STREET_TYPES, key=len, reverse=True))
+_DIRS = r"(?:north|south|east|west|n|s|e|w|northeast|northwest|southeast|southwest|ne|nw|se|sw)"
+
+# A street "name" token: a capitalized word, an ordinal (149th, 5th), or a
+# direction. Numbers-with-ordinal count as street names ("East 149th").
+_NAME = r"(?:[A-Z][a-zA-Z]+|\d{1,3}(?:st|nd|rd|th)|" + _DIRS + r")"
+# A name word that is NOT a street type (so the type terminates the name and
+# isn't swallowed as another name word, which would then grab trailing junk).
+_NAME_NT = r"(?!(?i:" + _STREET_TYPE_RE + r")\b)" + _NAME
+
+# 1) Numbered street address: "3658 East 149th Street", "162 America Boulevard",
+#    "66745 Schubert Drive". Number + 1-3 name words + optional street type.
+_ADDR_NUMBERED = re.compile(
+    r"\b(\d{2,6})\s+"
+    r"((?:" + _DIRS + r"\s+)?" + _NAME_NT + r"(?:\s+" + _NAME_NT + r"){0,2})"
+    r"(?:\s+(" + _STREET_TYPE_RE + r"))?\b",
+    re.I)
+
+# 2) Named street with an explicit type: "American Boulevard", "Schubert Drive",
+#    "Detroit Road". Name(s) immediately followed by a street type word.
+#    The NAME stays case-sensitive (requires a capitalized proper noun); the
+#    street type is case-insensitive via inline (?i:...).
+_ADDR_NAMED = re.compile(
+    r"\b((?:(?i:" + _DIRS + r")\s+)?[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+"
+    r"((?i:" + _STREET_TYPE_RE + r"))\b")
+
+# 3) Intersection: "Detroit and Dover", "Revere and Butternut", "East 93rd and
+#    Union". Both sides must look like street names AND not be common words.
+#    A side is: optional direction + (ordinal | capitalized name).
+_XNAME = r"(?:(?i:" + _DIRS + r")\s+)?(?:\d{1,3}(?:st|nd|rd|th)|[A-Z][a-zA-Z]+)"
+_ADDR_INTERSECTION = re.compile(
+    r"\b(" + _XNAME + r")\s+and\s+(" + _XNAME + r")\b")
+
+# Words that frequently appear in "X and Y" but are NOT streets -- reject an
+# intersection match if either side is one of these.
+_NOT_STREET_WORDS = {
+    "conscious", "alert", "responsive", "unresponsive", "salt", "pepper",
+    "black", "white", "male", "female", "vehicles", "vehicle", "signs",
+    "sneakers", "sneakers", "vans", "shoes", "shirt", "hair", "eyes",
+    "blue", "red", "green", "gray", "grey", "orange", "brown", "clear",
+    "over", "out", "up", "down", "here", "there", "him", "her", "them",
+    "again", "appreciate", "quarter", "quarters", "time", "everyone",
+    "everybody", "sir", "again", "advised", "copy", "aware", "safe",
+    "sound", "fire", "ems", "fine", "okay", "good", "well",
+}
+
+
+def _looks_like_street(token):
+    """A single street-name token (may be multi-word direction+name)."""
+    words = token.strip().split()
+    core = words[-1].lower().rstrip(".,")
+    if core in _NOT_STREET_WORDS:
+        return False
+    # Ordinals (149th) and capitalized proper names qualify.
+    if re.match(r"\d{1,3}(st|nd|rd|th)$", core):
+        return True
+    return words[-1][:1].isupper()
+
+
+def extract_addresses(text):
+    """Return a list of (matched_span_text, map_query) for addresses/streets found
+    in `text`, in order, non-overlapping. `map_query` is the cleaned string to
+    hand to a maps search (without city; the GUI appends per-feed city). Aggressive
+    but guards common non-street 'X and Y' phrases."""
+    if not text:
+        return []
+    found = []
+    claimed = []   # (start, end) spans already taken, to avoid overlaps
+
+    def overlaps(s, e):
+        return any(not (e <= cs or s >= ce) for cs, ce in claimed)
+
+    def add(m, query):
+        s, e = m.start(), m.end()
+        if overlaps(s, e):
+            return
+        claimed.append((s, e))
+        found.append((text[s:e].strip(), " ".join(query.split())))
+
+    # 1) Numbered addresses (highest confidence).
+    for m in _ADDR_NUMBERED.finditer(text):
+        num, name, stype = m.group(1), m.group(2), m.group(3)
+        # Require either a street type OR an ordinal name to avoid grabbing
+        # "unit 306" or "710 mail" style false hits.
+        if stype or re.search(r"\d{1,3}(st|nd|rd|th)\b", name, re.I) \
+                or name.split()[-1][:1].isupper():
+            q = f"{num} {name}" + (f" {stype}" if stype else "")
+            add(m, q)
+
+    # 2) Named streets with explicit type.
+    for m in _ADDR_NAMED.finditer(text):
+        name = m.group(1)
+        if name.split()[-1].lower() not in _NOT_STREET_WORDS:
+            add(m, f"{name} {m.group(2)}")
+
+    # 3) Intersections -- both sides must look like streets.
+    for m in _ADDR_INTERSECTION.finditer(text):
+        a, b = m.group(1), m.group(2)
+        if _looks_like_street(a) and _looks_like_street(b):
+            add(m, f"{a} and {b}")
+
+    # Return in order of appearance.
+    found_sorted = sorted(found, key=lambda f: text.find(f[0]))
+    return found_sorted
+
+
+def maps_url(query, location=None):
+    """Build a Google Maps search URL for `query`, optionally anchored to a city
+    (e.g. 'Cleveland, OH') so bare street names resolve to the right place."""
+    import urllib.parse
+    q = query if not location else f"{query}, {location}"
+    return "https://www.google.com/maps/search/?api=1&query=" + \
+        urllib.parse.quote(q)
+
+
 def purge_old_logs(retention_days, log_dir=LOG_DIR):
     """
     Delete *.log files in log_dir older than retention_days (by modified time).
