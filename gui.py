@@ -35,7 +35,7 @@ SPLASH_LOGO = os.path.join(HERE, "OfficialLogo.png")
 TASKBAR_ICON = os.path.join(HERE, "OfficialTaskbarIcon.png")
 DEVELOPER_PHOTO = os.path.join(HERE, "Developer.png")
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 
 def load_scaled_image(path, max_w=None, max_h=None):
@@ -1523,8 +1523,13 @@ class TranscriberGUI:
                 continue
             start, end = f"{idx} linestart", f"{idx} lineend+1c"
             if on:
+                # Only scroll to the spoken line if the user is already tailing
+                # the bottom; if they've scrolled up to read history, leave their
+                # position alone (same rule as incoming lines).
+                stick = self._at_bottom(w)
                 w.tag_add("speaking", start, end)
-                w.see(idx)
+                if stick:
+                    w.see(idx)
             else:
                 # Finished: clear the green on this line, apply the persistent blue.
                 w.tag_remove("speaking", start, end)
@@ -1583,6 +1588,19 @@ class TranscriberGUI:
             widget.insert("end", text[pos:], base_tags)
         widget.insert("end", "\n", base_tags)
 
+    @staticmethod
+    def _at_bottom(widget):
+        """True if the text widget is scrolled to (or within a line of) the end.
+
+        Used to decide whether an incoming line should auto-scroll: only pin to
+        the bottom when the user is already there. If they've scrolled up to
+        read history, we leave their position untouched. An empty widget reports
+        yview() == (0.0, 1.0), so the very first line still scrolls."""
+        try:
+            return widget.yview()[1] >= 0.999
+        except Exception:
+            return True
+
     def _render_line(self, name, color, text, ts, unit=None, autoscroll=True):
         """
         Draw a single transcript line into the active view (no history write).
@@ -1602,6 +1620,7 @@ class TranscriberGUI:
 
         if self.view_mode.get() == "unified":
             t = self.unified
+            stick = self._at_bottom(t)
             t.tag_config(label_tag, foreground=label_fg)
             t.tag_config("ts", foreground=MUTED)
             if unit:
@@ -1612,12 +1631,13 @@ class TranscriberGUI:
             t.insert("end", f"[{ts}] ", ("ts",))
             t.insert("end", f"{label:<16}", (label_tag,))
             self._insert_message_text(t, name, text, text_tag)
-            if autoscroll:
+            if autoscroll and stick:
                 t.see("end")
             t.configure(state="disabled")
         else:
             t = self.sector_panels.get(name)
             if t is not None:
+                stick = self._at_bottom(t)
                 t.tag_config(label_tag, foreground=label_fg)
                 t.tag_config("ts2", foreground=MUTED)
                 if unit:
@@ -1633,7 +1653,7 @@ class TranscriberGUI:
                 else:
                     t.insert("end", f"[{ts}] ", ("ts2",))
                     self._insert_message_text(t, name, text, text_tag)
-                if autoscroll:
+                if autoscroll and stick:
                     t.see("end")
                 t.configure(state="disabled")
 
