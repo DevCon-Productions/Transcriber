@@ -1485,23 +1485,37 @@ class TranscriberGUI:
             return [self.unified] if getattr(self, "unified", None) else []
         return list(self.sector_panels.values())
 
+    # Highlight colors for TTS: green while being read, blue-grey once read
+    # (the "already read to you" marker), which persists until the line scrolls
+    # off the top of the transcript.
+    _HL_SPEAKING = "#4a5a2a"   # muted green — line currently being spoken
+    _HL_SPOKEN = "#2e3f5c"     # muted blue — line that finished being read
+
     def _highlight_spoken(self, text, on):
-        """Highlight (or clear) the transcript line currently being read aloud.
-        Searches visible widgets for the spoken text and tags that whole line."""
-        HL = "#4a5a2a"   # muted green background for the line being spoken
+        """On speak_start (on=True): mark the line green ('speaking'). On
+        speak_end (on=False): switch THAT line to blue ('spoken') and keep it —
+        it stays until it scrolls off. Only the actively-spoken line is green;
+        previously-read lines retain the blue marker."""
         for w in self._active_text_widgets():
             try:
-                w.tag_config("speaking", background=HL)
+                w.tag_config("speaking", background=self._HL_SPEAKING)
+                w.tag_config("spoken", background=self._HL_SPOKEN)
+                # 'speaking' must draw above 'spoken' where they'd overlap.
+                w.tag_raise("speaking")
             except Exception:
                 continue
-            if not on:
-                w.tag_remove("speaking", "1.0", "end")
-                continue
-            # Find the last occurrence (most recent line) of the spoken text.
+            # Find the most recent line containing the spoken text.
             idx = w.search(text, "end", backwards=True, stopindex="1.0")
-            if idx:
-                w.tag_add("speaking", f"{idx} linestart", f"{idx} lineend+1c")
+            if not idx:
+                continue
+            start, end = f"{idx} linestart", f"{idx} lineend+1c"
+            if on:
+                w.tag_add("speaking", start, end)
                 w.see(idx)
+            else:
+                # Finished: clear the green on this line, apply the persistent blue.
+                w.tag_remove("speaking", start, end)
+                w.tag_add("spoken", start, end)
 
     def _bind_unit_click(self, widget, tag, unit):
         """Make a unit tag clickable -> filter to that unit (hand cursor + click)."""
