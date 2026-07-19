@@ -34,6 +34,12 @@ datas += collect_data_files("piper")
 datas += collect_data_files("piper_phonemize", include_py_files=False) \
     if os.path.exists("./.venv/Lib/site-packages/piper_phonemize") else []
 
+# faster-whisper ships the Silero VAD model (assets/silero_vad_v6.onnx) that it
+# loads via onnxruntime whenever transcribe(vad_filter=True) is used. Without
+# this the frozen app raises "ONNXRuntimeError ... file doesn't exist" on every
+# transcription. collect_data_files grabs the assets/ dir.
+datas += collect_data_files("faster_whisper")
+
 # --- native binaries -----------------------------------------------------
 # NOTE: the large NVIDIA CUDA libraries (~1.9 GB) are deliberately NOT bundled.
 # The app downloads them into %APPDATA%\Transcriber\cuda on first run
