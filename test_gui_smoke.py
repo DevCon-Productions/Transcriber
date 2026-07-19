@@ -544,6 +544,25 @@ def run():
         results["about_version"] = (gui.APP_VERSION == "1.1")
         a.destroy()
 
+        # --- Broadcastify login dialog ---------------------------------------
+        captured = {}
+        d = gui.BroadcastifyLoginDialog(app.root, username="preset_user",
+                                        password="preset_pass",
+                                        on_save=lambda u, p: captured.update(u=u, p=p))
+        results["login_prefills_user"] = (d.user_var.get() == "preset_user")
+        results["login_prefills_pw"] = (d.pw_var.get() == "preset_pass")
+        results["login_pw_masked"] = (str(d.pw_entry.cget("show")) not in ("", "None"))
+        # empty username/password -> save rejected (dialog stays, no callback)
+        d.user_var.set("")
+        d._save()
+        results["login_rejects_empty"] = ("u" not in captured and d.winfo_exists())
+        # valid values -> callback fires with entered creds
+        d.user_var.set("newuser")
+        d.pw_var.set("newpass")
+        d._save()
+        results["login_saves_values"] = (captured.get("u") == "newuser"
+                                         and captured.get("p") == "newpass")
+
         app._on_close()
 
     # Tkinter swallows exceptions raised inside after() callbacks (prints to

@@ -936,6 +936,84 @@ class AboutDialog(tk.Toplevel):
             pass
 
 
+class BroadcastifyLoginDialog(tk.Toplevel):
+    """Enter / update Broadcastify Premium credentials. Prefilled with the
+    current login; saving persists to credentials.json and (via on_save) applies
+    it live so running feeds reconnect without an app restart."""
+    def __init__(self, parent, username="", password="", on_save=None):
+        super().__init__(parent)
+        self.title("Broadcastify login")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.resizable(False, False)
+        self._on_save = on_save
+
+        tk.Label(self, text="Broadcastify Premium account", bg=BG, fg=FG,
+                 font=("Segoe UI", 13, "bold")).pack(padx=26, pady=(20, 2))
+        tk.Label(self, text="Required to stream Broadcastify feeds. Stored only on\n"
+                            "this PC in credentials.json — never uploaded.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 9), justify="center").pack(padx=26)
+
+        form = tk.Frame(self, bg=BG)
+        form.pack(padx=26, pady=(16, 4), fill="x")
+        tk.Label(form, text="Username", bg=BG, fg=FG,
+                 font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", pady=5)
+        self.user_var = tk.StringVar(value=username or "")
+        u = tk.Entry(form, textvariable=self.user_var, width=26, bg=BG2, fg=FG,
+                     insertbackground=FG, relief="flat")
+        u.grid(row=0, column=1, padx=(12, 0), pady=5, ipady=2)
+
+        tk.Label(form, text="Password", bg=BG, fg=FG,
+                 font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=5)
+        self.pw_var = tk.StringVar(value=password or "")
+        self.pw_entry = tk.Entry(form, textvariable=self.pw_var, width=26, show="•",
+                                 bg=BG2, fg=FG, insertbackground=FG, relief="flat")
+        self.pw_entry.grid(row=1, column=1, padx=(12, 0), pady=5, ipady=2)
+
+        show = tk.Frame(self, bg=BG)
+        show.pack(padx=26, anchor="e")
+        self._show = CheckBox(show, value=False, command=self._toggle_pw,
+                              font=("Segoe UI", 11))
+        self._show.pack(side="left")
+        tk.Label(show, text="Show password", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
+
+        self.msg = tk.Label(self, text="", bg=BG, fg="#e06c6c",
+                            font=("Segoe UI", 9))
+        self.msg.pack(pady=(6, 0))
+
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(pady=(8, 18))
+        tk.Button(btns, text="Save", command=self._save, bg=BG2, fg=FG,
+                  relief="flat", width=10).pack(side="left", padx=6)
+        tk.Button(btns, text="Cancel", command=self.destroy, bg=BG2, fg=FG,
+                  relief="flat", width=10).pack(side="left", padx=6)
+
+        (u if not username else self.pw_entry).focus_set()
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+            self.geometry(f"+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            pass
+
+    def _toggle_pw(self):
+        self.pw_entry.configure(show="" if self._show.get() else "•")
+
+    def _save(self):
+        user = self.user_var.get().strip()
+        pw = self.pw_var.get().strip()
+        if not user or not pw:
+            self.msg.configure(text="Enter both a username and password.")
+            return
+        if self._on_save:
+            self._on_save(user, pw)
+        self.destroy()
+
+
 class TranscriberGUI:
     def __init__(self, root, splash=None):
         self.root = root
@@ -1127,6 +1205,7 @@ class TranscriberGUI:
         m = tk.Menu(self.root)
         streams_menu = tk.Menu(m, tearoff=0)
         streams_menu.add_command(label="Feeds...", command=self._open_library)
+        streams_menu.add_command(label="Broadcastify login...", command=self._open_login)
         streams_menu.add_separator()
         streams_menu.add_command(label="Save config", command=self._save_cfg)
         m.add_cascade(label="Streams", menu=streams_menu)
@@ -1152,6 +1231,33 @@ class TranscriberGUI:
 
     def _open_about(self):
         AboutDialog(self.root)
+
+    def _open_login(self):
+        """Open the Broadcastify credentials dialog; apply saved creds live."""
+        user, pw = core.load_credentials()
+
+        def on_save(u, p):
+            if self.engine is not None:
+                self.engine.apply_credentials(u, p, self.streams)
+            else:
+                core.save_credentials(u, p)
+            self._set_status(f"Broadcastify login saved (user '{u}'). "
+                             "Feeds will reconnect.")
+        BroadcastifyLoginDialog(self.root, username=user or "", password=pw or "",
+                                on_save=on_save)
+
+    def _maybe_prompt_login(self):
+        """On startup, if Broadcastify feeds are configured but no usable login
+        is set, open the login dialog so feeds don't silently drop."""
+        try:
+            needs = any(core.is_broadcastify_stream(s)
+                        for s in self._enabled_streams())
+            if needs and not core.credentials_configured():
+                self._set_status("Broadcastify feeds need a login to stream — "
+                                 "enter your account details.")
+                self._open_login()
+        except Exception:
+            pass
 
     def _build_toolbar(self):
         bar = tk.Frame(self.root, bg=BG2)
@@ -1448,6 +1554,7 @@ class TranscriberGUI:
                     self._set_status("Model ready. Listening.")
                     self._refresh_listen_choices()
                     self._dismiss_splash()
+                    self.root.after(400, self._maybe_prompt_login)
                 elif kind == "model_done":
                     ok, msg, target = payload
                     self.model_combo.config(state="readonly")

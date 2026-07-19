@@ -638,12 +638,29 @@ def normalize_url(url, provider=None):
     return url
 
 
-def load_credentials(cfg):
+# The values the installer seeds into a fresh credentials.json (from
+# credentials.example.json). Treated as "not configured" so the app doesn't try
+# to authenticate with literal placeholder text (which just makes feeds drop).
+_PLACEHOLDER_CREDS = {"YOUR_BROADCASTIFY_USERNAME", "YOUR_BROADCASTIFY_PASSWORD"}
+
+
+def _clean_cred(v):
+    """Return a usable credential string, or None for blank/placeholder values."""
+    if not v:
+        return None
+    v = v.strip()
+    if not v or v in _PLACEHOLDER_CREDS:
+        return None
+    return v
+
+
+def load_credentials(cfg=None):
     """
     Resolve Broadcastify Premium credentials, in priority order:
       1. credentials.json  ({"broadcastify": {"username": "...", "password": "..."}})
       2. env vars BROADCASTIFY_USERNAME / BROADCASTIFY_PASSWORD
-    Returns (username, password) or (None, None) if not configured.
+    Placeholder/blank values are ignored. Returns (username, password) or
+    (None, None) if not configured.
     """
     user = pw = None
     if os.path.exists(CREDENTIALS_PATH):
@@ -653,9 +670,45 @@ def load_credentials(cfg):
             user, pw = creds.get("username"), creds.get("password")
         except Exception:
             pass
-    user = user or os.environ.get("BROADCASTIFY_USERNAME")
-    pw = pw or os.environ.get("BROADCASTIFY_PASSWORD")
+    user = _clean_cred(user) or _clean_cred(os.environ.get("BROADCASTIFY_USERNAME"))
+    pw = _clean_cred(pw) or _clean_cred(os.environ.get("BROADCASTIFY_PASSWORD"))
     return user, pw
+
+
+def save_credentials(username, password):
+    """Write Broadcastify credentials to credentials.json (creating it if
+    needed). Preserves any other top-level keys already in the file. Returns
+    True on success."""
+    data = {}
+    if os.path.exists(CREDENTIALS_PATH):
+        try:
+            with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["broadcastify"] = {"username": (username or "").strip(),
+                            "password": (password or "").strip()}
+    try:
+        os.makedirs(os.path.dirname(CREDENTIALS_PATH), exist_ok=True)
+        with open(CREDENTIALS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def credentials_configured():
+    """True if usable (non-placeholder) Broadcastify credentials are available."""
+    user, pw = load_credentials()
+    return bool(user and pw)
+
+
+def is_broadcastify_stream(stream):
+    """True if a stream is a Broadcastify feed (needs Premium auth)."""
+    return (stream.get("provider") == "broadcastify"
+            or "broadcastify.com" in (stream.get("url") or ""))
 
 
 def enable_windows_ansi():
@@ -1760,6 +1813,25 @@ class Engine:
             self.out.status(f"Broadcastify auth: enabled (user '{user}')")
             return base64.b64encode(f"{user}:{pw}".encode()).decode()
         return None
+
+    def apply_credentials(self, username, password, active_streams=None):
+        """Persist new Broadcastify credentials, rebuild the auth header, and
+        restart any running Broadcastify feeds so they reconnect with the new
+        login (no app restart needed). `active_streams` is the caller's list of
+        stream dicts (used to re-add restarted feeds); falls back to restarting
+        by name only. Returns True if credentials were saved."""
+        ok = save_credentials(username, password)
+        self.auth_header = self._build_auth()
+        # Restart running Broadcastify workers so they pick up the new header.
+        # Only restart feeds we have a stream dict for (so we can re-add them);
+        # leave pc-audio and non-Broadcastify streams untouched.
+        by_name = {s["name"]: s for s in (active_streams or [])}
+        running = set(self.stream_names())
+        for name, stream in by_name.items():
+            if name in running and is_broadcastify_stream(stream):
+                self.remove_stream(name)
+                self.add_stream(stream)
+        return ok
 
     # -- lifecycle ----------------------------------------------------------
     def _make_whisper_model(self, model_name):
