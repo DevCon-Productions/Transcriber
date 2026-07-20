@@ -576,7 +576,7 @@ def run():
         results["help_has_guide"] = ("USER GUIDE" in gui.HELP_TEXT)
         h.destroy()
         a = gui.AboutDialog(app.root)
-        results["about_version"] = (gui.APP_VERSION == "1.0")
+        results["about_version"] = (gui.APP_VERSION == "1.2-arm64")
         a.destroy()
 
         # --- Broadcastify login dialog ---------------------------------------
