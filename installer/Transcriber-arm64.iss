@@ -12,7 +12,7 @@
 
 #define MyAppName "Transcriber"
 #define MyAppNameFull "Transcriber (ARM64)"
-#define MyAppVersion "1.3-arm64"
+#define MyAppVersion "1.4-arm64"
 #define MyAppPublisher "DevCon Productions"
 #define MyAppExeName "Transcriber.exe"
 
