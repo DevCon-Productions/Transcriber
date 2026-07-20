@@ -1,0 +1,31 @@
+{
+  "model": "base.en",
+  "engine": "whispercpp",
+  "language": "en",
+  "beam_size": 5,
+  "log_retention_days": 14,
+  "unit_prefixes": [],
+  "initial_prompt": "The following is police, fire, and EMS radio dispatch. Common terms: dispatch, copy, en route, on scene, clear, 10-4, code three, signal, suspect, vehicle, plate, registration, subject, complainant, requesting backup, be advised, negative, affirmative, over.",
+  "vad": {
+    "trigger_ratio": 3.0,
+    "abs_min_rms": 0.004,
+    "silence_hangover_sec": 0.8,
+    "min_speech_sec": 0.4,
+    "max_segment_sec": 25.0,
+    "preroll_sec": 0.3
+  },
+  "filters": {
+    "max_no_speech_prob": 0.6,
+    "min_avg_logprob": -1.0
+  },
+  "streams": [
+    {
+      "name": "Example Feed",
+      "url": "https://www.broadcastify.com/listen/feed/25008",
+      "color": "cyan",
+      "disabled": true
+    }
+  ],
+  "font_size": 12,
+  "view_mode": "sectors"
+}
