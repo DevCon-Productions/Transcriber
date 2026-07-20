@@ -283,7 +283,14 @@ def _seed_from_example(target, example_name):
 
 def load_config(path=CONFIG_PATH):
     # First run of an installed build: seed config + credentials from examples.
-    _seed_from_example(CONFIG_PATH, "config.example.json")
+    # On native ARM64 prefer config.example.arm.json (small CPU model default) if
+    # the build bundled it -- the shared config.example.json defaults to large-v3
+    # on CUDA, which on ARM would mean a ~3 GB download and unusable CPU speed.
+    example = "config.example.json"
+    if interpreter_is_arm64() and os.path.exists(
+            os.path.join(HERE, "config.example.arm.json")):
+        example = "config.example.arm.json"
+    _seed_from_example(CONFIG_PATH, example)
     _seed_from_example(CREDENTIALS_PATH, "credentials.example.json")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
