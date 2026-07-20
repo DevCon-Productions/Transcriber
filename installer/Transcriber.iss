@@ -1,10 +1,10 @@
 ; Inno Setup script for Transcriber (DevCon Productions)
 ; Build the app first:  .venv\Scripts\python.exe -E -m PyInstaller Transcriber.spec --noconfirm
 ; Then compile this:     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\Transcriber.iss
-; Output installer:      installer\Output\Transcriber-Setup-1.3.exe
+; Output installer:      installer\Output\Transcriber-Setup-1.4.exe
 
 #define MyAppName "Transcriber"
-#define MyAppVersion "1.3"
+#define MyAppVersion "1.4"
 #define MyAppPublisher "DevCon Productions"
 #define MyAppExeName "Transcriber.exe"
 
