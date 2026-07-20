@@ -16,6 +16,13 @@ landed on `master` since:
 | `dc1c6f7` | Bundle faster-whisper Silero VAD in installer | ❌ **x64-only — do NOT port literally** |
 | `e28430e` | In-app Broadcastify login dialog | ✅ **Yes — highest value** |
 | `958735b` | v1.2 version bump | ❌ Keep your own ARM version |
+| `41fb934` | GitHub-release app self-updater | ✅ Yes — **but one critical ARM change** (see #5) |
+| `99c16f3` | v1.3 version bump | ❌ Keep your own ARM version |
+
+> Note: the repo is now **public** and its history was scrubbed (a username was
+> removed from an old test commit), which is why some hashes above differ from
+> what you may have seen earlier. `git fetch origin master` to get the current
+> ones. The public repo is what makes the self-updater's anonymous downloads work.
 
 ## Before you start
 
@@ -86,6 +93,60 @@ Commit **`c9d9da0`**. Pure GUI + the existing TTS start/end callbacks.
   `tag_raise("speaking")` so green wins on overlap.
 - **ARM caveat**: Piper TTS runs on ARM (onnxruntime has ARM64 wheels), so this
   ports. Confirm `piper` + `onnxruntime` import in your ARM venv first.
+
+### 5. GitHub-release self-updater — port it, but with ONE critical ARM change
+Commits **`41fb934`** (feature) + **`99c16f3`** (v1.3 bump). Checks the public
+repo's latest release and, if newer, downloads the installer and upgrades in
+place. Mostly backend-agnostic, but multi-architecture makes the **asset picker**
+a landmine.
+
+- **transcriber.py**: `APP_REPO`, `check_for_app_update(current_version)` (hits
+  GitHub `/releases/latest` anonymously → `is_newer(tag, APP_VERSION)` → returns
+  the installer asset + notes), `download_file(url, dest, progress_cb)` (streams
+  to a `.part`, renames on success).
+- **gui.py**: `AppUpdateDialog` (notes → Download & install → `ttk.Progressbar`),
+  `_check_app_update_manual/_auto`, `_run_app_update_check`,
+  `_handle_app_update_result`, `_start_app_download`, `_download_update`,
+  `_launch_installer_and_quit`, `_open_url`; the **Help → "Check for app updates"**
+  menu item; the four event kinds (`app_update_result` / `app_dl_progress` /
+  `app_dl_done` / `app_dl_error`) in `_drain_events`; `self._update_dialog` init;
+  and the `self.root.after(3500, self._check_app_update_auto)` quiet check.
+- **tests**: `test_appupdate.py` (14 checks, network mocked).
+
+⚠️ **CRITICAL — the asset picker must be architecture-aware.** In transcriber.py,
+`check_for_app_update` currently grabs the **first `.exe`** asset in the release:
+```python
+for a in data.get("assets", []):
+    if str(a.get("name", "")).lower().endswith(".exe"):
+        asset = a; break
+```
+On ARM this could download the **x64 installer**. Before porting, decide the
+release strategy and fix the picker:
+
+- **Recommended — one release, two assets.** Attach both
+  `Transcriber-Setup-<v>.exe` (x64) and `Transcriber-ARM64-Setup-<v>.exe` (arm64)
+  to each GitHub release. Then the ARM build selects the asset whose name contains
+  `arm64`; the x64 build selects the one that does **not**. (Tell the x64 session
+  to make the same tweak, or x64 could grab the ARM installer once ARM assets
+  exist — flagged in the x64 memory too.)
+- **Alternative — separate release channels/tags for ARM.** Then point the check
+  at the ARM releases (or filter tag names) so `/releases/latest` never hands the
+  ARM app an x64 build.
+
+**Other ARM notes:**
+- **Versioning:** keep ARM version numbers parallel to x64 (both `"1.4"`, etc.) so
+  `is_newer(tag, APP_VERSION)` just works. If you use an ARM suffix, adjust the
+  tag parse in `check_for_app_update`.
+- **Installer:** your ARM Inno `.iss` needs its **own fixed `AppId`** (distinct
+  from x64's `{{8F3C1A22-…-TRANSCRIBER01}}`) so the two arches are separate
+  products, plus the admin manifest and the `[Run]` postinstall relaunch. With
+  those, `os.startfile(installer)` → UAC → in-place upgrade → relaunch all behave
+  the same on ARM Windows. No code change needed in `_launch_installer_and_quit`.
+- **Bootstrap caveat (same as x64):** the updater only activates from the ARM
+  version it first ships in. The first ARM release carrying the updater must be
+  installed manually; ARM releases after that self-update.
+- Everything else — the dialog, progress download, event wiring, launch-and-quit
+  — is backend-agnostic and ports unchanged.
 
 ---
 
