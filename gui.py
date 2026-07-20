@@ -35,7 +35,7 @@ SPLASH_LOGO = os.path.join(HERE, "OfficialLogo.png")
 TASKBAR_ICON = os.path.join(HERE, "OfficialTaskbarIcon.png")
 DEVELOPER_PHOTO = os.path.join(HERE, "Developer.png")
 
-APP_VERSION = "1.2-arm64"
+APP_VERSION = "1.3-arm64"
 
 
 def load_scaled_image(path, max_w=None, max_h=None):

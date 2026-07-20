@@ -23,19 +23,27 @@ def run():
     r = {}
     orig = urllib.request.urlopen
 
+    # Releases carry BOTH installers; the build must pick its own architecture.
+    want_arm = core.interpreter_is_arm64()
+    ARM_SZ, X64_SZ = 480 * (1 << 20), 511 * (1 << 20)
+
     def fake(url_or_req, timeout=None):
         return _Resp(_release_json("v1.5",
             [{"name": "Transcriber-Setup-1.5.exe",
               "browser_download_url": "https://x/dl/Transcriber-Setup-1.5.exe",
-              "size": 511 * (1 << 20)}]))
+              "size": X64_SZ},
+             {"name": "Transcriber-ARM64-Setup-1.5.exe",
+              "browser_download_url": "https://x/dl/Transcriber-ARM64-Setup-1.5.exe",
+              "size": ARM_SZ}]))
     try:
-        # 1. newer version available + asset parsed
+        # 1. newer version available + the ARCH-APPROPRIATE asset parsed
         urllib.request.urlopen = fake
         info = core.check_for_app_update("1.2")
         r["available_true"] = (info is not None and info["available"] is True)
         r["latest_parsed"] = (info["latest"] == "1.5")            # 'v' stripped
+        r["asset_arch_aware"] = (("arm64" in info["asset_url"].lower()) == want_arm)
         r["asset_url"] = (info["asset_url"].endswith("1.5.exe"))
-        r["asset_size"] = (info["asset_size"] == 511 * (1 << 20))
+        r["asset_size"] = (info["asset_size"] == (ARM_SZ if want_arm else X64_SZ))
         r["notes"] = (info["notes"] == "notes here")
 
         # 2. same/older running version -> not available
@@ -71,6 +79,17 @@ def run():
         r["dl_progress_fired"] = (len(seen) > 0 and seen[-1][0] == len(payload))
         r["dl_total_reported"] = (seen[-1][1] == len(payload))
         r["dl_no_part_left"] = (not os.path.exists(dest + ".part"))
+
+        # 6. arch-aware installer picker never crosses architectures
+        both = [{"name": "Transcriber-Setup-1.5.exe"},
+                {"name": "Transcriber-ARM64-Setup-1.5.exe"}]
+        r["picker_matches_arch"] = (
+            ("arm64" in core._pick_installer_asset(both)["name"].lower()) == want_arm)
+        # a release with only the WRONG arch -> no asset (never cross-install)
+        wrong = [{"name": ("Transcriber-Setup-1.5.exe" if want_arm
+                           else "Transcriber-ARM64-Setup-1.5.exe")}]
+        r["picker_no_cross_arch"] = (core._pick_installer_asset(wrong) is None)
+        r["picker_empty_none"] = (core._pick_installer_asset([]) is None)
     finally:
         urllib.request.urlopen = orig
 
