@@ -79,6 +79,32 @@ first use into `whispercpp_models/` (dev) or `%APPDATA%\Transcriber\whispercpp_m
 small model on ARM** (e.g. `base.en`, `small.en-q5_1`). Large-v3 across many feeds is
 not realistic without a working NPU path.
 
+## Packaging (native ARM64 installer)
+Produces `Transcriber-ARM64-Setup-<v>.exe`. Prereqs: `pip install pyinstaller` into
+`.venv-arm64` (it ships a `win_arm64` bootloader → a genuine ARM64 exe) and Inno
+Setup 6 (`winget install JRSoftware.InnoSetup`; ISCC's Setup.exe is x86, runs
+emulated — fine).
+```powershell
+# 1) one-folder ARM64 build -> dist\Transcriber\
+.venv-arm64\Scripts\python.exe -E -m PyInstaller Transcriber-arm64.spec --noconfirm
+# 2) installer -> installer\Output\Transcriber-ARM64-Setup-<v>.exe
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\Transcriber-arm64.iss
+```
+`Transcriber-arm64.spec` bundles the whisper.cpp `_pywhispercpp.pyd`, native ARM64
+`bin\ffmpeg.exe`, the `winrt-*` projection + comtypes, soundcard/pycaw/PIL; it
+EXCLUDES the x64 stack (faster_whisper/ctranslate2/nvidia) and unused-on-ARM
+`onnxruntime`/`scipy`/`proctap` (note: `collect_all("onnxruntime")` crashes the
+analyzer via `onnxruntime.quantization` → missing `onnx`). The ARM installer `.iss`
+has its OWN Inno `AppId` (separate product from x64), `ArchitecturesAllowed=arm64`,
+and an `ARM64`-containing filename the self-updater's arch-aware picker requires.
+
+⚠️ **Always exercise the FROZEN exe, not just `python gui.py`** — data/binary-file
+resolution differs when packaged. Verified: the frozen build transcribes a live feed
+and loads `_pywhispercpp` + the WinRT speech `.pyd`s in-process. GGUF models are NOT
+bundled (base.en ~148 MB downloads on first use into `%APPDATA%\Transcriber`); the
+installed build seeds `config.example.arm.json` (base.en) so it doesn't default to
+large-v3/CUDA.
+
 ## What works on ARM (verified on the Snapdragon box)
 - Transcription (whisper.cpp), URL feeds, **PC-audio loopback** (`soundcard`),
   Stereo-Mix capture, **"listen to feed"** playback (`sounddevice`), GUI (Tkinter —
