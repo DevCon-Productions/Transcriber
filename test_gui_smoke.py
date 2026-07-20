@@ -557,7 +557,7 @@ def run():
         results["effective_has_extra"] = ("euclid ave" in eff)
         results["effective_dedupes"] = (eff.count("gunfire") == 1)
 
-        # --- TTS dialog: check-all / clear presets ---------------------------
+        # --- TTS dialog: check-all / clear presets + engine picker -----------
         if core.tts_available():
             tdlg = gui.TTSDialog(app.root, app)
             tdlg._set_all_presets(True)
@@ -566,10 +566,31 @@ def run():
                 len(allc["keyword_presets"]) == len(gui.KEYWORD_PRESETS))
             tdlg._set_all_presets(False)
             results["tts_clear_all"] = (tdlg._collect()["keyword_presets"] == [])
+            # Engine picker: Auto is always offered, only usable engines beyond it,
+            # and _collect() records the chosen engine id.
+            labels = [lab for _id, lab in tdlg._engine_choices]
+            results["tts_engine_has_auto"] = ("Auto (recommended)" in labels)
+            results["tts_engine_only_usable"] = (
+                [i for i, _l in tdlg._engine_choices if i != "auto"]
+                == core.available_tts_engines())
+            results["tts_engine_collected"] = (allc.get("engine") in
+                                               ["auto"] + core.available_tts_engines())
+            # Switching engine refreshes the voice list to that engine's voices.
+            if core.available_tts_engines():
+                first = gui._TTS_ID_TO_LABEL[core.available_tts_engines()[0]]
+                tdlg.engine_var.set(first)
+                vlist = list(tdlg.voice_combo.cget("values"))
+                want = [v[0] for v in core.list_tts_voices(
+                    engine=tdlg._selected_engine())]
+                results["tts_engine_voice_refresh"] = (vlist == want)
+            else:
+                results["tts_engine_voice_refresh"] = True
             tdlg.destroy()
         else:
-            results["tts_check_all"] = True   # skip if no voices installed
-            results["tts_clear_all"] = True
+            for k in ("tts_check_all", "tts_clear_all", "tts_engine_has_auto",
+                      "tts_engine_only_usable", "tts_engine_collected",
+                      "tts_engine_voice_refresh"):
+                results[k] = True   # skip if no voices installed
 
         # --- Help + About dialogs build without error ------------------------
         h = gui.HelpDialog(app.root)
