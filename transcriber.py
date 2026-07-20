@@ -687,6 +687,27 @@ def check_for_updates(packages=None, timeout=4.0, cfg=None):
 APP_REPO = "DevCon-Productions/Transcriber"
 
 
+def _pick_installer_asset(assets):
+    """Choose the installer asset (.exe) matching THIS build's architecture.
+
+    Releases carry both x64 (`Transcriber-Setup-<v>.exe`) and ARM64
+    (`Transcriber-ARM64-Setup-<v>.exe`) installers. This is the ARM build, so it
+    must pick the arm64-named asset and NEVER fall back to the x64 one (installing
+    the wrong architecture). If no arm64 installer is on the release yet, return
+    None -> the updater simply reports no update rather than downloading x64.
+    (The x64 build makes the mirror choice: the .exe whose name does NOT contain
+    'arm64'.)"""
+    want_arm = interpreter_is_arm64()
+    for a in assets:
+        name = str(a.get("name", "")).lower()
+        if not name.endswith(".exe"):
+            continue
+        is_arm_asset = "arm64" in name or "-arm-" in name
+        if want_arm == is_arm_asset:
+            return a
+    return None
+
+
 def check_for_app_update(current_version, repo=APP_REPO, timeout=6.0):
     """Query the repo's latest GitHub Release and compare it to the running
     version. Returns a dict or None (on any failure — offline, rate-limited, no
@@ -708,11 +729,7 @@ def check_for_app_update(current_version, repo=APP_REPO, timeout=6.0):
     tag = (data.get("tag_name") or "").lstrip("vV")
     if not tag:
         return None
-    asset = None
-    for a in data.get("assets", []):
-        if str(a.get("name", "")).lower().endswith(".exe"):
-            asset = a
-            break
+    asset = _pick_installer_asset(data.get("assets", []))
     return {
         "available": is_newer(tag, current_version),
         "current": current_version,
