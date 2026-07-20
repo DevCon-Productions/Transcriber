@@ -678,6 +678,77 @@ def check_for_updates(packages=None, timeout=4.0, cfg=None):
     return results
 
 
+# --------------------------------------------------------------------------
+# App self-update: check GitHub Releases for a newer Transcriber build.
+# (Separate from check_for_updates() above, which reports ML-library versions
+# from PyPI and never installs anything.) The repo is public, so these calls
+# are anonymous — no token needed.
+# --------------------------------------------------------------------------
+APP_REPO = "DevCon-Productions/Transcriber"
+
+
+def check_for_app_update(current_version, repo=APP_REPO, timeout=6.0):
+    """Query the repo's latest GitHub Release and compare it to the running
+    version. Returns a dict or None (on any failure — offline, rate-limited, no
+    installer asset):
+      {available, current, latest, notes, html_url,
+       asset_name, asset_url, asset_size}
+    """
+    import urllib.request
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Transcriber-Updater",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    tag = (data.get("tag_name") or "").lstrip("vV")
+    if not tag:
+        return None
+    asset = None
+    for a in data.get("assets", []):
+        if str(a.get("name", "")).lower().endswith(".exe"):
+            asset = a
+            break
+    return {
+        "available": is_newer(tag, current_version),
+        "current": current_version,
+        "latest": tag,
+        "notes": data.get("body") or "",
+        "html_url": data.get("html_url") or "",
+        "asset_name": asset.get("name") if asset else None,
+        "asset_url": asset.get("browser_download_url") if asset else None,
+        "asset_size": asset.get("size") if asset else None,
+    }
+
+
+def download_file(url, dest, progress_cb=None, chunk=1 << 20, timeout=30.0):
+    """Stream-download `url` to `dest`, writing to a .part file and renaming on
+    success. Calls progress_cb(bytes_done, total_bytes) as it goes (total is 0
+    if the server sends no Content-Length). Returns dest; raises on failure."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Transcriber-Updater"})
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        with open(tmp, "wb") as f:
+            while True:
+                buf = r.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                done += len(buf)
+                if progress_cb:
+                    progress_cb(done, total)
+    os.replace(tmp, dest)
+    return dest
+
+
 # Match a Broadcastify player-page URL or bare feed id -> capture the feed id.
 _BCFY_PAGE = re.compile(r"broadcastify\.com/(?:listen/)?feed/(\d+)", re.I)
 _BARE_ID = re.compile(r"^\d+$")
