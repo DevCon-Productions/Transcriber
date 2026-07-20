@@ -11,6 +11,7 @@
 ; arch-aware asset picker keys off (it downloads only the *ARM64* asset on ARM).
 
 #define MyAppName "Transcriber"
+#define MyAppNameFull "Transcriber (ARM64)"
 #define MyAppVersion "1.3-arm64"
 #define MyAppPublisher "DevCon Productions"
 #define MyAppExeName "Transcriber.exe"
@@ -20,12 +21,16 @@
 ; {{8F3C1A22-7B4E-4E2A-9F1D-TRANSCRIBER01}} so the two architectures are separate
 ; installed products and the ARM self-updater upgrades the ARM install in place.
 AppId={{8F3C1A22-7B4E-4E2A-9F1D-TRANSCRIBERARM64}}
-AppName={#MyAppName}
+; Display name, install folder, and Start-menu group are ALL distinct from the x64
+; build so the two can coexist on one machine and never overwrite each other. (A
+; shared "Transcriber" folder was letting an x64 install block the ARM one.) The
+; app's writable state also uses a separate %APPDATA%\Transcriber-ARM64 dir.
+AppName={#MyAppNameFull}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL=https://github.com/DevCon-Productions/Transcriber
-DefaultDirName={autopf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
+DefaultDirName={autopf}\Transcriber ARM64
+DefaultGroupName={#MyAppNameFull}
 DisableProgramGroupPage=yes
 ; Per-machine install (Program Files) needs admin; writable state (config/
 ; credentials/logs) is redirected to %APPDATA%\Transcriber at runtime.
@@ -52,9 +57,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "..\dist\Transcriber\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppNameFull}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\Uninstall {#MyAppNameFull}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppNameFull}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 ; Launch after an interactive install. The self-updater runs the installer
