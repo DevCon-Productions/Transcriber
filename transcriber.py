@@ -990,6 +990,19 @@ def select_tts_engine(cfg_tts=None):
     return "piper"
 
 
+def available_tts_engines():
+    """TTS engine ids that can actually speak on this system, best-first
+    (piper, winrt, sapi). Used by the GUI to offer only working engines."""
+    out = []
+    if _piper_usable():
+        out.append("piper")
+    if _winrt_usable():
+        out.append("winrt")
+    if _sapi_usable():
+        out.append("sapi")
+    return out
+
+
 def list_tts_voices(engine=None, cfg_tts=None):
     """Voices for the selected engine as [(voice_id, detail)]. Piper -> (stem,
     path); WinRT/SAPI -> (display name, display name)."""
@@ -2347,6 +2360,14 @@ class Engine:
     def set_tts_voice(self, voice_id):
         """Change the TTS voice (recreates the player on next _ensure_tts)."""
         self.tts_voice = voice_id
+
+    def set_tts_engine(self, engine):
+        """Change the TTS engine ('auto'|'piper'|'winrt'|'sapi'). If TTS is on,
+        recreate the player so it takes effect (_ensure_tts recreates when the
+        resolved engine changes)."""
+        self.tts_engine = engine or "auto"
+        if self.tts_enabled:
+            self._ensure_tts()
 
     def _maybe_speak(self, name, text):
         """Decide whether this transcript line should be read aloud, and queue it."""

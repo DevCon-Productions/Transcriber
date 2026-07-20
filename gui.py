@@ -185,6 +185,23 @@ MODEL_CHOICES_WHISPERCPP = ["tiny.en", "base.en", "small.en-q5_1", "small.en",
                             "medium.en"]
 
 
+# TTS engine picker (in the Read-aloud dialog). "Auto" lets the app choose
+# (piper -> winrt -> sapi); the rest force a specific engine. Only engines that
+# can actually speak on this machine are offered (see core.available_tts_engines).
+_TTS_ENGINE_LABELS = [("auto", "Auto (recommended)"),
+                      ("piper", "Piper (neural)"),
+                      ("winrt", "Windows — all voices"),
+                      ("sapi", "Windows SAPI5")]
+_TTS_ID_TO_LABEL = {eid: lab for eid, lab in _TTS_ENGINE_LABELS}
+_TTS_LABEL_TO_ID = {lab: eid for eid, lab in _TTS_ENGINE_LABELS}
+
+
+def tts_engine_choices():
+    """[(id, label)] to offer: Auto + whatever engines actually work here."""
+    ids = ["auto"] + core.available_tts_engines()
+    return [(eid, _TTS_ID_TO_LABEL[eid]) for eid in ids]
+
+
 def model_choices(cfg=None, current=None):
     """Models to offer for the active engine. `current` (the configured model) is
     always included, so whatever config.json is running stays re-selectable -- on
@@ -718,13 +735,26 @@ class TTSDialog(tk.Toplevel):
         tk.Label(row, text="  Read transcriptions aloud", bg=BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).pack(side="left")
 
+        # Engine picker (Auto + whichever engines work on this machine).
+        self._engine_choices = tts_engine_choices()
+        erow = tk.Frame(body, bg=BG); erow.pack(fill="x", pady=4, **pad)
+        tk.Label(erow, text="Engine:", bg=BG, fg=MUTED).pack(side="left")
+        cur_eng = str(self.cfg.get("engine", "auto")).lower()
+        self.engine_var = tk.StringVar(
+            value=_TTS_ID_TO_LABEL.get(cur_eng, "Auto (recommended)"))
+        ttk.Combobox(erow, textvariable=self.engine_var,
+                     values=[lab for _id, lab in self._engine_choices],
+                     state="readonly", width=28).pack(side="left", padx=6)
+        self.engine_var.trace_add("write", lambda *a: self._refresh_voice_list())
+
         # Voice picker.
         vrow = tk.Frame(body, bg=BG); vrow.pack(fill="x", pady=4, **pad)
         tk.Label(vrow, text="Voice:", bg=BG, fg=MUTED).pack(side="left")
-        voices = [v[0] for v in core.list_tts_voices()]
+        voices = [v[0] for v in core.list_tts_voices(engine=self._selected_engine())]
         self.voice_var = tk.StringVar(value=self.cfg.get("voice") or (voices[0] if voices else ""))
-        ttk.Combobox(vrow, textvariable=self.voice_var, values=voices,
-                     state="readonly", width=28).pack(side="left", padx=6)
+        self.voice_combo = ttk.Combobox(vrow, textvariable=self.voice_var,
+                                        values=voices, state="readonly", width=28)
+        self.voice_combo.pack(side="left", padx=6)
 
         # What to read: mode.
         tk.Label(body, text="What to read:", bg=BG, fg=MUTED).pack(pady=(10, 2), **pad)
@@ -787,6 +817,19 @@ class TTSDialog(tk.Toplevel):
         for cb in self.preset_checks.values():
             cb.set(value)
 
+    def _selected_engine(self):
+        """The engine id chosen in the picker ('auto' -> resolved best engine)."""
+        eid = _TTS_LABEL_TO_ID.get(self.engine_var.get(), "auto")
+        return core.select_tts_engine({"engine": eid}) if eid == "auto" else eid
+
+    def _refresh_voice_list(self):
+        """Repopulate the Voice dropdown for the currently-selected engine, keeping
+        the current voice if that engine has it (else the first available)."""
+        voices = [v[0] for v in core.list_tts_voices(engine=self._selected_engine())]
+        self.voice_combo.config(values=voices)
+        keep = core._match_voice_name(self.voice_var.get(), voices)
+        self.voice_var.set(keep or (voices[0] if voices else ""))
+
     def _collect(self):
         # Checked active feeds + any saved selections for feeds not currently
         # active (so switching a feed off doesn't wipe its TTS selection).
@@ -796,6 +839,7 @@ class TTSDialog(tk.Toplevel):
         extras = [k.strip() for k in self.kw_var.get().split(",") if k.strip()]
         return {
             "enabled": self.enabled.get(),
+            "engine": _TTS_LABEL_TO_ID.get(self.engine_var.get(), "auto"),
             "voice": self.voice_var.get() or None,
             "mode": self.mode.get(),
             "feeds": feeds,
@@ -1997,6 +2041,7 @@ class TranscriberGUI:
         self._save_cfg()
         e = self.engine
         if e:
+            e.set_tts_engine(self.tts_cfg.get("engine", "auto"))  # before voice/enable
             e.set_tts_voice(self.tts_cfg.get("voice"))
             e.set_tts_feeds(self.tts_cfg.get("feeds", []))
             e.set_tts_keywords(self._effective_keywords())   # presets + extras
