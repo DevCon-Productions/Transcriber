@@ -14,8 +14,8 @@ landed on `master` since:
 | `106e31b` | Clickable address → Google Maps links | ✅ Yes |
 | `f31eda9` | Scroll-position preservation (v1.1) | ✅ Yes (gui.py hunks only) |
 | `dc1c6f7` | Bundle faster-whisper Silero VAD in installer | ❌ **x64-only — do NOT port literally** |
-| `dea567e` | In-app Broadcastify login dialog | ✅ **Yes — highest value** |
-| `d54cdff` | v1.2 version bump | ❌ Keep your own ARM version |
+| `e28430e` | In-app Broadcastify login dialog | ✅ **Yes — highest value** |
+| `958735b` | v1.2 version bump | ❌ Keep your own ARM version |
 
 ## Before you start
 
@@ -32,7 +32,7 @@ landed on `master` since:
 ## PORT THESE (feature parity)
 
 ### 1. Broadcastify login dialog — do this first, highest value
-Commit **`dea567e`**. Completely backend-agnostic (auth is about *stream URLs*,
+Commit **`e28430e`**. Completely backend-agnostic (auth is about *stream URLs*,
 not transcription). **It fixes the exact "fresh install → feeds silently drop"
 bug ARM installs will also hit**: the installer seeds a placeholder
 `credentials.json`, and before this change the app tried to authenticate with the
@@ -112,7 +112,7 @@ asset**, so the literal change doesn't apply.
   swap in the whisper.cpp backend, make sure the VAD/segmenting is handled by
   your backend (or SpeechGate) and you're not silently relying on faster-whisper.
 
-### B. Version + installer identity (`d54cdff`, and the `.iss` hunks above)
+### B. Version + installer identity (`958735b`, and the `.iss` hunks above)
 Keep your **own** ARM version string and installer name (e.g.
 `Transcriber-ARM64-Setup`). Set `APP_VERSION` to reflect feature parity, but
 don't copy `"1.2"` blindly — decide your own ARM versioning.
