@@ -623,6 +623,40 @@ def check_for_updates(packages=UPDATE_PACKAGES, timeout=4.0):
 APP_REPO = "DevCon-Productions/Transcriber"
 
 
+def interpreter_is_arm64():
+    """True if this build is native ARM64 (so it should fetch the ARM64
+    installer). Keys off the interpreter's OWN architecture, not the host's:
+    an emulated x64 process on an ARM host must report False so it upgrades with
+    the x64 installer. NOTE: platform.machine() can misreport under emulation on
+    Windows, so we use the build/wheel platform tag and PROCESSOR_ARCHITECTURE
+    (which reflect the process arch)."""
+    import sysconfig
+    plat = (sysconfig.get_platform() or "").lower()   # e.g. win-arm64 / win-amd64
+    if "arm64" in plat or "aarch64" in plat:
+        return True
+    if "amd64" in plat or "x86_64" in plat or "win32" in plat:
+        return False
+    arch = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
+    return "ARM64" in arch
+
+
+def _pick_installer_asset(assets):
+    """Select the release .exe matching THIS build's architecture. Returns None
+    if no matching-arch installer is present, so we report 'no update' rather
+    than cross-installing the wrong architecture. Shared logic with the ARM
+    build: each release carries both Transcriber-Setup-<v>.exe (x64) and
+    Transcriber-ARM64-Setup-<v>.exe (arm64)."""
+    want_arm = interpreter_is_arm64()
+    for a in assets:
+        name = str(a.get("name", "")).lower()
+        if not name.endswith(".exe"):
+            continue
+        is_arm_asset = "arm64" in name or "-arm-" in name
+        if want_arm == is_arm_asset:
+            return a
+    return None
+
+
 def check_for_app_update(current_version, repo=APP_REPO, timeout=6.0):
     """Query the repo's latest GitHub Release and compare it to the running
     version. Returns a dict or None (on any failure — offline, rate-limited, no
@@ -644,11 +678,7 @@ def check_for_app_update(current_version, repo=APP_REPO, timeout=6.0):
     tag = (data.get("tag_name") or "").lstrip("vV")
     if not tag:
         return None
-    asset = None
-    for a in data.get("assets", []):
-        if str(a.get("name", "")).lower().endswith(".exe"):
-            asset = a
-            break
+    asset = _pick_installer_asset(data.get("assets", []))
     return {
         "available": is_newer(tag, current_version),
         "current": current_version,

@@ -57,6 +57,37 @@ def run():
         urllib.request.urlopen = boom
         r["network_error_none"] = (core.check_for_app_update("1.2") is None)
 
+        # 4b. architecture-aware asset picker (shared release, both installers).
+        both = [
+            {"name": "Transcriber-Setup-1.5.exe",
+             "browser_download_url": "https://x/dl/x64.exe", "size": 1},
+            {"name": "Transcriber-ARM64-Setup-1.5.exe",
+             "browser_download_url": "https://x/dl/arm.exe", "size": 2},
+        ]
+        urllib.request.urlopen = lambda u, timeout=None: _Resp(
+            _release_json("v1.5", both))
+        _orig_arm = core.interpreter_is_arm64
+        try:
+            # running as x64 -> must pick the NON-arm installer
+            core.interpreter_is_arm64 = lambda: False
+            ix = core.check_for_app_update("1.2")
+            r["x64_picks_x64_asset"] = (ix["asset_name"] == "Transcriber-Setup-1.5.exe")
+            # running as arm64 -> must pick the arm installer
+            core.interpreter_is_arm64 = lambda: True
+            ia = core.check_for_app_update("1.2")
+            r["arm_picks_arm_asset"] = (ia["asset_name"] == "Transcriber-ARM64-Setup-1.5.exe")
+            # x64 app, release has ONLY an arm asset -> no cross-install (asset None)
+            core.interpreter_is_arm64 = lambda: False
+            urllib.request.urlopen = lambda u, timeout=None: _Resp(
+                _release_json("v1.5", [both[1]]))
+            ionly = core.check_for_app_update("1.2")
+            r["x64_refuses_arm_only"] = (ionly["available"] is True
+                                         and ionly["asset_url"] is None)
+        finally:
+            core.interpreter_is_arm64 = _orig_arm
+        # picker returns None on empty / no matching arch
+        r["picker_empty_none"] = (core._pick_installer_asset([]) is None)
+
         # 5. download_file writes dest, fires progress, cleans .part
         payload = b"x" * (3 * (1 << 20) + 123)
         urllib.request.urlopen = lambda u, timeout=None: _Resp(
