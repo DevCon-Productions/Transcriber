@@ -223,10 +223,16 @@ def _resource_dir():
 def _user_data_dir():
     """Per-user WRITABLE dir for config/credentials/logs. In a frozen install the
     app lives in Program Files (read-only), so writable state goes to AppData.
-    In dev, everything stays in the project folder for convenience."""
+    In dev, everything stays in the project folder for convenience.
+
+    The ARM64 build uses a DISTINCT dir (Transcriber-ARM64) so it never inherits an
+    x64 install's config/credentials on the same machine -- the x64 default is
+    large-v3/CUDA, which on ARM means a 3 GB download and a model that won't load.
+    Lets both architectures be installed side by side with independent state."""
     if getattr(sys, "frozen", False):
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        d = os.path.join(base, "Transcriber")
+        name = "Transcriber-ARM64" if interpreter_is_arm64() else "Transcriber"
+        d = os.path.join(base, name)
         os.makedirs(d, exist_ok=True)
         return d
     return os.path.dirname(os.path.abspath(__file__))
