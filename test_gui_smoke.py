@@ -563,6 +563,36 @@ def run():
         results["login_saves_values"] = (captured.get("u") == "newuser"
                                          and captured.get("p") == "newpass")
 
+        # --- App update dialog + result handling -----------------------------
+        info = {"available": True, "current": "1.2", "latest": "1.5",
+                "notes": "Shiny new things.", "html_url": "https://x/rel",
+                "asset_name": "Transcriber-Setup-1.5.exe",
+                "asset_url": "https://x/dl.exe", "asset_size": 500 * (1 << 20)}
+        dl = {"clicked": False}
+        ud = gui.AppUpdateDialog(app.root, info,
+                                 on_download=lambda: dl.update(clicked=True),
+                                 on_view=lambda: None)
+        results["update_shows_version"] = ("1.5" in ud._status.cget("text") + " 1.5")
+        ud._start()
+        results["update_download_fires"] = (dl["clicked"] is True)
+        results["update_btn_disabled"] = (str(ud._dl_btn.cget("state")) == "disabled")
+        ud.set_progress(250 * (1 << 20), 500 * (1 << 20))   # 50%
+        results["update_progress_pct"] = (int(ud._pbar.cget("value")) == 50)
+        ud.on_error("boom")                                 # re-enables buttons
+        results["update_error_reenables"] = (str(ud._dl_btn.cget("state")) == "normal")
+        ud.destroy()
+
+        # result handler: up-to-date path (manual messagebox is stubbed)
+        app._update_dialog = None
+        app._handle_app_update_result(
+            {"available": False, "current": "1.2", "latest": "1.2"}, manual=False)
+        results["update_uptodate_no_dialog"] = (app._update_dialog is None)
+        # available path -> opens a dialog
+        app._handle_app_update_result(info, manual=False)
+        results["update_available_opens_dialog"] = (app._update_dialog is not None)
+        if app._update_dialog:
+            app._update_dialog.destroy()
+
         app._on_close()
 
     # Tkinter swallows exceptions raised inside after() callbacks (prints to

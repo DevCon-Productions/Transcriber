@@ -854,8 +854,12 @@ READ ALOUD — TEXT TO SPEECH  (toolbar "Speak" button)
 MODEL & UPDATES
   • Model dropdown switches the Whisper model live (bigger = more accurate,
     smaller = faster/lighter). It reloads without stopping your feeds.
-  • "Check updates" looks for newer speech-engine versions (report only; it never
-    installs on its own). It also checks quietly at launch.
+  • "Check updates" (toolbar) looks for newer speech-engine libraries (report
+    only; it never installs on its own). It also checks quietly at launch.
+  • Help → "Check for app updates" looks for a newer Transcriber release on
+    GitHub. If one exists it shows the release notes and can download the
+    installer and upgrade in place (you'll get a Windows admin prompt). The app
+    also checks for a new version quietly at launch.
 
 LOGS & PRIVACY
   Transcripts are saved under logs\\ and auto-deleted after a number of days
@@ -1014,6 +1018,103 @@ class BroadcastifyLoginDialog(tk.Toplevel):
         self.destroy()
 
 
+class AppUpdateDialog(tk.Toplevel):
+    """Offer a newer app version: show the version + release notes, then a
+    Download & install button that swaps to a progress bar. The controller pushes
+    progress via set_progress()/on_done()/on_error()."""
+    def __init__(self, parent, info, on_download, on_view):
+        super().__init__(parent)
+        self.title("Update available")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.resizable(False, False)
+        self._on_download = on_download
+        self._on_view = on_view
+        self._info = info
+
+        tk.Label(self, text=f"Transcriber {info['latest']} is available",
+                 bg=BG, fg=FG, font=("Segoe UI", 13, "bold")).pack(
+            padx=24, pady=(20, 2))
+        tk.Label(self, text=f"You have {info['current']}.", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(padx=24)
+
+        # Release notes (read-only, scrollable).
+        nf = tk.Frame(self, bg=BG)
+        nf.pack(padx=24, pady=(14, 6), fill="both")
+        sb = ttk.Scrollbar(nf)
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(nf, width=64, height=12, wrap="word", bg=BG2, fg=FG,
+                      relief="flat", font=("Segoe UI", 9), yscrollcommand=sb.set,
+                      padx=10, pady=8)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt.yview)
+        txt.insert("1.0", info.get("notes") or "(no release notes)")
+        txt.configure(state="disabled")
+
+        # Progress area (hidden until download starts).
+        self._pbar = ttk.Progressbar(self, orient="horizontal", mode="determinate",
+                                     maximum=100, length=460)
+        self._status = tk.Label(self, text="", bg=BG, fg=MUTED,
+                                font=("Segoe UI", 9))
+
+        self._btns = tk.Frame(self, bg=BG)
+        self._btns.pack(pady=(6, 18))
+        self._dl_btn = tk.Button(self._btns, text="Download & install",
+                                 command=self._start, bg=BG2, fg=FG, relief="flat",
+                                 width=18)
+        self._dl_btn.pack(side="left", padx=6)
+        tk.Button(self._btns, text="View release", command=self._on_view, bg=BG2,
+                  fg=FG, relief="flat", width=12).pack(side="left", padx=6)
+        self._later_btn = tk.Button(self._btns, text="Later", command=self.destroy,
+                                    bg=BG2, fg=FG, relief="flat", width=10)
+        self._later_btn.pack(side="left", padx=6)
+
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+            self.geometry(f"+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            pass
+
+    def _start(self):
+        self._dl_btn.configure(state="disabled")
+        self._later_btn.configure(state="disabled")
+        self._pbar.pack(padx=24, pady=(0, 2))
+        self._status.pack(padx=24, pady=(0, 4))
+        self._status.configure(text="Starting download…")
+        self._on_download()
+
+    def set_progress(self, done, total):
+        if total:
+            pct = int(done * 100 / total)
+            self._pbar.configure(mode="determinate", value=pct)
+            self._status.configure(
+                text=f"Downloading… {done // (1 << 20)} / {total // (1 << 20)} MB ({pct}%)")
+        else:
+            self._pbar.configure(mode="indeterminate")
+            self._pbar.start(20)
+            self._status.configure(text=f"Downloading… {done // (1 << 20)} MB")
+
+    def on_done(self):
+        try:
+            self._pbar.stop()
+        except Exception:
+            pass
+        self._pbar.configure(mode="determinate", value=100)
+        self._status.configure(text="Download complete — launching installer…",
+                               fg="#7fd18b")
+
+    def on_error(self, msg):
+        try:
+            self._pbar.stop()
+        except Exception:
+            pass
+        self._status.configure(text=f"Update failed: {msg}", fg="#e06c6c")
+        self._dl_btn.configure(state="normal")
+        self._later_btn.configure(state="normal")
+
+
 class TranscriberGUI:
     def __init__(self, root, splash=None):
         self.root = root
@@ -1031,6 +1132,7 @@ class TranscriberGUI:
         self.engine = None
         self.events = queue.Queue()          # (kind, payload) from bg threads
         self.sector_panels = {}              # name -> ScrolledText (sectors view)
+        self._update_dialog = None           # active AppUpdateDialog, if any
         self.history = collections.deque(maxlen=HISTORY_MAX)  # (name,color,text,ts)
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
@@ -1073,6 +1175,7 @@ class TranscriberGUI:
         self.root.after(100, self._drain_events)
         # Quiet automatic update check shortly after launch (status bar only).
         self.root.after(1500, self._check_updates_auto)
+        self.root.after(3500, self._check_app_update_auto)   # quiet app-update check
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # Safety net: never leave the splash up (and the window hidden) forever
         # if the model fails to load and no 'ready' event fires.
@@ -1221,6 +1324,8 @@ class TranscriberGUI:
 
         help_menu = tk.Menu(m, tearoff=0)
         help_menu.add_command(label="Help / User guide", command=self._open_help)
+        help_menu.add_command(label="Check for app updates...",
+                              command=self._check_app_update_manual)
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self._open_about)
         m.add_cascade(label="Help", menu=help_menu)
@@ -1231,6 +1336,87 @@ class TranscriberGUI:
 
     def _open_about(self):
         AboutDialog(self.root)
+
+    # -- app self-update ----------------------------------------------------
+    def _check_app_update_manual(self):
+        self._set_status("Checking for app updates…")
+        threading.Thread(target=self._run_app_update_check, args=(True,),
+                         daemon=True).start()
+
+    def _check_app_update_auto(self):
+        threading.Thread(target=self._run_app_update_check, args=(False,),
+                         daemon=True).start()
+
+    def _run_app_update_check(self, manual):
+        info = core.check_for_app_update(APP_VERSION)
+        self.events.put(("app_update_result", (info, manual)))
+
+    def _handle_app_update_result(self, info, manual):
+        if info is None:
+            if manual:
+                messagebox.showinfo("Updates",
+                                    "Couldn't check for updates (offline or GitHub "
+                                    "unavailable). Try again later.")
+            else:
+                self._set_status("Update check skipped (offline).")
+            return
+        if not info.get("available"):
+            if manual:
+                messagebox.showinfo("Updates",
+                                    f"You're up to date (version {info['current']}).")
+            else:
+                self._set_status(f"Up to date (v{info['current']}).")
+            return
+        if not info.get("asset_url"):
+            # A newer version exists but has no installer asset to download.
+            self._set_status(f"Version {info['latest']} is available on GitHub.")
+            if manual:
+                messagebox.showinfo("Update available",
+                                    f"Transcriber {info['latest']} is available, but "
+                                    "no installer was attached to the release. See "
+                                    "the releases page.")
+            return
+        self._set_status(f"Update available: v{info['latest']}.")
+        self._update_dialog = AppUpdateDialog(
+            self.root, info,
+            on_download=lambda: self._start_app_download(info),
+            on_view=lambda: self._open_url(info.get("html_url")))
+
+    def _start_app_download(self, info):
+        dest = os.path.join(core.DATA_DIR, "updates", info["asset_name"])
+        threading.Thread(target=self._download_update, args=(info, dest),
+                         daemon=True).start()
+
+    def _download_update(self, info, dest):
+        try:
+            core.download_file(
+                info["asset_url"], dest,
+                progress_cb=lambda d, t: self.events.put(("app_dl_progress", (d, t))))
+            self.events.put(("app_dl_done", dest))
+        except Exception as e:
+            self.events.put(("app_dl_error", str(e)))
+
+    def _launch_installer_and_quit(self, path):
+        """Launch the downloaded installer (UAC prompt — it's admin-manifested)
+        and quit so it can replace files. Inno upgrades in place via its fixed
+        AppId and relaunches the app from its postinstall step."""
+        try:
+            os.startfile(path)   # noqa: S606 — trusted, freshly downloaded from our release
+        except Exception as e:
+            if getattr(self, "_update_dialog", None):
+                self._update_dialog.on_error(f"couldn't launch installer: {e}")
+            return
+        # Give the installer a moment to spawn before we exit.
+        self.root.after(1200, self._on_close)
+
+    def _open_url(self, url):
+        if not url:
+            return
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
 
     def _open_login(self):
         """Open the Broadcastify credentials dialog; apply saved creds live."""
@@ -1571,6 +1757,19 @@ class TranscriberGUI:
                     self._highlight_spoken(payload, True)
                 elif kind == "speak_end":
                     self._highlight_spoken(payload, False)
+                elif kind == "app_update_result":
+                    info, manual = payload
+                    self._handle_app_update_result(info, manual)
+                elif kind == "app_dl_progress":
+                    if getattr(self, "_update_dialog", None):
+                        self._update_dialog.set_progress(*payload)
+                elif kind == "app_dl_done":
+                    if getattr(self, "_update_dialog", None):
+                        self._update_dialog.on_done()
+                    self._launch_installer_and_quit(payload)
+                elif kind == "app_dl_error":
+                    if getattr(self, "_update_dialog", None):
+                        self._update_dialog.on_error(payload)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_events)
