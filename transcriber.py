@@ -2127,6 +2127,16 @@ _WHISPERCPP_MODEL_MAP = {
 # choose a small/quantized model; this is the fallback when a name can't be mapped.
 ARM_DEFAULT_MODEL = "small.en-q5_1"
 
+# Approximate GGML download sizes (MB), for a friendly first-run download status.
+# Rough figures -- only used to show "~N MB" while the model downloads.
+_WHISPERCPP_MODEL_MB = {
+    "tiny": 75, "tiny.en": 75, "tiny-q5_1": 31, "tiny.en-q5_1": 31,
+    "base": 148, "base.en": 148, "base-q5_1": 57, "base.en-q5_1": 57,
+    "small": 488, "small.en": 488, "small-q5_1": 181, "small.en-q5_1": 181,
+    "medium": 1530, "medium.en": 1530,
+    "large-v3": 3100, "large-v3-turbo": 1600, "large-v2": 3100,
+}
+
 
 def whispercpp_model_name(name):
     """Resolve an app model id to a valid whisper.cpp GGML model name."""
@@ -2205,15 +2215,45 @@ class WhisperCppBackend:
         models_dir = cfg.get("whispercpp_models_dir") or os.path.join(
             DATA_DIR, "whispercpp_models")
         os.makedirs(models_dir, exist_ok=True)
-        if status_cb:
+
+        # First use downloads the GGML model (up to hundreds of MB) into models_dir.
+        # In a packaged app there's no console, and Model() blocks with no visible
+        # feedback -- so it just looks frozen / "not transcribing". Report progress
+        # to the GUI status line: pywhispercpp writes the file as it downloads, so a
+        # watcher thread reports how many MB have landed while Model() fetches it.
+        model_file = os.path.join(models_dir, f"ggml-{wname}.bin")
+        downloading = not os.path.exists(model_file)
+        watch_stop = threading.Event()
+        if downloading and status_cb:
+            approx = _WHISPERCPP_MODEL_MB.get(wname)
+            status_cb(f"First run: downloading the '{wname}' speech model"
+                      + (f" (~{approx} MB)" if approx else "")
+                      + " — one time. Transcription starts when it finishes…")
+
+            def _watch():
+                while not watch_stop.wait(2.0):
+                    try:
+                        mb = os.path.getsize(model_file) / (1 << 20)
+                    except OSError:
+                        mb = 0
+                    status_cb(f"Downloading '{wname}' model… {mb:.0f}"
+                              + (f" / ~{approx} MB" if approx else " MB"))
+            threading.Thread(target=_watch, daemon=True, name="wcpp-dl").start()
+        elif status_cb:
             status_cb(f"Loading whisper.cpp model '{wname}' "
                       f"({self._n_threads} threads)...")
-        self._model = Model(
-            model=wname, models_dir=models_dir,
-            redirect_whispercpp_logs_to=False,
-            n_threads=self._n_threads, print_progress=False,
-            print_realtime=False,
-        )
+
+        try:
+            self._model = Model(
+                model=wname, models_dir=models_dir,
+                redirect_whispercpp_logs_to=False,
+                n_threads=self._n_threads, print_progress=False,
+                print_realtime=False,
+            )
+        finally:
+            watch_stop.set()
+        if downloading and status_cb:
+            status_cb(f"Model '{wname}' downloaded ({self._n_threads} threads).")
 
     def transcribe(self, audio, language=None, initial_prompt=None,
                    no_speech_threshold=0.6, log_prob_threshold=-1.0,
