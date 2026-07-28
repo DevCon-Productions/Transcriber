@@ -220,6 +220,9 @@ dropdown. The `-E` flag avoids this machine's PYTHONPATH trap — see below.
 - `log_retention_days` — on startup, delete log files older than this many days
   (default 14). Set to `0` to keep logs forever. Because logs contain sensitive
   PII, this keeps the on-disk footprint bounded automatically.
+- `clips.enabled` / `clips.retention_days` / `clips.bitrate` — audio clip
+  recording (off by default). Same purge-on-startup contract as the logs, and it
+  matters more here: clips are voice recordings. See "Clip recording" below.
 
 The GUI keeps recent transcript lines in memory and **replays them** when you
 toggle a feed or switch views, so the visible scrollback no longer resets.
@@ -312,6 +315,46 @@ dropped:
 | URL / Broadcastify | Yes | Just a URL |
 | `pc audio` | Needs re-pointing | Names a specific output device on the old PC |
 | `application` | No on ARM64 | Per-app capture has no ARM64 build; the pid is session-only |
+
+### Clip recording — click a line, hear it again
+
+Transcriber can keep the audio behind every transcript line. Lines with a saved
+recording get a violet **🔊**; click it to hear that exact transmission.
+
+No continuous recording is involved. The voice gate already splits each feed into
+one segment per transmission, and that same segment is what gets transcribed — so
+a line and its audio are 1:1 by construction, including the `preroll_sec` lead-in
+so clips don't sound chopped.
+
+Two switches, both **off** by default:
+
+1. **Streams → Audio recording…** — the master switch, retention in days, what's
+   on disk now, open-folder, and delete-all.
+2. **Feeds → Edit → "Save audio for each line"** — per-feed opt-in.
+
+Playback takes over the speakers briefly; the live feed you were listening to
+resumes when the clip ends, and clicking another 🔊 interrupts the first.
+
+| | Size |
+|---|---|
+| Raw 16 kHz mono WAV | ~32 KB/s → **~800 MB/day** for a busy feed |
+| Opus (what's used) | ~7× smaller → **~100 MB/day** |
+
+Encoding goes through the ffmpeg that already decodes the streams, so there's no
+new dependency on either build. If that ffmpeg has no `libopus`, clips fall back
+to WAV and the status line says so once — shorten the retention if that happens.
+
+Clips are voice recordings of live radio. They stay on your PC, are purged on the
+same kind of schedule as the logs (`clips.retention_days`), and can be wiped from
+the recording dialog at any time.
+
+```jsonc
+"clips": {
+  "enabled": true,        // master switch
+  "retention_days": 7,    // 0 = keep forever
+  "bitrate": "24k"        // Opus target
+}
+```
 
 ### Saving a transcript as PDF
 

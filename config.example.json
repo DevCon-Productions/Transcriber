@@ -5,6 +5,11 @@
   "language": "en",
   "beam_size": 5,
   "log_retention_days": 14,
+  "clips": {
+    "enabled": false,
+    "retention_days": 7,
+    "bitrate": "24k"
+  },
   "unit_prefixes": [],
   "initial_prompt": "The following is police, fire, and EMS radio dispatch. Common terms: dispatch, copy, en route, on scene, clear, 10-4, code three, signal, suspect, vehicle, plate, registration, subject, complainant, requesting backup, be advised, negative, affirmative, over.",
   "vad": {

@@ -348,7 +348,7 @@ FEED_EXPORT_VERSION = 1
 
 # Per-feed keys that are portable between machines and architectures.
 FEED_PORTABLE_KEYS = ("name", "url", "type", "provider", "color", "location",
-                      "desc", "output_device", "app_name")
+                      "desc", "output_device", "app_name", "record")
 
 
 def _clean_feed(entry):
@@ -621,6 +621,275 @@ def read_log_lines(paths):
         except OSError:
             continue
     return lines
+
+
+# --------------------------------------------------------------------------
+# Clip recording: keep the audio behind each transcript line.
+#
+# The gate already does the hard part. Gate.push() emits ONE completed segment
+# per transmission and that same array is what gets transcribed, so a line and
+# its audio are 1:1 -- there is nothing to record continuously and slice up
+# later. A clip is just that array written out (preroll_sec included, so it
+# doesn't sound chopped).
+#
+# Storage is the real constraint: 16 kHz mono s16 is 32 KB/s, so a busy feed at
+# ~30% duty cycle (~7h of actual transmissions) is ~800 MB/day as WAV. Clips are
+# therefore encoded to Opus through the ffmpeg that already decodes the streams
+# (no new dependency on either architecture), which measures ~7x smaller on
+# scanner-length segments -- call it ~100 MB/day for a busy feed. If ffmpeg can't
+# encode Opus we fall back to WAV via the stdlib and say so once.
+#
+# Writing happens on a worker thread: encoding on the transcribe thread would
+# add latency to every line.
+# --------------------------------------------------------------------------
+CLIP_DIR = os.path.join(DATA_DIR, "clips")
+CLIP_QUEUE_MAX = 200          # bounded: never let a stalled disk eat memory
+CLIP_DEFAULTS = {"enabled": False, "retention_days": 7, "bitrate": "24k"}
+
+
+def clip_settings(cfg):
+    """Merge the config's 'clips' block over the defaults."""
+    s = dict(CLIP_DEFAULTS)
+    s.update(cfg.get("clips") or {})
+    return s
+
+
+def _f32_to_s16_bytes(audio):
+    """Gate segments are float32 in [-1, 1]; clips are int16 PCM."""
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+class ClipStore:
+    """Saves and reloads the audio behind transcript lines.
+
+    save() is called from the transcribe thread and returns a clip id
+    immediately; the encode happens on this object's writer thread. The id is
+    minted up front so the transcript line can carry it before the file exists.
+    """
+
+    def __init__(self, cfg, out=None, clip_dir=CLIP_DIR, ffmpeg=None):
+        s = clip_settings(cfg)
+        self.enabled = bool(s["enabled"])
+        self.retention_days = s["retention_days"]
+        self.bitrate = s["bitrate"]
+        self.dir = clip_dir
+        self.out = out
+        self.ffmpeg = ffmpeg or find_ffmpeg()
+        self._q = queue.Queue(maxsize=CLIP_QUEUE_MAX)
+        self._thread = None
+        self._stop = threading.Event()
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        self._opus = None           # None = not probed yet, then True/False
+        self._warned = False
+        self.dropped = 0            # clips lost to a full queue (writer too slow)
+
+    # -- lifecycle ---------------------------------------------------------
+    def start(self):
+        if self._thread is not None:
+            return
+        os.makedirs(self.dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="clipwriter")
+        self._thread.start()
+
+    def stop(self, timeout=5.0):
+        """Stop the writer, giving queued clips a chance to land."""
+        self._stop.set()
+        t = self._thread
+        self._thread = None
+        if t:
+            t.join(timeout=timeout)
+
+    # -- writing -----------------------------------------------------------
+    def new_id(self, feed, when=None):
+        when = when or dt.datetime.now()
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
+        return (f"{safe_filename(feed)}-{when.strftime('%Y%m%d-%H%M%S')}"
+                f"-{seq:05d}")
+
+    def save(self, feed, audio, text="", when=None):
+        """Queue `audio` (float32 gate segment) for writing. Returns the clip id,
+        or None if recording is off or the queue is saturated."""
+        if not self.enabled or self._thread is None:
+            return None
+        when = when or dt.datetime.now()
+        clip_id = self.new_id(feed, when)
+        item = {
+            "id": clip_id, "feed": feed, "day": when.strftime("%Y%m%d"),
+            "ts": when.strftime("%H:%M:%S"), "text": text,
+            "dur": round(len(audio) / float(SAMPLE_RATE), 2),
+        }
+        try:
+            self._q.put_nowait((item, _f32_to_s16_bytes(audio)))
+        except queue.Full:
+            # Better to lose a clip than to stall transcription behind the disk.
+            self.dropped += 1
+            return None
+        return clip_id
+
+    def _run(self):
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                item, pcm = self._q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                self._write(item, pcm)
+            except Exception as e:
+                self._warn(f"clip write failed: {e}")
+            finally:
+                self._q.task_done()
+
+    def _write(self, item, pcm):
+        os.makedirs(self.dir, exist_ok=True)
+        if self._opus is None:
+            self._opus = self._probe_opus()
+            if not self._opus:
+                self._warn("ffmpeg has no Opus encoder -- saving clips as WAV "
+                           "(much larger; consider a shorter clip retention).")
+        path = os.path.join(self.dir, item["id"] +
+                            (".opus" if self._opus else ".wav"))
+        if self._opus:
+            self._encode_opus(pcm, path)
+        else:
+            self._write_wav(pcm, path)
+        item["file"] = os.path.basename(path)
+        item["bytes"] = os.path.getsize(path)
+        with open(self._index_path(item["day"]), "a", encoding="utf-8") as f:
+            f.write(json.dumps(item) + "\n")
+
+    def _encode_opus(self, pcm, path):
+        cmd = [self.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+               "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+               "-c:a", "libopus", "-b:a", self.bitrate, "-application", "voip",
+               path]
+        proc = subprocess.run(cmd, input=pcm, capture_output=True,
+                              **_no_window_kwargs())
+        if proc.returncode != 0 or not os.path.exists(path):
+            raise RuntimeError((proc.stderr or b"").decode("utf-8", "replace")[-200:]
+                               or "ffmpeg failed")
+
+    @staticmethod
+    def _write_wav(pcm, path):
+        import wave
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm)
+
+    def _probe_opus(self):
+        """Does this ffmpeg build have libopus? Probed once, then cached."""
+        try:
+            proc = subprocess.run([self.ffmpeg, "-hide_banner", "-encoders"],
+                                  capture_output=True, timeout=15,
+                                  **_no_window_kwargs())
+            return b"libopus" in (proc.stdout or b"")
+        except Exception:
+            return False
+
+    def _warn(self, msg):
+        if self.out and not self._warned:
+            self._warned = True
+            self.out.status(msg)
+
+    # -- reading -----------------------------------------------------------
+    def _index_path(self, day):
+        return os.path.join(self.dir, f"index-{day}.jsonl")
+
+    def path_for(self, clip_id):
+        """Where a clip landed, or None if it isn't on disk (yet)."""
+        for ext in (".opus", ".wav"):
+            p = os.path.join(self.dir, clip_id + ext)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def load_pcm(self, clip_id):
+        """Decode a clip back to raw 16 kHz mono s16 bytes for playback.
+        Returns b"" if the clip is missing or undecodable."""
+        path = self.path_for(clip_id)
+        if not path:
+            return b""
+        if path.endswith(".wav"):
+            import wave
+            try:
+                with wave.open(path, "rb") as w:
+                    return w.readframes(w.getnframes())
+            except Exception:
+                return b""
+        cmd = [self.ffmpeg, "-nostdin", "-loglevel", "error", "-i", path,
+               "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=30,
+                                  **_no_window_kwargs())
+            return proc.stdout if proc.returncode == 0 else b""
+        except Exception:
+            return b""
+
+    def index_for_day(self, day):
+        """Every clip record saved on `day` (YYYYMMDD), oldest first."""
+        p = self._index_path(day)
+        if not os.path.isfile(p):
+            return []
+        rows = []
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue        # a torn last line after a hard kill
+        return rows
+
+    def find_clip(self, feed, ts, day=None):
+        """The clip id for a feed's line at timestamp `ts` (HH:MM:SS), or None.
+        Used to re-attach audio to lines restored from disk logs."""
+        day = day or dt.datetime.now().strftime("%Y%m%d")
+        for row in self.index_for_day(day):
+            if row.get("feed") == feed and row.get("ts") == ts:
+                return row.get("id")
+        return None
+
+
+def purge_old_clips(retention_days, clip_dir=CLIP_DIR):
+    """Delete clips and index files older than retention_days. Same contract as
+    purge_old_logs -- clips are voice recordings, so bounding them matters more,
+    not less. retention_days <= 0 disables purging. Returns deleted paths."""
+    if not retention_days or retention_days <= 0:
+        return []
+    if not os.path.isdir(clip_dir):
+        return []
+    cutoff = time.time() - retention_days * 86400
+    deleted = []
+    for pattern in ("*.opus", "*.wav", "index-*.jsonl"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    deleted.append(path)
+            except OSError:
+                pass
+    return deleted
+
+
+def clips_disk_usage(clip_dir=CLIP_DIR):
+    """(clip count, total bytes) currently on disk."""
+    n = total = 0
+    for pattern in ("*.opus", "*.wav"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                total += os.path.getsize(path)
+                n += 1
+            except OSError:
+                pass
+    return n, total
 
 
 # --------------------------------------------------------------------------
@@ -1197,27 +1466,33 @@ def enable_windows_ansi():
 class Output:
     def __init__(self, on_line=None, on_status=None, console=True, file_logging=True):
         self._lock = threading.Lock()
-        self.on_line = on_line          # callback(stream_name, color, text, ts)
+        # callback(stream_name, color, text, ts, clip_id); clip_id is None unless
+        # this feed is recording and the clip was queued successfully.
+        self.on_line = on_line
         self.on_status = on_status      # callback(msg)
         self.console = console
         self.file_logging = file_logging
         if self.file_logging:
             os.makedirs(LOG_DIR, exist_ok=True)
 
-    def line(self, stream_name, color, text):
-        ts = dt.datetime.now().strftime("%H:%M:%S")
+    def line(self, stream_name, color, text, clip_id=None, when=None):
+        # `when` lets the caller pin the line and its saved clip to the SAME
+        # instant -- otherwise the two can straddle a second boundary and the
+        # clip index no longer matches the timestamp written to the log.
+        when = when or dt.datetime.now()
+        ts = when.strftime("%H:%M:%S")
         with self._lock:
             if self.console:
                 code = ANSI_COLORS.get(color, "97")
                 print(f"\033[{code}m[{ts}] {stream_name:<10}\033[0m {text}", flush=True)
             if self.file_logging:
-                day = dt.datetime.now().strftime("%Y%m%d")
+                day = when.strftime("%Y%m%d")
                 path = os.path.join(LOG_DIR, f"{safe_filename(stream_name)}-{day}.log")
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(f"[{ts}] {text}\n")
         if self.on_line:
             try:
-                self.on_line(stream_name, color, text, ts)
+                self.on_line(stream_name, color, text, ts, clip_id)
             except Exception:
                 pass
 
@@ -1238,6 +1513,10 @@ class Output:
 # Workers always feed their decoded PCM here tagged with their stream name; the
 # player only emits audio for the currently-selected source (listen one-at-a-
 # time). sounddevice is imported lazily so the headless CLI never depends on it.
+#
+# A saved clip (play_clip) takes priority over the live feed rather than mixing
+# with it: two radio voices at once is unlistenable, and the point of clicking a
+# line is to hear THAT transmission. Live audio resumes when the clip ends.
 # --------------------------------------------------------------------------
 class AudioPlayer:
     def __init__(self):
@@ -1246,6 +1525,7 @@ class AudioPlayer:
         self._stream = None
         self._sd = None
         self._buf = bytearray()
+        self._clip = bytearray()        # one-shot clip, drained before _buf
         self._ok = self._init_device()
 
     def _init_device(self):
@@ -1268,9 +1548,14 @@ class AudioPlayer:
     def _callback(self, outdata, frames, time_info, status):
         need = frames * 2  # int16 mono -> 2 bytes/frame
         with self._lock:
-            have = min(need, len(self._buf))
-            outdata[:have] = bytes(self._buf[:have])
-            del self._buf[:have]
+            src = self._clip if self._clip else self._buf
+            have = min(need, len(src))
+            outdata[:have] = bytes(src[:have])
+            del src[:have]
+            # While a clip plays, live audio is discarded rather than queued --
+            # otherwise the feed would blast a backlog the moment the clip ends.
+            if self._clip:
+                self._buf.clear()
         if have < need:
             outdata[have:] = b"\x00" * (need - have)
 
@@ -1284,11 +1569,30 @@ class AudioPlayer:
         with self._lock:
             return self._source
 
+    def play_clip(self, pcm_bytes):
+        """Play a saved clip once, over the top of whatever is live. Replaces any
+        clip already playing (clicking a second line interrupts the first)."""
+        if not self._ok or not pcm_bytes:
+            return False
+        with self._lock:
+            self._clip = bytearray(pcm_bytes)
+            self._buf.clear()
+        return True
+
+    def stop_clip(self):
+        """Cut a clip short and hand the speakers back to the live feed."""
+        with self._lock:
+            self._clip.clear()
+
+    def clip_playing(self):
+        with self._lock:
+            return bool(self._clip)
+
     def feed(self, name, pcm_bytes):
         if not self._ok:
             return
         with self._lock:
-            if name != self._source:
+            if name != self._source or self._clip:
                 return
             # Guard against unbounded growth if the device stalls (~2s cap).
             if len(self._buf) > SAMPLE_RATE * 2 * 2:
@@ -2584,7 +2888,8 @@ class WhisperCppBackend:
 # Transcription worker: single shared model serving all streams
 # --------------------------------------------------------------------------
 class Transcriber(threading.Thread):
-    def __init__(self, model, cfg, jobq, out, stop_evt):
+    def __init__(self, model, cfg, jobq, out, stop_evt, clips=None,
+                 should_record=None):
         super().__init__(daemon=True, name="transcriber")
         self.model = model
         self.cfg = cfg
@@ -2594,6 +2899,9 @@ class Transcriber(threading.Thread):
         self.max_no_speech = cfg.get("filters", {}).get("max_no_speech_prob", 0.6)
         self.min_logprob = cfg.get("filters", {}).get("min_avg_logprob", -1.0)
         self.tts_hook = None    # optional callable(stream_name, text) for TTS
+        self.clips = clips              # ClipStore, or None when not recording
+        # callable(stream_name) -> bool; per-feed opt-in for clip recording.
+        self.should_record = should_record or (lambda _name: False)
 
     def run(self):
         while not self.stop_evt.is_set():
@@ -2635,7 +2943,14 @@ class Transcriber(threading.Thread):
                 parts.append(txt)
         text = _collapse_repeats(" ".join(parts).strip())
         if text:
-            self.out.line(name, color, text)
+            # Save the clip only once we know the segment produced real text:
+            # hallucination-filtered transmissions would otherwise leave audio
+            # on disk that no line ever points at.
+            when = dt.datetime.now()
+            clip_id = None
+            if self.clips is not None and self.should_record(name):
+                clip_id = self.clips.save(name, audio, text=text, when=when)
+            self.out.line(name, color, text, clip_id=clip_id, when=when)
             if self.tts_hook:
                 try:
                     self.tts_hook(name, text)
@@ -2665,6 +2980,12 @@ class Engine:
         self.player = AudioPlayer() if enable_audio else None
         self.auth_header = self._build_auth()
 
+        # Clip recording: which feeds save their audio (per-feed opt-in), plus
+        # the store that writes/reads them. Populated by start_streams/add_stream
+        # from each stream dict's "record" flag.
+        self.clips = ClipStore(cfg, out=self.out, ffmpeg=self.ffmpeg)
+        self.recording_feeds = set()
+
         # Text-to-speech state (lazy: player created only when first enabled).
         tts = cfg.get("tts", {})
         self.tts = None
@@ -2683,6 +3004,12 @@ class Engine:
             deleted = purge_old_logs(days)
             if deleted:
                 self.out.status(f"Purged {len(deleted)} log file(s) older than {days} day(s).")
+        # Same for clips -- voice recordings, so bounding them matters more.
+        cdays = self.clips.retention_days
+        cdeleted = purge_old_clips(cdays, self.clips.dir)
+        if cdeleted:
+            self.out.status(f"Purged {len(cdeleted)} clip file(s) older than "
+                            f"{cdays} day(s).")
 
     # -- auth ---------------------------------------------------------------
     def _build_auth(self):
@@ -2768,12 +3095,53 @@ class Engine:
         t0 = time.time()
         self.model = self._make_whisper_model(self.cfg.get("model", "large-v3"))
         self.out.status(f"Model ready in {time.time()-t0:.1f}s.")
+        self.clips.start()
         self.transcriber = Transcriber(self.model, self.cfg, self.jobq,
-                                       self.out, self.stop_evt)
+                                       self.out, self.stop_evt,
+                                       clips=self.clips,
+                                       should_record=self.is_recording)
         self.transcriber.tts_hook = self._maybe_speak
         self.transcriber.start()
         if self.tts_enabled:
             self._ensure_tts()
+
+    # -- clip recording -----------------------------------------------------
+    def is_recording(self, name):
+        """True if this feed saves the audio behind each of its lines. Requires
+        both the global switch and the feed's own opt-in."""
+        return self.clips.enabled and name in self.recording_feeds
+
+    def set_recording(self, name, on):
+        """Turn clip recording on/off for one feed (takes effect immediately --
+        the next transmission is saved or not, no restart)."""
+        if on:
+            self.recording_feeds.add(name)
+        else:
+            self.recording_feeds.discard(name)
+
+    def set_clips_enabled(self, on):
+        """Global switch. Off means no feed records, whatever its own flag."""
+        self.clips.enabled = bool(on)
+        if on:
+            self.clips.start()
+
+    def play_clip(self, clip_id):
+        """Play a saved clip through the speakers. Returns True if audio started.
+        Decoding runs on a worker thread so a click never blocks the UI."""
+        if not (self.player and self.player.available and clip_id):
+            return False
+        def _go():
+            pcm = self.clips.load_pcm(clip_id)
+            if pcm:
+                self.player.play_clip(pcm)
+            else:
+                self.out.status("That clip is no longer on disk.")
+        threading.Thread(target=_go, daemon=True, name="clipplay").start()
+        return True
+
+    def stop_clip(self):
+        if self.player:
+            self.player.stop_clip()
 
     # -- text-to-speech -----------------------------------------------------
     def _ensure_tts(self):
@@ -2909,6 +3277,8 @@ class Engine:
         """Start a worker for a stream. Type 'pcaudio' captures a PC input
         device; anything else is a URL/feed via ffmpeg. Returns True if started."""
         name = stream["name"]
+        # Clip recording is per-feed opt-in, carried on the stream dict.
+        self.set_recording(name, stream.get("record", False))
         with self._lock:
             if name in self.workers:
                 self.out.status(f"[{name}] already running.")
@@ -2936,6 +3306,7 @@ class Engine:
     def remove_stream(self, name):
         with self._lock:
             w = self.workers.pop(name, None)
+        self.recording_feeds.discard(name)
         if w:
             w.stop()
             if self.player and self.player.get_source() == name:
@@ -2983,6 +3354,9 @@ class Engine:
 
     def shutdown(self):
         self.stop_evt.set()
+        # Stop the clip writer FIRST: it drains what's queued, so clips from the
+        # last few seconds still land instead of dying with the process.
+        self.clips.stop()
         if self.player:
             self.player.close()
         if self.tts:

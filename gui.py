@@ -103,6 +103,7 @@ FG = "#e6e6e6"
 MUTED = "#9aa0a6"
 NO_UNIT_COLOR = FG          # white for lines with no detected speaker/call sign
 LINK_FG = "#6db3f2"         # blue for clickable address -> Google Maps links
+CLIP_FG = "#c2a3f0"         # violet for the 🔊 "play this line's audio" marker
 
 # Read-aloud keyword presets: each checkbox expands to several synonyms so you
 # catch variants without typing them all. Label -> list of match terms (lower).
@@ -334,6 +335,19 @@ class AddStreamDialog(simpledialog.Dialog):
         tk.Label(master, text="e.g. Cleveland, OH", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8)).grid(row=7, column=1, sticky="w", padx=6)
 
+        # Clip recording: per-feed opt-in, off by default. Saves the audio behind
+        # each transcript line so you can click 🔊 and hear that transmission.
+        self.record = tk.BooleanVar(value=bool(init.get("record", False)))
+        tk.Checkbutton(master, text="Save audio for each line (click 🔊 to replay)",
+                       variable=self.record, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       anchor="w").grid(row=8, column=1, sticky="w", padx=4,
+                                        pady=(8, 0))
+        tk.Label(master, text="Roughly 100 MB per day for a busy feed. "
+                 "Old clips are deleted automatically.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=9, column=1, sticky="w", padx=6, pady=(0, 4))
+
         self.provider = tk.StringVar(value=init.get("provider", "broadcastify"))
         self._sync_state()
         return None
@@ -418,6 +432,9 @@ class AddStreamDialog(simpledialog.Dialog):
         loc = self.location.get().strip()
         if loc:
             self.result["location"] = loc
+        # Only written when on, so feeds that never opt in stay clean in config.
+        if self.record.get():
+            self.result["record"] = True
 
 
 class ChangeDeviceDialog(simpledialog.Dialog):
@@ -735,6 +752,117 @@ class ImportConflictDialog(simpledialog.Dialog):
 
     def apply(self):
         self.result = self.mode.get()
+
+
+def _fmt_bytes(n):
+    """Human-readable size for the clips-on-disk readout."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+class ClipSettingsDialog(simpledialog.Dialog):
+    """Global controls for clip recording: the master switch, how long clips are
+    kept, and what's on disk now. Which FEEDS record is set per feed in Edit."""
+    def __init__(self, parent, app):
+        self._app = app
+        super().__init__(parent, title="Audio recording")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        cfg = core.clip_settings(self._app.cfg)
+
+        tk.Label(master, text="Save the audio behind each transcript line",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2))
+        tk.Label(master, text="Lines with saved audio show a 🔊 you can click to "
+                 "hear that transmission.\nRecordings are voice audio — they're "
+                 "kept only on this PC and deleted on the schedule below.",
+                 bg=BG, fg=MUTED, justify="left").grid(
+                     row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
+
+        self.enabled = tk.BooleanVar(value=bool(cfg["enabled"]))
+        tk.Checkbutton(master, text="Enable clip recording",
+                       variable=self.enabled, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       command=self._sync_state).grid(
+                           row=2, column=0, columnspan=2, sticky="w", padx=8)
+        tk.Label(master, text="Then turn it on per feed in Feeds → Edit.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=3, column=0, columnspan=2, sticky="w", padx=30, pady=(0, 8))
+
+        self.days_label = tk.Label(master, text="Keep clips for (days)", bg=BG, fg=FG)
+        self.days_label.grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        self.days = tk.StringVar(value=str(cfg["retention_days"]))
+        self.days_spin = tk.Spinbox(master, from_=0, to=365, width=6,
+                                    textvariable=self.days)
+        self.days_spin.grid(row=4, column=1, sticky="w", padx=10, pady=4)
+        tk.Label(master, text="0 = keep forever (watch your disk).",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=5, column=1, sticky="w", padx=10)
+
+        n, total = core.clips_disk_usage(self._app._clip_dir())
+        self.usage = tk.Label(master, text=f"On disk now: {n} clip(s), "
+                              f"{_fmt_bytes(total)}", bg=BG, fg=FG)
+        self.usage.grid(row=6, column=0, columnspan=2, sticky="w",
+                        padx=10, pady=(10, 2))
+        row = tk.Frame(master, bg=BG)
+        row.grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        tk.Button(row, text="Open folder", command=self._open_folder,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2)
+        tk.Button(row, text="Delete all clips", command=self._delete_all,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2)
+
+        self._sync_state()
+        return None
+
+    def _sync_state(self):
+        on = self.enabled.get()
+        self.days_spin.config(state="normal" if on else "disabled")
+        self.days_label.config(fg=FG if on else MUTED)
+
+    def _open_folder(self):
+        d = self._app._clip_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)                    # Windows-only, as is the app
+        except Exception as e:
+            messagebox.showerror("Open folder", str(e), parent=self)
+
+    def _delete_all(self):
+        n, total = core.clips_disk_usage(self._app._clip_dir())
+        if not n:
+            messagebox.showinfo("Delete clips", "No clips saved.", parent=self)
+            return
+        if not messagebox.askyesno("Delete clips",
+                                   f"Permanently delete all {n} saved clip(s) "
+                                   f"({_fmt_bytes(total)})?", parent=self):
+            return
+        # retention_days=-1 would be a no-op; purge everything by using a cutoff
+        # in the future instead.
+        removed = core.purge_old_clips(0.0000001, self._app._clip_dir())
+        self.usage.config(text=f"On disk now: 0 clip(s), 0 B")
+        messagebox.showinfo("Delete clips", f"Deleted {len(removed)} file(s).",
+                            parent=self)
+
+    def validate(self):
+        try:
+            d = float(self.days.get())
+        except ValueError:
+            messagebox.showwarning("Retention",
+                                   "Days must be a number.", parent=self)
+            return False
+        if d < 0:
+            messagebox.showwarning("Retention",
+                                   "Days can't be negative.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        self.result = {"enabled": bool(self.enabled.get()),
+                       "retention_days": float(self.days.get())}
 
 
 class PdfExportDialog(simpledialog.Dialog):
@@ -1056,6 +1184,21 @@ MOVING YOUR FEED LIST  (Feeds window, or Streams menu)
   (not supported at all on ARM64). Those import fine but need re-pointing, and
   the app tells you which ones after an import.
   You can also point Import at another install's config.json directly.
+
+HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
+  Transcriber can keep the audio behind each transcript line. Lines that have a
+  recording show a violet 🔊 — click it to hear exactly that transmission.
+  • Turn it on in Streams → "Audio recording…", then switch it on per feed in
+    Feeds → Edit ("Save audio for each line"). Both are off until you say so.
+  • Clicking a line's 🔊 takes over the speakers for a moment; whatever you were
+    listening to live resumes when the clip finishes. Click another 🔊 to skip
+    straight to that one.
+  • Roughly 100 MB per day for a busy feed. Clips are deleted automatically
+    after the number of days you set (7 by default; 0 keeps them forever).
+  • "Audio recording…" also shows what's on disk, opens the clips folder, and
+    can delete every saved clip at once.
+  • These are voice recordings of live radio — they never leave your PC, but
+    treat the clips folder the way you'd treat the transcripts.
 
 SAVING A TRANSCRIPT AS PDF  (Streams menu, or the PDF button on a feed row)
   Pick a feed and what to include:
@@ -1633,6 +1776,33 @@ class TranscriberGUI:
             n += 1
         return f"{name} ({n})"
 
+    # ----- clip recording ---------------------------------------------------
+    def _clip_dir(self):
+        """Where clips live. Read from the engine when it has a store, so this
+        follows a relocated data dir instead of guessing. Falls back to the
+        default before the engine is up (the settings dialog opens either way)."""
+        store = getattr(self.engine, "clips", None)
+        return store.dir if store is not None else core.CLIP_DIR
+
+    def _open_clip_settings(self):
+        dlg = ClipSettingsDialog(self.root, self)
+        if not dlg.result:
+            return
+        clips = dict(self.cfg.get("clips") or {})
+        clips.update(dlg.result)
+        self.cfg["clips"] = clips
+        self._save_cfg()
+        if self.engine is not None:
+            self.engine.set_clips_enabled(clips["enabled"])
+            self.engine.clips.retention_days = clips["retention_days"]
+        state = "on" if clips["enabled"] else "off"
+        self._set_status(f"Clip recording {state}; keeping "
+                         f"{clips['retention_days']:g} day(s).")
+
+    def _recording_feeds(self):
+        """Names of feeds with recording opted in (regardless of the global switch)."""
+        return {s["name"] for s in self.streams if s.get("record")}
+
     # ----- transcript -> PDF -----------------------------------------------
     def _export_pdf(self, name=None):
         """Save one feed's transcript as a PDF: either the current on-screen
@@ -1648,9 +1818,9 @@ class TranscriberGUI:
         feed, source, days = dlg.result
 
         if source == "session":
-            # history rows are (name, color, text, ts, unit); the PDF wants the
-            # same "[HH:MM:SS] text" shape the disk logs use.
-            lines = [f"[{ts}] {text}" for nm, _c, text, ts, _u in self.history
+            # history rows are (name, color, text, ts, unit, clip_id); the PDF
+            # wants the same "[HH:MM:SS] text" shape the disk logs use.
+            lines = [f"[{ts}] {text}" for nm, _c, text, ts, _u, _cl in self.history
                      if nm == feed]
             subtitle = f"Current session — {len(lines)} lines"
         else:
@@ -1691,6 +1861,8 @@ class TranscriberGUI:
         streams_menu.add_command(label="Export feed list...", command=self._export_feeds)
         streams_menu.add_command(label="Import feed list...", command=self._import_feeds)
         streams_menu.add_separator()
+        streams_menu.add_command(label="Audio recording...",
+                                 command=self._open_clip_settings)
         streams_menu.add_command(label="Save transcript as PDF...",
                                  command=self._export_pdf)
         streams_menu.add_separator()
@@ -2106,7 +2278,8 @@ class TranscriberGUI:
         try:
             self.engine = core.Engine(
                 self.cfg,
-                on_line=lambda n, c, t, ts: self.events.put(("line", (n, c, t, ts))),
+                on_line=lambda n, c, t, ts, clip=None: self.events.put(
+                    ("line", (n, c, t, ts, clip))),
                 on_status=lambda m: self.events.put(("status", m)),
                 console=False, file_logging=True, enable_audio=True,
             )
@@ -2185,13 +2358,14 @@ class TranscriberGUI:
         """A line is shown if no unit filter is active or its unit matches."""
         return self.filter_unit is None or unit == self.filter_unit
 
-    def _append_line(self, name, color, text, ts):
+    def _append_line(self, name, color, text, ts, clip_id=None):
         # Compute the call sign ONCE here so coloring is consistent on replay.
         unit = core.extract_callsign(text, self.extra_prefixes)
         # Always record to history (filter affects display only, not the record).
-        self.history.append((name, color, text, ts, unit))
+        self.history.append((name, color, text, ts, unit, clip_id))
         if self._passes_filter(unit):
-            self._render_line(name, color, text, ts, unit, autoscroll=True)
+            self._render_line(name, color, text, ts, unit, autoscroll=True,
+                              clip_id=clip_id)
 
     def _line_fg(self, stream_color, unit):
         """Resolve the foreground color for a line per the current color mode."""
@@ -2308,7 +2482,29 @@ class TranscriberGUI:
         except Exception:
             return True
 
-    def _render_line(self, name, color, text, ts, unit=None, autoscroll=True):
+    def _play_clip(self, clip_id):
+        """Click handler for a line's 🔊 marker: hear that transmission."""
+        if not self.engine:
+            return
+        if not self.engine.audio_available():
+            self._set_status("No audio device available for playback.")
+            return
+        if self.engine.play_clip(clip_id):
+            self._set_status("Playing saved audio for that line…")
+
+    def _insert_clip_marker(self, widget, clip_id):
+        """Prefix a line with a clickable 🔊. One tag per clip id, so a tag that
+        already exists (the same line redrawn on a view switch) just rebinds."""
+        tag = f"clip:{clip_id}"
+        widget.tag_config(tag, foreground=CLIP_FG)
+        widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
+        widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
+        widget.tag_bind(tag, "<Button-1>",
+                        lambda e, c=clip_id: self._play_clip(c))
+        widget.insert("end", "🔊 ", (tag,))
+
+    def _render_line(self, name, color, text, ts, unit=None, autoscroll=True,
+                     clip_id=None):
         """
         Draw a single transcript line into the active view (no history write).
 
@@ -2336,6 +2532,8 @@ class TranscriberGUI:
                 self._bind_unit_click(t, label_tag, unit)
             t.configure(state="normal")
             t.insert("end", f"[{ts}] ", ("ts",))
+            if clip_id:
+                self._insert_clip_marker(t, clip_id)
             t.insert("end", f"{label:<16}", (label_tag,))
             self._insert_message_text(t, name, text, text_tag)
             if autoscroll and stick:
@@ -2355,10 +2553,14 @@ class TranscriberGUI:
                 # In unit mode, prefix the line with the clickable unit label.
                 if clickable:
                     t.insert("end", f"[{ts}] ", ("ts2",))
+                    if clip_id:
+                        self._insert_clip_marker(t, clip_id)
                     t.insert("end", f"{unit}", (label_tag,))
                     self._insert_message_text(t, name, text, text_tag)
                 else:
                     t.insert("end", f"[{ts}] ", ("ts2",))
+                    if clip_id:
+                        self._insert_clip_marker(t, clip_id)
                     self._insert_message_text(t, name, text, text_tag)
                 if autoscroll and stick:
                     t.see("end")
@@ -2368,12 +2570,13 @@ class TranscriberGUI:
         """Re-draw retained lines after the body is rebuilt. Disabled feeds'
         panels don't exist in sectors view, so those lines are simply skipped."""
         active = {s["name"] for s in self._enabled_streams()}
-        for name, color, text, ts, unit in self.history:
+        for name, color, text, ts, unit, clip_id in self.history:
             if self.view_mode.get() == "sectors" and name not in active:
                 continue
             if not self._passes_filter(unit):
                 continue
-            self._render_line(name, color, text, ts, unit, autoscroll=False)
+            self._render_line(name, color, text, ts, unit, autoscroll=False,
+                              clip_id=clip_id)
         # Snap each visible panel to the bottom once at the end.
         if self.view_mode.get() == "unified":
             self.unified.see("end")

@@ -9,6 +9,15 @@ import transcriber as core
 import gui
 
 
+class FakeClips:
+    """Stands in for Engine.clips: the GUI only needs its dir and retention."""
+    def __init__(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="fakeclips_")
+        self.enabled = False
+        self.retention_days = 7
+
+
 class FakeEngine:
     def __init__(self, *a, **k):
         self.added = []
@@ -17,6 +26,13 @@ class FakeEngine:
         self.cfg = {"model": "tiny"}
         self.set_model_calls = []
         self.set_device_calls = []
+        self.clips = FakeClips()
+        self.recording = {}
+        self.played = []
+    def set_recording(self, name, on): self.recording[name] = on
+    def set_clips_enabled(self, on): self.clips.enabled = on
+    def play_clip(self, clip_id): self.played.append(clip_id); return True
+    def stop_clip(self): pass
     def load_model(self): pass
     def start_streams(self, streams): self.added += [s["name"] for s in streams]
     def add_stream(self, s): self.added.append(s["name"]); return True
@@ -807,6 +823,71 @@ def run():
         results["conflictdlg_applies"] = (cd.result == "rename")
         cd.destroy()
 
+        # --- Clip recording ---------------------------------------------------
+        # A line carrying a clip id renders a clickable speaker marker; one
+        # without stays exactly as before.
+        app.view_mode.set("unified")
+        app._append_line("East", "yellow", "clip-marked line", "12:00:00",
+                         "clip-abc")
+        app._append_line("East", "yellow", "plain line", "12:00:01")
+        content = app.unified.get("1.0", "end")
+        results["clip_marker_drawn"] = ("🔊" in content and "clip-marked line" in content)
+        results["clip_marker_tag"] = ("clip:clip-abc" in app.unified.tag_names())
+        # Exactly one marker: the plain line must not get one.
+        results["clip_marker_once"] = (content.count("🔊") == 1)
+        # It survives a view rebuild (history carries the clip id, so the replay
+        # re-draws the marker rather than losing it).
+        app.view_mode.set("sectors")
+        app.view_mode.set("unified")
+        app._rebuild_body()
+        results["clip_marker_replayed"] = ("🔊" in app.unified.get("1.0", "end"))
+
+        # Clicking it asks the engine to play that clip.
+        app._play_clip("clip-abc")
+        results["clip_click_plays"] = (app.engine.played == ["clip-abc"])
+
+        # History keeps the clip id alongside the line, and the PDF export still
+        # unpacks the wider row.
+        results["history_keeps_clip"] = any(
+            row[-1] == "clip-abc" for row in app.history)
+
+        # Per-feed opt-in round-trips through the Add/Edit dialog.
+        class RecDlg(gui.AddStreamDialog):
+            def wait_window(self, *a, **k): pass
+        ad = RecDlg(app.root, title="Edit", initial={
+            "name": "East", "url": "https://audio.example/e.mp3", "record": True})
+        ad.grab_release()
+        results["record_box_prefilled"] = (ad.record.get() is True)
+        ad.apply()
+        results["record_in_result"] = (ad.result.get("record") is True)
+        ad.record.set(False)
+        ad.apply()
+        # Off means the key is simply absent, so config stays clean.
+        results["record_off_omits_key"] = ("record" not in ad.result)
+        ad.destroy()
+        results["recording_feeds_helper"] = (app._recording_feeds() == set())
+
+        # Global settings dialog reads config and writes it back.
+        class LiveClipSettings(gui.ClipSettingsDialog):
+            def wait_window(self, *a, **k): pass
+        app.cfg["clips"] = {"enabled": False, "retention_days": 7}
+        cs = LiveClipSettings(app.root, app)
+        cs.grab_release()
+        results["clipdlg_reads_cfg"] = (cs.enabled.get() is False
+                                        and cs.days.get() == "7")
+        results["clipdlg_days_disabled"] = (str(cs.days_spin.cget("state"))
+                                            == "disabled")
+        cs.enabled.set(True)
+        cs._sync_state()
+        results["clipdlg_days_enable"] = (str(cs.days_spin.cget("state")) == "normal")
+        cs.days.set("-3")
+        results["clipdlg_rejects_negative"] = (cs.validate() is False)
+        cs.days.set("3")
+        cs.apply()
+        results["clipdlg_applies"] = (cs.result == {"enabled": True,
+                                                    "retention_days": 3.0})
+        cs.destroy()
+
         # --- Streams menu exposes the new commands ---------------------------
         menubar = app.root.nametowidget(app.root.cget("menu"))
         streams = app.root.nametowidget(menubar.entrycget(1, "menu"))
@@ -816,6 +897,7 @@ def run():
         results["menu_has_export"] = ("Export feed list..." in labels)
         results["menu_has_import"] = ("Import feed list..." in labels)
         results["menu_has_pdf"] = ("Save transcript as PDF..." in labels)
+        results["menu_has_recording"] = ("Audio recording..." in labels)
 
         app._on_close()
 
