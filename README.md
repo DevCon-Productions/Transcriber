@@ -316,6 +316,35 @@ Cleveland feeds **plus anything you add**). Per row:
 The built-in Cleveland feeds are: Cleveland West, Cleveland Citywide (covers east
 side), Cleveland Fire/EMS, Westlake/WestCom, and East Cleveland.
 
+### Column groups — several feeds in one sector
+
+A busy airport is split across separate LiveATC feeds — Tower, Ground, Approach,
+Clearance — and each is silent much of the time. Four near-empty columns read
+worse than one populated column, so **Feeds → Edit → Column group** puts feeds
+together. Pick an existing group or "New group…".
+
+```
+┌── CLE ATC  (3) ─────────────┐   ┌── Cleveland West ───┐
+│ [10:38] CLE Tower   Delta…  │   │ [10:38] Adam 33…    │
+│ [10:39] CLE Ground  Taxi…   │   │ [10:39] …           │
+│ [10:41] CLE Appr    Descend…│   │                     │
+└─────────────────────────────┘   └─────────────────────┘
+```
+
+Each line is labelled with its channel, in that feed's own colour, so Tower and
+Ground stay distinguishable. Feeds without a group keep their own column exactly
+as before, and don't waste width on a label.
+
+**Grouping is display only.** Every feed keeps its own worker, log, clips, PDF
+export and past-day review, so you can still export just Tower. Dragging a shared
+column moves all its members together. Selecting rows in a shared column picks up
+lines from every channel in it, which is usually what you want for an MP3 or a
+transcript file of an incident.
+
+It does **not** reduce CPU: five feeds means five ffmpeg processes and five gates
+whether they share a column or not. The saving is that silent channels cost
+decoding but almost no transcription — the gate only emits when someone talks.
+
 ### Feed service — police, fire/EMS, ATC, general
 
 Each feed can say what kind of radio it carries, in **Feeds → Edit → Service**.

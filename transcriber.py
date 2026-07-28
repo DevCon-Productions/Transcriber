@@ -351,7 +351,9 @@ FEED_PORTABLE_KEYS = ("name", "url", "type", "provider", "color", "location",
                       "desc", "output_device", "app_name", "record",
                       # What kind of radio this is, and any prompt tuning for it.
                       # Both are preferences, not machine state, so they travel.
-                      "service", "initial_prompt")
+                      "service", "initial_prompt",
+                      # Which display column the feed shares (e.g. "CLE ATC").
+                      "group")
 
 
 def _clean_feed(entry):

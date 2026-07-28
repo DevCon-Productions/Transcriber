@@ -1523,6 +1523,66 @@ def run():
         # Enabling recording must not clobber the retention just set.
         gui.RetentionDialog = real_ret
 
+        # --- Feed groups: several feeds sharing one column --------------------
+        app.past_day = None
+        app.bundle = None
+        app.history.clear()
+        saved_streams = list(app.streams)
+        app.streams = [
+            {"name": "CLE Tower", "url": "u1", "color": "cyan",
+             "group": "CLE ATC", "service": "atc"},
+            {"name": "CLE Ground", "url": "u2", "color": "yellow",
+             "group": "CLE ATC", "service": "atc"},
+            {"name": "Cleveland West", "url": "u3", "color": "green"},
+        ]
+        app.view_mode.set("sectors")
+        app._rebuild_body()
+        results["grp_columns_merged"] = (app._active_groups() ==
+                                         ["CLE ATC", "Cleveland West"])
+        # Both ATC feeds must draw into the SAME widget, and the ungrouped feed
+        # into its own.
+        results["grp_shared_widget"] = (
+            app.sector_panels["CLE Tower"] is app.sector_panels["CLE Ground"]
+            and app.sector_panels["Cleveland West"]
+            is not app.sector_panels["CLE Tower"])
+        results["grp_marks_members"] = (app._grouped_feeds ==
+                                        {"CLE Tower", "CLE Ground"})
+        results["grp_known_groups"] = ("CLE ATC" in app._known_groups())
+
+        # Lines from both channels land in the shared column, each labelled.
+        app._append_line("CLE Tower", "cyan", "cleared to land", "15:00:00")
+        app._append_line("CLE Ground", "yellow", "taxi via alpha", "15:00:01")
+        app._append_line("Cleveland West", "green", "adam 33 responding", "15:00:02")
+        shared = app.sector_panels["CLE Tower"].get("1.0", "end")
+        own = app.sector_panels["Cleveland West"].get("1.0", "end")
+        results["grp_both_channels_shown"] = ("cleared to land" in shared
+                                              and "taxi via alpha" in shared)
+        results["grp_channel_tagged"] = ("CLE Tower" in shared
+                                         and "CLE Ground" in shared)
+        results["grp_ungrouped_isolated"] = ("adam 33 responding" in own
+                                             and "cleared to land" not in own)
+        # An ungrouped column shouldn't waste width on a channel tag.
+        results["grp_no_tag_when_alone"] = ("Cleveland West" not in own)
+
+        # A selection in the shared column recovers rows from BOTH feeds.
+        w = app.sector_panels["CLE Tower"]
+        w.tag_add("sel", "1.0", "end")
+        feeds_in_sel = {r[3] for r in app._selected_rows()}
+        results["grp_selection_spans_feeds"] = (feeds_in_sel ==
+                                                {"CLE Tower", "CLE Ground"})
+        w.tag_remove("sel", "1.0", "end")
+
+        # Dragging a grouped column moves its members together, not one of them.
+        app._reorder_streams("CLE ATC", "Cleveland West")
+        order = [s["name"] for s in app.streams]
+        results["grp_reorder_moves_all"] = (order ==
+                                            ["Cleveland West", "CLE Tower",
+                                             "CLE Ground"])
+        app.streams = saved_streams
+        app.history.clear()
+        app.view_mode.set("unified")
+        app._rebuild_body()
+
         # --- Streams menu exposes the new commands ---------------------------
         menubar = app.root.nametowidget(app.root.cget("menu"))
         streams = app.root.nametowidget(menubar.entrycget(1, "menu"))

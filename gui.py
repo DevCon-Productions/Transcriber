@@ -107,6 +107,10 @@ LINK_FG = "#6db3f2"         # blue for clickable address -> Google Maps links
 CLIP_FG = "#c2a3f0"         # violet for the 🔊 "play this line's audio" marker
 AIRCRAFT_FG = "#7fd1a8"     # green for aircraft -> FlightRadar24 links
 
+# Sentinels in the column-group picker (not group names).
+_GROUP_NONE = "(none — its own column)"
+_GROUP_NEW = "New group…"
+
 # Read-aloud keyword presets: each checkbox expands to several synonyms so you
 # catch variants without typing them all. Label -> list of match terms (lower).
 KEYWORD_PRESETS = [
@@ -252,8 +256,9 @@ class AddStreamDialog(simpledialog.Dialog):
       - pc audio: capture an output device (all sound from those speakers)
       - application: capture ONE app's audio by process (per-app loopback).
     Pass `initial` (a stream dict) to prefill for editing."""
-    def __init__(self, parent, title="Add stream", initial=None):
+    def __init__(self, parent, title="Add stream", initial=None, groups=None):
         self._initial = initial or {}
+        self._groups = list(groups or [])
         super().__init__(parent, title=title)
 
     def body(self, master):
@@ -369,6 +374,25 @@ class AddStreamDialog(simpledialog.Dialog):
         self.prompt_hint.grid(row=12, column=1, sticky="w", padx=6, pady=(0, 6))
         self._sync_prompt_hint()
 
+        # Column group: several feeds can share one column (e.g. an airport's
+        # Tower / Ground / Approach), each line tagged with its channel.
+        tk.Label(master, text="Column group", bg=BG, fg=FG).grid(
+            row=13, column=0, sticky="w", padx=6, pady=(6, 2))
+        init_group = (init.get("group") or "").strip()
+        if init_group and init_group not in self._groups:
+            self._groups.append(init_group)
+        self.group = tk.StringVar(value=init_group or _GROUP_NONE)
+        self.group_combo = ttk.Combobox(
+            master, textvariable=self.group, state="readonly", width=28,
+            values=[_GROUP_NONE] + sorted(self._groups) + [_GROUP_NEW])
+        self.group_combo.grid(row=13, column=1, sticky="w", padx=6, pady=(6, 2))
+        self._group_guard = False
+        self.group.trace_add("write", lambda *_: self._on_group_pick())
+        tk.Label(master, text="Feeds sharing a group share one column, with "
+                 "each line labelled by feed.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=14, column=1, sticky="w", padx=6, pady=(0, 6))
+
         # Clip recording: per-feed opt-in, off by default. Saves the audio behind
         # each transcript line so you can click 🔊 and hear that transmission.
         self.record = tk.BooleanVar(value=bool(init.get("record", False)))
@@ -385,6 +409,27 @@ class AddStreamDialog(simpledialog.Dialog):
         self.provider = tk.StringVar(value=init.get("provider", "broadcastify"))
         self._sync_state()
         return None
+
+    def _on_group_pick(self):
+        """Choosing 'New group…' asks for a name and selects it. Guarded, since
+        setting the variable from inside its own trace would re-enter."""
+        if self._group_guard or self.group.get() != _GROUP_NEW:
+            return
+        self._group_guard = True
+        try:
+            name = (simpledialog.askstring(
+                "New group", "Name for the new column group:",
+                parent=self) or "").strip()
+            if name:
+                if name not in self._groups:
+                    self._groups.append(name)
+                    self.group_combo.config(
+                        values=[_GROUP_NONE] + sorted(self._groups) + [_GROUP_NEW])
+                self.group.set(name)
+            else:
+                self.group.set(_GROUP_NONE)
+        finally:
+            self._group_guard = False
 
     def _sync_prompt_hint(self):
         """Say what the empty prompt box will fall back to for this service."""
@@ -499,6 +544,9 @@ class AddStreamDialog(simpledialog.Dialog):
         override = self.prompt_box.get("1.0", "end").strip()
         if override:
             self.result["initial_prompt"] = override
+        grp = self.group.get()
+        if grp not in (_GROUP_NONE, _GROUP_NEW) and grp.strip():
+            self.result["group"] = grp.strip()
 
 
 class ChangeDeviceDialog(simpledialog.Dialog):
@@ -729,7 +777,8 @@ class CatalogDialog(tk.Toplevel):
     def _add_new(self):
         # New feeds go to the LIBRARY ONLY -- they don't start transcribing until
         # the user clicks "Add" on the row.
-        dlg = AddStreamDialog(self, title="Add new feed")
+        dlg = AddStreamDialog(self, title="Add new feed",
+                              groups=self.app._known_groups())
         if dlg.result and self.app._do_add_to_library(dlg.result):
             self.app._set_status(f"Added '{dlg.result['name']}' to library.")
             self._render()
@@ -751,7 +800,8 @@ class CatalogDialog(tk.Toplevel):
         entry = self.app._lib_find(name)
         if not entry:
             return
-        dlg = AddStreamDialog(self, title=f"Edit '{name}'", initial=entry)
+        dlg = AddStreamDialog(self, title=f"Edit '{name}'", initial=entry,
+                              groups=self.app._known_groups())
         if dlg.result:
             self.app._do_edit(name, dlg.result)
             self._render()
@@ -1459,6 +1509,15 @@ FEEDS  (toolbar "Feeds" button / Streams menu)
                      until you click Add.
   • PDF      – save that feed's transcript as a PDF (see SAVING below).
   • Drag the ⠿ handle to reorder feeds; the order is remembered.
+
+PUTTING SEVERAL FEEDS IN ONE COLUMN  (Feeds → Edit → Column group)
+  An airport is usually split across separate feeds (Tower, Ground, Approach),
+  each quiet much of the time. Give them the same group and they share one
+  column, with every line labelled by which channel it came from, in that
+  feed's colour. Feeds with no group keep their own column as before.
+  • Logs, clips, PDFs and past-day review stay per feed — you can still export
+    just Tower.
+  • Dragging a shared column moves all its feeds together.
 
 WHAT KIND OF RADIO A FEED CARRIES  (Feeds → Edit → Service)
   Police / Fire-EMS / Air traffic control / General. This sets three things at
@@ -2236,11 +2295,13 @@ class TranscriberGUI:
             return [(ts, text, cid, name)
                     for name, _c, text, ts, unit, cid in self.history
                     if self._passes_filter(unit)]
-        for name, w in self.sector_panels.items():
-            if w is widget:
-                return [(ts, text, cid, name)
-                        for n, _c, text, ts, unit, cid in self.history
-                        if n == name and self._passes_filter(unit)]
+        # A column can serve several feeds (a group), so collect every feed
+        # drawn into this widget rather than stopping at the first.
+        feeds = {n for n, w in self.sector_panels.items() if w is widget}
+        if feeds:
+            return [(ts, text, cid, n)
+                    for n, _c, text, ts, unit, cid in self.history
+                    if n in feeds and self._passes_filter(unit)]
         return []
 
     def _selected_rows(self):
@@ -3046,31 +3107,43 @@ class TranscriberGUI:
             # Color tags are configured lazily per line in _render_line.
             self._bind_transcript_menu(self.unified)
         else:
-            panels = active or [{"name": "(no active streams)", "color": "grey"}]
-            self._sector_headers = []   # (frame, stream_name, hdr) for drag hit-test
-            for i, s in enumerate(panels):
+            groups = self._active_groups() or ["(no active streams)"]
+            self._sector_headers = []   # (frame, group_key, hdr) for drag hit-test
+            # Feeds drawn in a shared column get a per-line channel tag, or you
+            # couldn't tell Tower from Ground.
+            self._grouped_feeds = set()
+            for i, g in enumerate(groups):
+                members = self._group_members(g)
                 col = tk.Frame(self.body, bg=BG)
                 col.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
                 self.body.grid_columnconfigure(i, weight=1)
                 self.body.grid_rowconfigure(0, weight=1)
-                hdr = tk.Label(col, text=("⠿ " + s["name"]), bg=BG2,
-                               fg=COLOR_HEX.get(s.get("color", "white"), FG),
+                # A single-feed column keeps that feed's colour; a shared column
+                # is neutral, since its lines carry their own colours.
+                head_fg = (COLOR_HEX.get(members[0].get("color", "white"), FG)
+                           if len(members) == 1 else FG)
+                title = g if len(members) <= 1 else f"{g}  ({len(members)})"
+                hdr = tk.Label(col, text=("⠿ " + title), bg=BG2, fg=head_fg,
                                font=("Segoe UI", 10, "bold"), cursor="fleur")
                 hdr.pack(side="top", fill="x")
                 txt = self._make_text(col)
                 txt.pack(fill="both", expand=True)
                 if active:
-                    self.sector_panels[s["name"]] = txt
-                    self._sector_headers.append((col, s["name"], hdr))
+                    for m in members:
+                        self.sector_panels[m["name"]] = txt
+                    if len(members) > 1:
+                        self._grouped_feeds.update(m["name"] for m in members)
+                    self._sector_headers.append((col, g, hdr))
                     # Drag the header to reorder columns.
                     hdr.bind("<ButtonPress-1>",
-                             lambda e, n=s["name"], c=s.get("color", "white"):
+                             lambda e, n=g, c=(members[0].get("color", "white")
+                                               if members else "white"):
                              self._drag_start(n, c, e))
                     hdr.bind("<B1-Motion>", self._drag_motion)
                     hdr.bind("<ButtonRelease-1>", self._drag_drop)
                     # Right-click for the sector context menu.
-                    hdr.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
-                    txt.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
+                    hdr.bind("<Button-3>", lambda e, n=g: self._sector_menu(e, n))
+                    txt.bind("<Button-3>", lambda e, n=g: self._sector_menu(e, n))
                 else:
                     self._bind_transcript_menu(txt)
 
@@ -3285,23 +3358,39 @@ class TranscriberGUI:
             self._save_cfg()
 
     # ----- sector right-click menu ----------------------------------------
-    def _sector_menu(self, event, name):
-        s = self._find(name)
-        if not s:
+    def _sector_menu(self, event, group):
+        """Right-click on a column. `group` is the column key, which may stand
+        for several feeds -- so feed-specific actions become submenus."""
+        members = self._group_members(group)
+        if not members:
             return
         menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
                        activebackground="#3a3d44", activeforeground=FG)
         # Sectors is the default view, so this menu -- not _transcript_menu --
         # is what most right-clicks on a transcript actually hit. It carries the
         # clip export too, or the feature would be invisible where it's used most.
-        self._add_export_items(menu, self.sector_panels.get(name))
+        self._add_export_items(menu, self.sector_panels.get(members[0]["name"]))
         menu.add_separator()
-        if s.get("type") == "pcaudio":
-            menu.add_command(label="Change audio source…",
-                             command=lambda n=name: self._change_audio_source(n))
-            menu.add_separator()
-        menu.add_command(label=f"Remove “{name}”",
-                         command=lambda n=name: self._remove_one(n))
+
+        def _sub(label, action, only=None):
+            """One entry per feed when the column is shared, else a plain item."""
+            eligible = [m for m in members if only is None or only(m)]
+            if not eligible:
+                return
+            if len(members) == 1:
+                menu.add_command(label=f"{label} “{eligible[0]['name']}”",
+                                 command=lambda n=eligible[0]["name"]: action(n))
+                return
+            sub = tk.Menu(menu, tearoff=0, bg=BG2, fg=FG,
+                          activebackground="#3a3d44", activeforeground=FG)
+            for m in eligible:
+                sub.add_command(label=m["name"],
+                                command=lambda n=m["name"]: action(n))
+            menu.add_cascade(label=f"{label}…", menu=sub)
+
+        _sub("Change audio source", self._change_audio_source,
+             only=lambda m: m.get("type") == "pcaudio")
+        _sub("Remove", self._remove_one)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3403,19 +3492,28 @@ class TranscriberGUI:
             return
         self._reorder_streams(name, target)
 
-    def _reorder_streams(self, name, target_name):
-        """Move stream `name` to the target column's position. Direction-aware:
-        dropping onto a column to the RIGHT lands after it; to the LEFT, before
-        it. So the dragged column ends up exactly where you dropped it."""
-        names = [s["name"] for s in self.streams]
-        if name == target_name or name not in names or target_name not in names:
+    def _reorder_streams(self, group, target_group):
+        """Move a whole COLUMN to the target column's position. A column may hold
+        several feeds (a group), and they move together keeping their relative
+        order -- otherwise dragging a grouped column would split it apart.
+        Direction-aware: dropping onto a column to the RIGHT lands after it; to
+        the LEFT, before it."""
+        if group == target_group:
             return
-        src = names.index(name)
-        dragging_right = src < names.index(target_name)
-        moving = self.streams.pop(src)
-        # Recompute the target's index in the now-shortened list.
-        t = next(i for i, s in enumerate(self.streams) if s["name"] == target_name)
-        self.streams.insert(t + 1 if dragging_right else t, moving)
+        moving = [s for s in self.streams if self._feed_group(s) == group]
+        rest = [s for s in self.streams if self._feed_group(s) != group]
+        if not moving:
+            return
+        positions = [i for i, s in enumerate(rest)
+                     if self._feed_group(s) == target_group]
+        if not positions:
+            return
+        first_src = next(i for i, s in enumerate(self.streams)
+                         if self._feed_group(s) == group)
+        first_tgt = next(i for i, s in enumerate(self.streams)
+                         if self._feed_group(s) == target_group)
+        at = positions[-1] + 1 if first_src < first_tgt else positions[0]
+        self.streams = rest[:at] + moving + rest[at:]
         self._save_cfg()
         self._rebuild_body()
 
@@ -3743,18 +3841,20 @@ class TranscriberGUI:
                 if clickable:
                     self._bind_unit_click(t, label_tag, unit)
                 t.configure(state="normal")
-                # In unit mode, prefix the line with the clickable unit label.
+                t.insert("end", f"[{ts}] ", ("ts2",))
+                if clip_id:
+                    self._insert_clip_marker(t, clip_id)
+                # A shared column carries several feeds, so name the channel --
+                # in the feed's own colour, which is what distinguishes Tower
+                # from Ground at a glance.
+                if name in getattr(self, "_grouped_feeds", ()):
+                    chan = f"chan:{name}"
+                    t.tag_config(chan, foreground=COLOR_HEX.get(color, FG))
+                    t.insert("end", f"{name:<14}", (chan,))
+                # In unit mode, also prefix the clickable unit label.
                 if clickable:
-                    t.insert("end", f"[{ts}] ", ("ts2",))
-                    if clip_id:
-                        self._insert_clip_marker(t, clip_id)
                     t.insert("end", f"{unit}", (label_tag,))
-                    self._insert_message_text(t, name, text, text_tag)
-                else:
-                    t.insert("end", f"[{ts}] ", ("ts2",))
-                    if clip_id:
-                        self._insert_clip_marker(t, clip_id)
-                    self._insert_message_text(t, name, text, text_tag)
+                self._insert_message_text(t, name, text, text_tag)
                 if autoscroll and stick:
                     t.see("end")
                 t.configure(state="disabled")
@@ -3838,6 +3938,36 @@ class TranscriberGUI:
 
     def _enabled_streams(self):
         return [s for s in self.streams if core.is_enabled(s)]
+
+    # ----- feed groups (several feeds sharing one column) --------------------
+    # ATC splits an airport across Tower / Ground / Approach / Clearance, each
+    # of them silent much of the time. Grouping puts them in ONE column, tagged
+    # per channel, instead of four mostly-empty ones. Purely a display concern:
+    # every feed still has its own worker, log, clips and export.
+    @staticmethod
+    def _feed_group(stream):
+        """The column a feed belongs to. Ungrouped feeds are their own column."""
+        return (stream.get("group") or "").strip() or stream.get("name", "")
+
+    def _group_members(self, group):
+        return [s for s in self._enabled_streams()
+                if self._feed_group(s) == group]
+
+    def _active_groups(self):
+        """Column keys in stream order, de-duplicated."""
+        out, seen = [], set()
+        for s in self._enabled_streams():
+            g = self._feed_group(s)
+            if g not in seen:
+                seen.add(g)
+                out.append(g)
+        return out
+
+    def _known_groups(self):
+        """Every group name in use, for the picker in the feed dialog."""
+        names = {(s.get("group") or "").strip()
+                 for s in list(self.streams) + list(self.library)}
+        return sorted(n for n in names if n)
 
     def _do_add(self, stream):
         """Add a feed to the ACTIVE streams (and remember it in the library).
