@@ -120,6 +120,26 @@ def run():
     results["pdf_empty_ok"] = (core.write_transcript_pdf(empty, "Nothing", []) == 1
                                and _pdf_objects_resolve(open(empty, "rb").read()))
 
+    # ---- transcript span (the PDF header) --------------------------------
+    same_day = [("20260728", "10:38:24", "a"), ("20260728", "11:05:02", "b"),
+                ("20260728", "09:00:00", "c")]           # deliberately unsorted
+    first, last = core.transcript_span(same_day)
+    results["span_finds_edges"] = (first == "2026-07-28 09:00:00"
+                                   and last == "2026-07-28 11:05:02")
+    # One day -> the date is stated once, then the times.
+    results["span_same_day_fmt"] = (core.format_transcript_span(first, last)
+                                    == "2026-07-28  ·  09:00:00 – 11:05:02")
+    # Across days -> both ends carry their date.
+    f2, l2 = core.transcript_span([("20260719", "23:59:12", "a"),
+                                   ("20260712", "08:00:01", "b")])
+    results["span_multiday_fmt"] = (core.format_transcript_span(f2, l2)
+                                    == "2026-07-12 08:00:01  –  2026-07-19 23:59:12")
+    one = core.transcript_span([("20260728", "10:00:00", "a")])
+    results["span_single_line"] = (core.format_transcript_span(*one)
+                                   == "2026-07-28 10:00:00")
+    results["span_empty"] = (core.transcript_span([]) == (None, None)
+                             and core.format_transcript_span(None, None) == "")
+
     # ---- log discovery ---------------------------------------------------
     logs = os.path.join(d, "logs")
     os.makedirs(logs)
@@ -135,6 +155,24 @@ def run():
                                ["20260712", "20260715", "20260719"])   # oldest first
     read = core.read_log_lines([p for _d, p in found] + [os.path.join(logs, "gone.log")])
     results["logs_read"] = (len(read) == 3 and read[0].endswith("20260712 line"))
+
+    # read_log_entries keeps the DAY (which lives in the filename, not the line),
+    # so a multi-day export can report a real first/last transmission.
+    ents = core.read_log_entries(found)
+    results["entries_carry_day"] = ([e[0] for e in ents] ==
+                                    ["20260712", "20260715", "20260719"])
+    results["entries_parsed"] = (ents[0][1] == "00:00:00"
+                                 and ents[0][2] == "20260712 line")
+    results["entries_span"] = (core.transcript_span(ents) ==
+                               ("2026-07-12 00:00:00", "2026-07-19 00:00:00"))
+    # A garbage line is skipped rather than becoming a bogus entry.
+    with open(os.path.join(logs, "Cleveland Fire-EMS-20260720.log"), "w",
+              encoding="utf-8") as f:
+        f.write("not a log line\n[07:00:00] real one\n")
+    ents2 = core.read_log_entries(core.log_files_for("Cleveland Fire/EMS",
+                                                     log_dir=logs))
+    results["entries_skip_garbage"] = (len(ents2) == 4
+                                       and all(e[1] for e in ents2))
 
     print("RESULTS:")
     ok = True

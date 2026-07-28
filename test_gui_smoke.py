@@ -759,7 +759,14 @@ def run():
         pdf2 = os.path.join(tmp, "out2.pdf")
         gui.filedialog.asksaveasfilename = lambda *a, **k: pdf2
         app._export_pdf()
-        results["pdf_logs_written"] = (b"pdf-log-line" in open(pdf2, "rb").read())
+        blob2 = open(pdf2, "rb").read()
+        results["pdf_logs_written"] = (b"pdf-log-line" in blob2)
+        # The header reports the real first/last transmission, dated from the
+        # log's filename -- not just the day, and not a bare line count.
+        results["pdf_header_span"] = (b"2026-07-19 09:00:00" in blob2)
+        results["pdf_header_counts"] = (b"1 transmission)" in blob2)
+        results["pdf_header_bold_title"] = (b"/F2 17.0 Tf" in blob2
+                                            and b"(East) Tj" in blob2)
         core.log_files_for = real_lookup
 
         # A feed with nothing to export informs the user instead of writing
@@ -866,6 +873,70 @@ def run():
         results["record_off_omits_key"] = ("record" not in ad.result)
         ad.destroy()
         results["recording_feeds_helper"] = (app._recording_feeds() == set())
+
+        # --- Restoring today's transcript from the logs -----------------------
+        # Write a log for an active feed plus clips for two of its lines, then
+        # re-run the restore and check the lines come back with their audio.
+        rdir = tempfile.mkdtemp(prefix="restore_")
+        rlogs = os.path.join(rdir, "logs")
+        os.makedirs(rlogs)
+        today = core.dt.datetime.now().strftime("%Y%m%d")
+        active_feed = app._enabled_streams()[0]["name"]
+        with open(os.path.join(rlogs, f"{core.safe_filename(active_feed)}-{today}.log"),
+                  "w", encoding="utf-8") as f:
+            f.write("[08:00:00] restored line one\n")
+            f.write("[08:00:00] restored line two\n")   # same second, own clip
+            f.write("[08:00:05] restored line three\n")
+            f.write("garbage that is not a log line\n")
+
+        rclips = os.path.join(rdir, "clips")
+        os.makedirs(rclips)
+        with open(os.path.join(rclips, f"index-{today}.jsonl"), "w",
+                  encoding="utf-8") as f:
+            for i, (ts, cid) in enumerate([("08:00:00", "cid-a"),
+                                           ("08:00:00", "cid-b")]):
+                f.write(json.dumps({"id": cid, "feed": active_feed, "day": today,
+                                    "ts": ts, "text": f"x{i}"}) + "\n")
+
+        real_logs_for = core.log_files_for
+        core.log_files_for = lambda name, log_dir=rlogs: real_logs_for(name, rlogs)
+        app.engine.clips.dir = rclips
+        app.history.clear()
+        app._restore_scrollback()
+        core.log_files_for = real_logs_for
+
+        restored = [r for r in app.history if r[0] == active_feed]
+        results["restore_reads_log"] = (len(restored) == 3)
+        results["restore_skips_garbage"] = all("garbage" not in r[2] for r in restored)
+        results["restore_in_order"] = ([r[3] for r in restored] ==
+                                       ["08:00:00", "08:00:00", "08:00:05"])
+        # Same-second lines get DIFFERENT clips, in index order -- not the same one.
+        results["restore_distinct_clips"] = ([r[5] for r in restored[:2]] ==
+                                             ["cid-a", "cid-b"])
+        # A line with no clip recorded stays unmarked.
+        results["restore_no_clip_stays_none"] = (restored[2][5] is None)
+        results["restore_counts"] = (app._restored == (3, 2))
+        # The marker is drawn for restored lines too.
+        app.view_mode.set("unified")
+        app._rebuild_body()
+        results["restore_marker_drawn"] = (
+            app.unified.get("1.0", "end").count("🔊") == 2)
+
+        # restore_lines = 0 disables it entirely.
+        core.log_files_for = lambda name, log_dir=rlogs: real_logs_for(name, rlogs)
+        app.cfg["restore_lines"] = 0
+        app.history.clear()
+        app._restore_scrollback()
+        results["restore_disabled"] = (len(app.history) == 0)
+        # A cap keeps the NEWEST lines.
+        app.cfg["restore_lines"] = 1
+        app._restore_scrollback()
+        kept = [r for r in app.history if r[0] == active_feed]
+        results["restore_caps_newest"] = (len(kept) == 1
+                                          and kept[0][2] == "restored line three")
+        core.log_files_for = real_logs_for
+        app.cfg.pop("restore_lines", None)
+        app.history.clear()
 
         # Global settings dialog reads config and writes it back.
         class LiveClipSettings(gui.ClipSettingsDialog):

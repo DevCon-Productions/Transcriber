@@ -444,6 +444,12 @@ PDF_PAGE_W, PDF_PAGE_H = 612.0, 792.0        # US Letter, in points
 PDF_MARGIN = 54.0                            # 0.75"
 PDF_BODY_SIZE = 9.0
 PDF_LEADING = 11.5
+# Header block on page 1: feed name, then the span/line count, then a rule.
+PDF_TITLE_SIZE = 17.0
+PDF_SUBTITLE_SIZE = 9.5
+PDF_SUBTITLE_GAP = 17.0       # title baseline -> subtitle baseline
+PDF_RULE_GAP = 11.0           # subtitle baseline -> rule
+PDF_HEADER_H = 58.0           # total height reserved before the body starts
 # Courier is metrically fixed: every glyph is exactly 0.6 em wide.
 PDF_COURIER_WIDTH = 0.6
 
@@ -495,9 +501,10 @@ def _pdf_wrap(text, max_chars):
 def write_transcript_pdf(path, title, lines, subtitle=""):
     """Render a transcript to a PDF at `path`.
 
-    title    -- feed name, shown as the heading on page 1 and in the tab title
+    title    -- feed name, set large + bold as the heading on page 1
     lines    -- iterable of transcript strings, e.g. "[20:50:01] Copy that."
-    subtitle -- optional grey line under the title (date range, source, count)
+    subtitle -- line under the title; callers pass the transmission span and
+                count (see transcript_span / format_transcript_span)
 
     Returns the number of pages written."""
     usable_w = PDF_PAGE_W - 2 * PDF_MARGIN
@@ -512,7 +519,8 @@ def write_transcript_pdf(path, title, lines, subtitle=""):
         body.append(wrapped[0])
         body.extend(" " * 11 + w for w in wrapped[1:])
 
-    first_top = PDF_PAGE_H - PDF_MARGIN - 46      # room for title block on page 1
+    # Page 1 starts below the header block; later pages start at the margin.
+    first_top = PDF_PAGE_H - PDF_MARGIN - PDF_HEADER_H
     rest_top = PDF_PAGE_H - PDF_MARGIN
     bottom = PDF_MARGIN + 16                      # room for the page footer
     first_rows = max(1, int((first_top - bottom) / PDF_LEADING))
@@ -531,16 +539,19 @@ def write_transcript_pdf(path, title, lines, subtitle=""):
         parts = []
         y = rest_top
         if idx == 0:
-            y = PDF_PAGE_H - PDF_MARGIN - 14
-            parts.append(f"BT /F2 15 Tf 1 1 1 rg {PDF_MARGIN} {y:.1f} Td "
-                         f"({_pdf_escape(title)}) Tj ET")
-            parts.append("0 0 0 rg")
+            # Header block: feed name large + bold, then the span/count beneath
+            # it, then a rule. Sizes and offsets track PDF_TITLE_* so the body's
+            # first_top stays in step with whatever the header actually occupies.
+            y = PDF_PAGE_H - PDF_MARGIN - PDF_TITLE_SIZE
+            parts.append(f"BT /F2 {PDF_TITLE_SIZE} Tf 0 0 0 rg {PDF_MARGIN} "
+                         f"{y:.1f} Td ({_pdf_escape(title)}) Tj ET")
             if subtitle:
-                y -= 15
-                parts.append(f"BT /F1 8.5 Tf 0.35 0.35 0.35 rg {PDF_MARGIN} "
-                             f"{y:.1f} Td ({_pdf_escape(subtitle)}) Tj ET")
-            y -= 10
-            parts.append(f"0.8 0.8 0.8 RG 0.6 w {PDF_MARGIN} {y:.1f} m "
+                y -= PDF_SUBTITLE_GAP
+                parts.append(f"BT /F2 {PDF_SUBTITLE_SIZE} Tf 0.30 0.30 0.30 rg "
+                             f"{PDF_MARGIN} {y:.1f} Td "
+                             f"({_pdf_escape(subtitle)}) Tj ET")
+            y -= PDF_RULE_GAP
+            parts.append(f"0.75 0.75 0.75 RG 0.7 w {PDF_MARGIN} {y:.1f} m "
                          f"{PDF_PAGE_W - PDF_MARGIN} {y:.1f} l S")
             y = first_top
         parts.append("0 0 0 rg")
@@ -610,6 +621,16 @@ def log_files_for(stream_name, log_dir=LOG_DIR):
     return sorted(out)
 
 
+_LOG_LINE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\]\s(.*)$")
+
+
+def parse_log_line(line):
+    """Split a saved log line back into (ts, text), or None if it isn't one.
+    Logs are written as "[HH:MM:SS] text" by Output.line."""
+    m = _LOG_LINE.match(line.rstrip("\n"))
+    return (m.group(1), m.group(2)) if m else None
+
+
 def read_log_lines(paths):
     """Read transcript lines from log files, in the order given. Unreadable files
     are skipped -- a partial export beats no export."""
@@ -621,6 +642,49 @@ def read_log_lines(paths):
         except OSError:
             continue
     return lines
+
+
+def read_log_entries(day_paths):
+    """Like read_log_lines, but keeps each line's DAY: [(day, ts, text), ...].
+
+    Log files only record the time of day; the date lives in the filename. A PDF
+    header that reports the first and last transmission needs both, so callers
+    that care about the span read entries instead of bare lines.
+    Unparseable lines (a torn write, a stray blank) are skipped."""
+    entries = []
+    for day, path in day_paths:
+        for raw in read_log_lines([path]):
+            got = parse_log_line(raw)
+            if got:
+                entries.append((day, got[0], got[1]))
+    return entries
+
+
+def transcript_span(entries):
+    """(first, last) as 'YYYY-MM-DD HH:MM:SS' over [(day, ts, ...)] entries, or
+    (None, None) if there are none. Sorted here rather than trusting input order,
+    so a caller that concatenates days out of order still gets a true span."""
+    stamps = sorted(f"{day[:4]}-{day[4:6]}-{day[6:8]} {ts}"
+                    for day, ts, *_ in entries if len(day) == 8)
+    return (stamps[0], stamps[-1]) if stamps else (None, None)
+
+
+def format_transcript_span(first, last):
+    """Human-readable span for a transcript header. Collapses the date when the
+    whole transcript is from one day, which is the common case:
+
+        2026-07-28  ·  10:38:24 - 11:05:02
+        2026-07-12 08:00:01  -  2026-07-19 23:59:12
+    """
+    if not first and not last:
+        return ""
+    if not last or first == last:
+        return first or last
+    d1, t1 = first.split(" ")
+    d2, t2 = last.split(" ")
+    if d1 == d2:
+        return f"{d1}  ·  {t1} – {t2}"
+    return f"{first}  –  {last}"
 
 
 # --------------------------------------------------------------------------
@@ -856,6 +920,23 @@ class ClipStore:
             if row.get("feed") == feed and row.get("ts") == ts:
                 return row.get("id")
         return None
+
+    def clip_map(self, day=None):
+        """{(feed, ts): [clip_id, ...]} for a whole day, read once. Restoring a
+        scrollback means thousands of lookups; find_clip() per line would rescan
+        the index every time.
+
+        The value is a LIST because timestamps are only second-resolution: a busy
+        feed can log several transmissions within one second, and each has its own
+        clip. Both the log and the index are chronological, so a caller walking
+        the log can take ids from each list in order and keep lines matched to the
+        right audio. Collapsing to one id per second would attach the same clip to
+        every line in it."""
+        out = {}
+        for r in self.index_for_day(day or dt.datetime.now().strftime("%Y%m%d")):
+            if r.get("feed") and r.get("ts") and r.get("id"):
+                out.setdefault((r["feed"], r["ts"]), []).append(r["id"])
+        return out
 
 
 def purge_old_clips(retention_days, clip_dir=CLIP_DIR):
@@ -2510,13 +2591,25 @@ class LoopbackWorker(threading.Thread):
 def proctap_available():
     """True only if per-app capture can ACTUALLY run. proc-tap ships a pure-python
     (py3-none-any) wheel whose compiled `_native` extension has no Windows-ARM64
-    build, so `import proctap` succeeds there while every capture raises. Require
+    build, so the package imports fine there while every capture raises. Require
     the native extension too, otherwise the GUI would offer an 'application' source
-    that always fails."""
+    that always fails.
+
+    This deliberately answers from DISK and never imports proctap. On ARM64,
+    importing it and then enumerating speakers through soundcard corrupts the
+    heap and kills the process (0xC0000374) -- and the two are probed together
+    all over: the add-feed dialog offers both sources, and importing a feed list
+    can carry both kinds. find_spec on a top-level name doesn't execute it;
+    find_spec("proctap._native") WOULD, because locating a submodule imports its
+    parent package. So we look for the .pyd beside __init__.py ourselves."""
     try:
-        import proctap  # noqa: F401
         import importlib.util
-        return importlib.util.find_spec("proctap._native") is not None
+        spec = importlib.util.find_spec("proctap")     # does not import it
+        if spec is None or not spec.origin:
+            return False
+        pkg_dir = os.path.dirname(spec.origin)
+        return any(f.startswith("_native") and f.endswith((".pyd", ".so"))
+                   for f in os.listdir(pkg_dir))
     except Exception:
         return False
 

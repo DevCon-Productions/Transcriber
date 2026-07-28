@@ -162,6 +162,36 @@ def run():
     p.stop_clip()
     results["stop_clip"] = (not p.clip_playing())
 
+    # ---- log parsing + bulk clip lookup (scrollback restore) --------------
+    results["parse_log_line"] = (core.parse_log_line("[20:50:01] Copy that.")
+                                 == ("20:50:01", "Copy that."))
+    results["parse_log_empty_text"] = (core.parse_log_line("[20:50:01] ")
+                                       == ("20:50:01", ""))
+    results["parse_log_rejects"] = (core.parse_log_line("not a log line") is None
+                                    and core.parse_log_line("") is None)
+
+    mdir = os.path.join(d, "map")
+    mstore = core.ClipStore(cfg, clip_dir=mdir)
+    mstore.start()
+    ids = [mstore.save("West", _tone(0.1), text=f"line {i}") for i in range(3)]
+    mstore._q.join()
+    mday = ids[0].split("-")[-3]
+    cmap = mstore.clip_map(mday)
+    rowsm = mstore.index_for_day(mday)
+    results["clip_map_keys"] = (set(cmap) == {(r["feed"], r["ts"]) for r in rowsm})
+    # Every clip is reachable: none is lost when several share a second, which
+    # is exactly what these three rapid saves produce.
+    results["clip_map_keeps_all"] = (
+        sorted(i for ids in cmap.values() for i in ids) == sorted(ids))
+    # First id per key must agree with find_clip, which it replaces in bulk.
+    results["clip_map_matches_find"] = all(
+        cmap[(r["feed"], r["ts"])][0] == mstore.find_clip(r["feed"], r["ts"], mday)
+        for r in rowsm)
+    results["clip_map_chronological"] = all(
+        lst == sorted(lst) for lst in cmap.values())      # ids embed a counter
+    results["clip_map_empty_day"] = (mstore.clip_map("19700101") == {})
+    mstore.stop()
+
     # ---- the seam: gate segment -> Transcriber -> clip + id on the line ----
     # The unit checks above test the pieces; this tests them joined up, with a
     # stub model so no Whisper/GPU is involved.

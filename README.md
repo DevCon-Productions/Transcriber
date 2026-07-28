@@ -365,6 +365,21 @@ the feed, then what to include:
 - **Saved logs** — one day, several (Ctrl/Shift-click), or all of them if you
   select none. Only days still on disk appear (see `log_retention_days`).
 
+Page 1 opens with the feed name in large bold type, and under it the span of the
+export — the date and time of the **first and last transmission it contains**,
+not the day you picked:
+
+```
+Westlake/WestCom
+2026-07-28  ·  10:38:24 – 11:05:02  ·  116 transmissions
+────────────────────────────────────────────────────────
+[10:38:24] Medics 7-2 in route 10-37.
+```
+
+An export spanning several days dates both ends
+(`2026-07-12 08:00:01 – 2026-07-19 23:59:12`). Log files only record the time of
+day, so the date comes from the filename.
+
 Output is a timestamped, wrapped, page-numbered PDF. The writer is plain stdlib —
 no reportlab — so it behaves identically on the x64 and ARM64 builds and adds
 nothing to either installer.

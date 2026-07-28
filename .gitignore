@@ -19,6 +19,9 @@ dist/
 
 # === Output ===
 logs/
+# Recorded audio behind transcript lines. Voice recordings of live radio --
+# treat like logs, only more so. Never commit.
+clips/
 
 # === TTS voice models (large; downloaded on demand) ===
 tts_voices/

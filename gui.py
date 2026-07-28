@@ -21,6 +21,7 @@ import os
 import queue
 import threading
 import collections
+import datetime as _dt
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import tkinter.font as tkfont
@@ -1205,8 +1206,10 @@ SAVING A TRANSCRIPT AS PDF  (Streams menu, or the PDF button on a feed row)
   • This session – exactly what's on screen for that feed right now.
   • Saved logs   – pick one day, several (Ctrl/Shift-click), or leave the day
                    list alone to take all of them.
-  The PDF is timestamped, wrapped, and page-numbered. Note that logs are purged
-  after the retention period, so old days may no longer be listed.
+  Page 1 is headed with the feed name in large bold type, and beneath it the
+  date and time of the first and last transmission in the export, plus how many
+  there are. The PDF is timestamped, wrapped, and page-numbered. Note that logs
+  are purged after the retention period, so old days may no longer be listed.
 
 VIEWS  (toolbar / View menu)
   • Sectors  – one scrolling column per feed, side by side. Drag a column's
@@ -1524,7 +1527,9 @@ class TranscriberGUI:
         self.events = queue.Queue()          # (kind, payload) from bg threads
         self.sector_panels = {}              # name -> ScrolledText (sectors view)
         self._update_dialog = None           # active AppUpdateDialog, if any
-        self.history = collections.deque(maxlen=HISTORY_MAX)  # (name,color,text,ts)
+        # (name, color, text, ts, unit, clip_id)
+        self.history = collections.deque(maxlen=HISTORY_MAX)
+        self._restored = (0, 0)          # (lines, of which had clips) on launch
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
@@ -1548,6 +1553,9 @@ class TranscriberGUI:
         self._build_menu()
         self._build_toolbar()
         self._build_body()
+        # Seed the transcript from today's logs BEFORE the engine starts, so
+        # restored lines can't interleave with live ones arriving mid-restore.
+        self._restore_scrollback()
         self._set_status("Loading model...")
 
         # Keyboard shortcuts for font size (Ctrl +/-/0), like a browser.
@@ -1776,6 +1784,59 @@ class TranscriberGUI:
             n += 1
         return f"{name} ({n})"
 
+    # ----- restoring today's transcript -------------------------------------
+    def _restore_scrollback(self):
+        """Seed the transcript with today's saved lines for each active feed, so
+        the window doesn't open empty after a restart -- and, where a clip was
+        recorded for a line, re-attach its 🔊 so audio from earlier today is
+        still one click away.
+
+        Bounded by `restore_lines` in config (per feed, newest kept); 0 disables.
+        Lines are interleaved by timestamp so the unified view reads in order."""
+        per_feed = self.cfg.get("restore_lines", 200)
+        if not per_feed or per_feed <= 0:
+            return
+        day = _dt.datetime.now().strftime("%Y%m%d")
+        try:
+            clip_map = core.ClipStore(self.cfg, clip_dir=self._clip_dir()).clip_map(day)
+        except Exception:
+            clip_map = {}
+
+        rows = []
+        for s in self._enabled_streams():
+            name = s["name"]
+            paths = [p for d, p in core.log_files_for(name) if d == day]
+            if not paths:
+                continue
+            parsed = []
+            for raw in core.read_log_lines(paths):
+                got = core.parse_log_line(raw)
+                if got:
+                    parsed.append(got)
+            # Several transmissions can share a second, each with its own clip.
+            # Both the log and the index are chronological, so walk the whole
+            # day's lines and take ids in order -- then keep only the tail we
+            # display, so the trim can't shift which clip a line gets.
+            used = {}
+            attached = []
+            for ts, text in parsed:
+                ids = clip_map.get((name, ts), ())
+                i = used.get(ts, 0)
+                used[ts] = i + 1
+                attached.append((ts, text, ids[i] if i < len(ids) else None))
+            for ts, text, clip_id in attached[-per_feed:]:
+                rows.append((ts, name, s.get("color", "white"), text, clip_id))
+        if not rows:
+            return
+
+        rows.sort(key=lambda r: r[0])           # chronological across feeds
+        for ts, name, color, text, clip_id in rows:
+            unit = core.extract_callsign(text, self.extra_prefixes)
+            self.history.append((name, color, text, ts, unit, clip_id))
+        self._replay_history()
+        n_clips = sum(1 for r in rows if r[4])
+        self._restored = (len(rows), n_clips)   # surfaced once the model is ready
+
     # ----- clip recording ---------------------------------------------------
     def _clip_dir(self):
         """Where clips live. Read from the engine when it has a store, so this
@@ -1817,18 +1878,22 @@ class TranscriberGUI:
             return
         feed, source, days = dlg.result
 
+        # The header reports the first and last TRANSMISSION, not the day range:
+        # exporting a whole day whose traffic ran 10:38-11:05 should say so.
+        # Logs only store the time, so entries carry the day from the filename.
         if source == "session":
             # history rows are (name, color, text, ts, unit, clip_id); the PDF
             # wants the same "[HH:MM:SS] text" shape the disk logs use.
-            lines = [f"[{ts}] {text}" for nm, _c, text, ts, _u, _cl in self.history
-                     if nm == feed]
-            subtitle = f"Current session — {len(lines)} lines"
+            today = _dt.datetime.now().strftime("%Y%m%d")
+            entries = [(today, ts, text)
+                       for nm, _c, text, ts, _u, _cl in self.history if nm == feed]
         else:
-            paths = [p for d, p in core.log_files_for(feed) if d in days]
-            lines = core.read_log_lines(paths)
-            span = (f"{_fmt_day(days[0])} – {_fmt_day(days[-1])}"
-                    if len(days) > 1 else _fmt_day(days[0]))
-            subtitle = f"{span} — {len(lines)} lines"
+            entries = core.read_log_entries(
+                [(d, p) for d, p in core.log_files_for(feed) if d in days])
+        lines = [f"[{ts}] {text}" for _d, ts, text in entries]
+        span = core.format_transcript_span(*core.transcript_span(entries))
+        count = f"{len(lines)} transmission{'s' if len(lines) != 1 else ''}"
+        subtitle = f"{span}  ·  {count}" if span else count
         if not lines:
             messagebox.showinfo("Save as PDF",
                                 f"No transcript lines for “{feed}”.",
@@ -2306,7 +2371,13 @@ class TranscriberGUI:
                 elif kind == "status":
                     self._set_status(payload)
                 elif kind == "ready":
-                    self._set_status("Model ready. Listening.")
+                    n, n_clips = getattr(self, "_restored", (0, 0))
+                    if n:
+                        extra = f", {n_clips} with audio" if n_clips else ""
+                        self._set_status(f"Model ready. Listening. "
+                                         f"(Restored {n} line(s) from today{extra}.)")
+                    else:
+                        self._set_status("Model ready. Listening.")
                     self._refresh_listen_choices()
                     self._dismiss_splash()
                     self.root.after(400, self._maybe_prompt_login)
