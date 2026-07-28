@@ -19,8 +19,14 @@ class FakeClips:
         self.enabled = False
         self.retention_days = 7
 
+    def _real(self):
+        return core.ClipStore({}, clip_dir=self.dir)
+
     def clip_map(self, day=None):
-        return core.ClipStore({}, clip_dir=self.dir).clip_map(day)
+        return self._real().clip_map(day)
+
+    def clip_info(self, clip_id):
+        return self._real().clip_info(clip_id)
 
 
 class FakeEngine:
@@ -941,6 +947,97 @@ def run():
                                           and kept[0][2] == "restored line three")
         core.log_files_for = real_logs_for
         app.cfg.pop("restore_lines", None)
+        app.history.clear()
+
+        # --- Selecting clips and exporting them as one MP3 --------------------
+        app.past_day = None
+        app.view_mode.set("unified")
+        app.history.clear()
+        app._rebuild_body()
+        for i, (txt, cid) in enumerate([("alpha line", "cid-1"),
+                                        ("bravo line", None),
+                                        ("charlie line", "cid-2"),
+                                        ("delta line", "cid-3")]):
+            app._append_line(active_feed, "cyan", txt, f"12:00:0{i}", cid)
+
+        u = app.unified
+        u.tag_remove("sel", "1.0", "end")
+        results["mp3_no_selection"] = (app._selected_clip_ids() == [])
+
+        # Select lines 1-3: picks up cid-1 and cid-2, skips the clipless line,
+        # and stops before cid-3.
+        u.tag_add("sel", "1.0", "3.end")
+        results["mp3_selection_maps"] = (app._selected_clip_ids() == ["cid-1", "cid-2"])
+        # Order follows the transcript, not tag creation order.
+        u.tag_remove("sel", "1.0", "end")
+        u.tag_add("sel", "1.0", "end")
+        results["mp3_selection_ordered"] = (app._selected_clip_ids() ==
+                                            ["cid-1", "cid-2", "cid-3"])
+        # A selection covering only a clipless line yields nothing.
+        u.tag_remove("sel", "1.0", "end")
+        u.tag_add("sel", "2.0", "2.end")
+        results["mp3_selection_clipless"] = (app._selected_clip_ids() == [])
+
+        # A real mouse drag must produce a selection -- the panes are disabled
+        # Text widgets, and the whole feature rests on that still selecting.
+        u.tag_remove("sel", "1.0", "end")
+        app.root.update()
+        u.event_generate("<Button-1>", x=5, y=5)
+        u.event_generate("<B1-Motion>", x=200, y=40)
+        u.event_generate("<ButtonRelease-1>", x=200, y=40)
+        app.root.update()
+        results["mp3_mouse_drag_selects"] = bool(u.tag_ranges("sel"))
+
+        # Nothing selected -> tells the user how, and opens no save dialog.
+        u.tag_remove("sel", "1.0", "end")
+        infos3 = []
+        gui.messagebox.showinfo = lambda *a, **k: infos3.append(a)
+        asked = []
+        gui.filedialog.asksaveasfilename = lambda *a, **k: asked.append(1) or ""
+        app._export_selected_mp3()
+        results["mp3_empty_selection_informs"] = (len(infos3) == 1 and not asked)
+
+        # With a selection, cancelling the save dialog does nothing further.
+        u.tag_add("sel", "1.0", "end")
+        app._export_selected_mp3()
+        results["mp3_cancel_noop"] = (len(asked) == 1)
+
+        # The result handler reports success and flags purged clips.
+        app._handle_mp3_done(True, "out.mp3", {"clips": 3, "seconds": 8.3,
+                                               "missing": []})
+        results["mp3_status_ok"] = ("3 clip" in app.status.cget("text")
+                                    and "out.mp3" in app.status.cget("text"))
+        app._handle_mp3_done(True, "out.mp3", {"clips": 2, "seconds": 5.0,
+                                               "missing": ["x"]})
+        results["mp3_status_missing"] = ("no longer on disk" in app.status.cget("text"))
+        errs2 = []
+        gui.messagebox.showerror = lambda *a, **k: errs2.append(a)
+        app._handle_mp3_done(False, "boom", None)
+        results["mp3_status_error"] = (len(errs2) == 1
+                                       and "failed" in app.status.cget("text"))
+
+        # The right-click menu enables/disables itself against the selection.
+        u.tag_remove("sel", "1.0", "end")
+        popped = {}
+        class FakeMenu:
+            def __init__(self, *a, **k): self.items = []
+            def add_command(self, **k): self.items.append(k)
+            def add_separator(self): pass
+            def tk_popup(self, *a): popped["shown"] = self
+            def grab_release(self): pass
+        real_menu = gui.tk.Menu
+        gui.tk.Menu = FakeMenu
+        class Ev: x_root = y_root = 10
+        app._transcript_menu(Ev(), u)
+        results["mp3_menu_disabled_empty"] = (
+            popped["shown"].items[0]["state"] == "disabled")
+        u.tag_add("sel", "1.0", "end")
+        app._transcript_menu(Ev(), u)
+        results["mp3_menu_enabled_counts"] = (
+            popped["shown"].items[0]["state"] == "normal"
+            and "3 clips" in popped["shown"].items[0]["label"])
+        gui.tk.Menu = real_menu
+        u.tag_remove("sel", "1.0", "end")
         app.history.clear()
 
         # --- Reviewing a past day ---------------------------------------------

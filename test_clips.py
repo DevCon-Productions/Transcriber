@@ -193,6 +193,64 @@ def run():
     results["clip_map_empty_day"] = (mstore.clip_map("19700101") == {})
     mstore.stop()
 
+    # ---- exporting selected clips as one MP3 ------------------------------
+    mdir2 = os.path.join(d, "mp3")
+    mp3store = core.ClipStore(cfg, clip_dir=mdir2)
+    mp3store.start()
+    e_ids = [mp3store.save("West", _tone(0.5, freq=300 + 100 * i),
+                           text=f"line {i}") for i in range(3)]
+    mp3store._q.join()
+
+    out_mp3 = os.path.join(d, "combined.mp3")
+    res = core.export_clips_mp3(e_ids, out_mp3, mp3store, title="West — test")
+    results["mp3_written"] = (os.path.isfile(out_mp3)
+                              and os.path.getsize(out_mp3) > 0)
+    results["mp3_counts_clips"] = (res["clips"] == 3 and res["missing"] == [])
+    # 3 x 0.5s of audio + 2 x 300ms of silence between them.
+    expected = 3 * 0.5 + 2 * (core.MP3_GAP_MS / 1000)
+    results["mp3_joined_length"] = (abs(res["seconds"] - expected) < 0.15)
+    # It really is an MP3, and decodes back to about that long.
+    with open(out_mp3, "rb") as f:
+        head = f.read(3)
+    results["mp3_is_mp3"] = (head in (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xfa"))
+    back = mp3store.load_pcm  # reuse the ffmpeg decode path via a temp clip name
+    import subprocess
+    dec = subprocess.run([mp3store.ffmpeg, "-nostdin", "-loglevel", "error",
+                          "-i", out_mp3, "-f", "s16le", "-ar",
+                          str(core.SAMPLE_RATE), "-ac", "1", "pipe:1"],
+                         capture_output=True)
+    dec_sec = len(dec.stdout) / 2.0 / core.SAMPLE_RATE
+    results["mp3_decodes_back"] = (abs(dec_sec - expected) < 0.35)  # codec padding
+
+    # A single clip is a valid export too (no gap involved).
+    one_mp3 = os.path.join(d, "one.mp3")
+    res1 = core.export_clips_mp3([e_ids[0]], one_mp3, mp3store)
+    results["mp3_single_clip"] = (res1["clips"] == 1
+                                  and abs(res1["seconds"] - 0.5) < 0.1)
+
+    # A purged clip in the selection is reported, not fatal.
+    mixed = os.path.join(d, "mixed.mp3")
+    res2 = core.export_clips_mp3([e_ids[0], "gone-20260101-000000-00001"],
+                                 mixed, mp3store)
+    results["mp3_reports_missing"] = (res2["clips"] == 1
+                                      and res2["missing"] == ["gone-20260101-000000-00001"])
+    # Nothing readable at all -> a clear error rather than a 0-byte file.
+    try:
+        core.export_clips_mp3(["nope-20260101-000000-00001"],
+                              os.path.join(d, "never.mp3"), mp3store)
+        results["mp3_all_missing_raises"] = False
+    except RuntimeError:
+        results["mp3_all_missing_raises"] = (
+            not os.path.exists(os.path.join(d, "never.mp3")))
+
+    # clip_info resolves a clip's index record from the day inside its id.
+    info = mp3store.clip_info(e_ids[1])
+    results["clip_info_found"] = (info is not None and info["text"] == "line 1"
+                                  and info["feed"] == "West")
+    results["clip_info_missing"] = (mp3store.clip_info("nope-20260101-000000-1")
+                                    is None)
+    mp3store.stop()
+
     # ---- reviewing a past day (day_summaries / load_day) ------------------
     # Two days of logs; only the newer one still has clips, which is the normal
     # state once clips.retention_days (7) outruns log_retention_days (14).

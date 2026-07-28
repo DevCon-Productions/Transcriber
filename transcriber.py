@@ -970,6 +970,17 @@ class ClipStore:
                 return row.get("id")
         return None
 
+    def clip_info(self, clip_id):
+        """The index record for one clip, or None. The day is embedded in the id
+        ({feed}-YYYYMMDD-HHMMSS-NNNNN), so this reads just that day's index."""
+        parts = clip_id.rsplit("-", 3)
+        if len(parts) < 4:
+            return None
+        for row in self.index_for_day(parts[-3]):
+            if row.get("id") == clip_id:
+                return row
+        return None
+
     def clip_map(self, day=None):
         """{(feed, ts): [clip_id, ...]} for a whole day, read once. Restoring a
         scrollback means thousands of lookups; find_clip() per line would rescan
@@ -986,6 +997,53 @@ class ClipStore:
             if r.get("feed") and r.get("ts") and r.get("id"):
                 out.setdefault((r["feed"], r["ts"]), []).append(r["id"])
         return out
+
+
+MP3_DEFAULT_BITRATE = "64k"     # mono 16 kHz speech; plenty, and small
+MP3_GAP_MS = 300                # silence between joined transmissions
+
+
+def export_clips_mp3(clip_ids, out_path, store, gap_ms=MP3_GAP_MS,
+                     bitrate=MP3_DEFAULT_BITRATE, title=None):
+    """Decode the given clips, join them in order, and write one MP3.
+
+    Joining happens as raw PCM rather than by concatenating encoded files: the
+    clips are Opus and stitching compressed frames would need matching encoder
+    state. Decoding to s16 and re-encoding once is simpler and lossless-enough
+    for speech at these rates. A short silence separates transmissions so a
+    combined file doesn't run together.
+
+    Returns {"clips": n_written, "missing": [ids], "seconds": float}. Raises
+    RuntimeError if nothing could be decoded or ffmpeg fails."""
+    gap = b"\x00\x00" * int(SAMPLE_RATE * max(0, gap_ms) / 1000)
+    chunks, missing = [], []
+    for cid in clip_ids:
+        pcm = store.load_pcm(cid)
+        if not pcm:
+            missing.append(cid)
+            continue
+        if chunks:
+            chunks.append(gap)
+        chunks.append(pcm)
+    if not chunks:
+        raise RuntimeError("None of the selected clips could be read "
+                           "(they may have been purged).")
+    audio = b"".join(chunks)
+
+    cmd = [store.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+           "-c:a", "libmp3lame", "-b:a", bitrate]
+    if title:
+        cmd += ["-metadata", f"title={title}"]
+    cmd += [out_path]
+    proc = subprocess.run(cmd, input=audio, capture_output=True,
+                          **_no_window_kwargs())
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        err = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        raise RuntimeError(err or "ffmpeg failed to write the MP3.")
+    n = len(clip_ids) - len(missing)
+    return {"clips": n, "missing": missing,
+            "seconds": round(len(audio) / 2.0 / SAMPLE_RATE, 2)}
 
 
 def purge_old_clips(retention_days, clip_dir=CLIP_DIR):

@@ -348,6 +348,25 @@ Clips are voice recordings of live radio. They stay on your PC, are purged on th
 same kind of schedule as the logs (`clips.retention_days`), and can be wiped from
 the recording dialog at any time.
 
+#### Exporting clips as an MP3
+
+Drag across transcript lines, then **right-click → Export selected audio as MP3…**
+(or Streams → the same). Every selected line that has a 🔊 is decoded, joined in
+transcript order with a short silence between transmissions, and written as a
+single MP3. Selecting one line exports just that one.
+
+The transcript panes are read-only but still selectable, so ordinary click-drag
+works; the right-click menu also has **Select all**, and reports how many clips
+your selection covers before you commit.
+
+Joining happens as raw PCM, not by concatenating the Opus files — stitching
+compressed frames would need matching encoder state. Clips decode, join, then
+re-encode once at 64 kbps mono, which is ample for 16 kHz speech. Lines without
+audio are skipped silently; clips already purged are reported in the status bar
+rather than failing the export.
+
+Encoding runs on a worker thread, so a long selection never freezes the window.
+
 #### Reviewing an earlier day
 
 The live window restores **today's** lines on launch. To go further back, use

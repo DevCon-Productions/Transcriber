@@ -1276,6 +1276,15 @@ HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
   • These are voice recordings of live radio — they never leave your PC, but
     treat the clips folder the way you'd treat the transcripts.
 
+SAVING CLIPS AS AN MP3  (right-click the transcript)
+  Drag across the lines you want, then right-click → "Export selected audio as
+  MP3…". The selected lines' audio is joined, in the order shown, into one MP3
+  with a short gap between transmissions. One line exports just that clip.
+  • The menu tells you how many clips your selection covers before you save.
+  • "Select all" is on the same menu if you want the whole pane.
+  • Lines without a 🔊 are skipped; if a clip has already been deleted it's
+    noted in the status bar rather than failing the whole export.
+
 GOING BACK A DAY  (Streams → Open a past day…)
   The window restores today's lines when it opens. For anything earlier, pick a
   feed and a day from the list — newest first, showing how many lines each day
@@ -1924,6 +1933,107 @@ class TranscriberGUI:
         n_clips = sum(1 for r in rows if r[4])
         self._restored = (len(rows), n_clips)   # surfaced once the model is ready
 
+    # ----- exporting selected clips as MP3 ----------------------------------
+    def _transcript_widgets(self):
+        """Every transcript Text on screen right now, past view included."""
+        if self.past_day:
+            return [self.unified] if getattr(self, "unified", None) else []
+        return self._active_text_widgets()
+
+    @staticmethod
+    def _index_key(idx):
+        """'12.4' -> (12, 4), so selected clips come out in reading order."""
+        line, _, col = str(idx).partition(".")
+        try:
+            return (int(line), int(col))
+        except ValueError:
+            return (0, 0)
+
+    def _selected_clip_ids(self):
+        """Clip ids whose 🔊 marker falls inside the current selection, in the
+        order they appear. Tk keeps `sel` per-widget, so this finds the one
+        widget holding a selection (sectors view has several)."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if not sel:
+                continue
+            start, end = sel[0], sel[1]
+            hits = []
+            for tag in w.tag_names():
+                if not tag.startswith("clip:"):
+                    continue
+                ranges = w.tag_ranges(tag)
+                for i in range(0, len(ranges), 2):
+                    a, b = ranges[i], ranges[i + 1]
+                    # Overlap, not containment: dragging across a line should
+                    # take its clip even if the 🔊 is only partly covered.
+                    if w.compare(a, "<", end) and w.compare(b, ">", start):
+                        hits.append((self._index_key(a), tag[len("clip:"):]))
+                        break
+            hits.sort()
+            seen, ids = set(), []
+            for _k, cid in hits:
+                if cid not in seen:
+                    seen.add(cid)
+                    ids.append(cid)
+            if ids:
+                return ids
+        return []
+
+    def _export_selected_mp3(self):
+        """Save the audio of the selected lines as one MP3, in transcript order."""
+        ids = self._selected_clip_ids()
+        if not ids:
+            messagebox.showinfo(
+                "Export audio",
+                "Select one or more transcript lines that have a 🔊 first, "
+                "then export.\n\nDrag across the lines you want; they're "
+                "combined into a single MP3 in the order shown.",
+                parent=self.root)
+            return
+
+        store = self._clip_store()
+        info = store.clip_info(ids[0]) or {}
+        feed = info.get("feed", "clips")
+        stamp = ids[0].rsplit("-", 3)
+        day_part = stamp[-3] if len(stamp) >= 4 else ""
+        default = (f"{core.safe_filename(feed)}-{day_part}"
+                   f"-{len(ids)}clip{'s' if len(ids) != 1 else ''}.mp3")
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title=f"Export {len(ids)} clip"
+                                    f"{'s' if len(ids) != 1 else ''} as MP3",
+            defaultextension=".mp3", initialfile=default,
+            filetypes=[("MP3 audio", "*.mp3"), ("All files", "*.*")])
+        if not path:
+            return
+
+        title = f"{feed} — {_fmt_day(day_part)}" if day_part else feed
+        self._set_status(f"Encoding {len(ids)} clip(s) to MP3…")
+
+        def _go():
+            try:
+                res = core.export_clips_mp3(ids, path, store, title=title)
+            except Exception as e:
+                self.events.put(("mp3_done", (False, str(e), None)))
+                return
+            self.events.put(("mp3_done", (True, os.path.basename(path), res)))
+
+        threading.Thread(target=_go, daemon=True, name="mp3export").start()
+
+    def _handle_mp3_done(self, ok, msg, res):
+        if not ok:
+            messagebox.showerror("Export audio", msg, parent=self.root)
+            self._set_status("MP3 export failed.")
+            return
+        note = (f"Saved {res['clips']} clip(s), {res['seconds']:.0f}s of audio "
+                f"to {msg}")
+        if res["missing"]:
+            note += f" ({len(res['missing'])} no longer on disk)"
+        self._set_status(note)
+
     # ----- reviewing a past day ---------------------------------------------
     def _open_past_day(self):
         """Streams → 'Open a past day…': pick a feed + day and review it."""
@@ -2059,6 +2169,8 @@ class TranscriberGUI:
                                  command=self._open_past_day)
         streams_menu.add_command(label="Audio recording...",
                                  command=self._open_clip_settings)
+        streams_menu.add_command(label="Export selected audio as MP3...",
+                                 command=self._export_selected_mp3)
         streams_menu.add_command(label="Save transcript as PDF...",
                                  command=self._export_pdf)
         streams_menu.add_separator()
@@ -2296,6 +2408,7 @@ class TranscriberGUI:
             self.unified = self._make_text(self.body)
             self.unified.pack(fill="both", expand=True, padx=6, pady=6)
             # Color tags are configured lazily per line in _render_line.
+            self._bind_transcript_menu(self.unified)
         else:
             panels = active or [{"name": "(no active streams)", "color": "grey"}]
             self._sector_headers = []   # (frame, stream_name, hdr) for drag hit-test
@@ -2322,8 +2435,32 @@ class TranscriberGUI:
                     # Right-click for the sector context menu.
                     hdr.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
                     txt.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
+                else:
+                    self._bind_transcript_menu(txt)
 
         self._replay_history()
+
+    def _bind_transcript_menu(self, widget):
+        """Right-click menu for a transcript pane that has no sector menu of its
+        own (unified view, and the past-day view)."""
+        widget.bind("<Button-3>", lambda e, w=widget: self._transcript_menu(e, w))
+
+    def _transcript_menu(self, event, widget):
+        n = len(self._selected_clip_ids())
+        menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
+                       activebackground="#3a3d44", activeforeground=FG)
+        label = (f"Export selected audio as MP3 ({n} clip"
+                 f"{'s' if n != 1 else ''})…") if n else \
+                "Export selected audio as MP3…"
+        menu.add_command(label=label, command=self._export_selected_mp3,
+                         state="normal" if n else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Select all", command=lambda w=widget: (
+            w.tag_add("sel", "1.0", "end"), w.focus_set()))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _build_past_view(self):
         """The read-only transcript of one past day, with a banner back to live."""
@@ -2345,6 +2482,7 @@ class TranscriberGUI:
         txt = self._make_text(self.body)
         txt.pack(fill="both", expand=True, padx=6, pady=6)
         self.unified = txt                     # so font resizing still applies
+        self._bind_transcript_menu(txt)         # select + export works here too
         color = (self._lib_find(feed) or {}).get("color", "white")
         txt.configure(state="normal")
         txt.tag_config("ts", foreground=MUTED)
@@ -2540,6 +2678,8 @@ class TranscriberGUI:
                     self._append_line(*payload)
                 elif kind == "status":
                     self._set_status(payload)
+                elif kind == "mp3_done":
+                    self._handle_mp3_done(*payload)
                 elif kind == "ready":
                     n, n_clips = getattr(self, "_restored", (0, 0))
                     if n:
