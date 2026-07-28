@@ -1532,11 +1532,17 @@ _NAME_NT = r"(?!(?i:" + _STREET_TYPE_RE + r")\b)" + _NAME
 
 # 1) Numbered street address: "3658 East 149th Street", "162 America Boulevard",
 #    "66745 Schubert Drive". Number + 1-3 name words + optional street type.
+#
+# NOT compiled with re.I. _NAME requires a capitalised word, and a blanket
+# re.I silently defeated that -- every lowercase word became a candidate street
+# name, so "Engine 14 show me en route" parsed as 14 + "show me en" + the street
+# type "route" and put a Google Maps link on it. ("en route" is about as common
+# as radio traffic gets.) Only the direction and street-type alternations are
+# case-insensitive, matching how _ADDR_NAMED already does it.
 _ADDR_NUMBERED = re.compile(
     r"\b(\d{2,6})\s+"
-    r"((?:" + _DIRS + r"\s+)?" + _NAME_NT + r"(?:\s+" + _NAME_NT + r"){0,2})"
-    r"(?:\s+(" + _STREET_TYPE_RE + r"))?\b",
-    re.I)
+    r"((?:(?i:" + _DIRS + r")\s+)?" + _NAME_NT + r"(?:\s+" + _NAME_NT + r"){0,2})"
+    r"(?:\s+((?i:" + _STREET_TYPE_RE + r")))?\b")
 
 # 2) Named street with an explicit type: "American Boulevard", "Schubert Drive",
 #    "Detroit Road". Name(s) immediately followed by a street type word.

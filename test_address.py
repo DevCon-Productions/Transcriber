@@ -34,6 +34,26 @@ def run():
     r["not_plain_chatter"] = (names("Okay, copy that, thank you.") == [])
     r["empty_safe"] = (names("") == [])
 
+    # --- "en route" must never look like an address -------------------------
+    # _ADDR_NUMBERED used to carry a blanket re.I, which defeated the capitalised
+    # -word requirement its street-name pattern relies on: any lowercase word
+    # became a candidate name, so a number followed by "... en route" matched
+    # with "route" as the street type. That phrase is everywhere on scanner
+    # audio, so it put a bogus map link on ordinary traffic.
+    r["not_en_route"] = (names("Engine 14 show me en route.") == [])
+    r["not_en_route_mid"] = (names("Show me en route, 26 radio.") == [])
+    r["not_en_route_units"] = (names("12 units en route to the fire.") == [])
+    r["not_lowercase_run"] = (names("We are 20 minutes out from the area.") == [])
+    # ...while genuine numbered addresses still resolve.
+    r["still_numbered"] = (names("Adam 33 out at 3658 East 149th Street.")
+                           == ["3658 East 149th Street"])
+    r["still_named_street"] = (names("Last seen on Detroit Road.")
+                               == ["Detroit Road"])
+    r["still_intersection"] = (names("Respond to East 93rd and Union.")
+                               == ["East 93rd and Union"])
+    r["still_no_type"] = (names("Responding to 162 America Boulevard.")
+                          == ["162 America Boulevard"])
+
     # --- map URL building ---------------------------------------------------
     u = maps_url("3658 East 149th", "Cleveland, OH")
     r["url_has_query"] = ("google.com/maps/search" in u and "3658" in u)
