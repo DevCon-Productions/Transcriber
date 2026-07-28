@@ -348,6 +348,27 @@ Clips are voice recordings of live radio. They stay on your PC, are purged on th
 same kind of schedule as the logs (`clips.retention_days`), and can be wiped from
 the recording dialog at any time.
 
+#### Reviewing an earlier day
+
+The live window restores **today's** lines on launch. To go further back, use
+**Streams → Open a past day…**: pick a feed, then a day. The list is newest-first
+and shows what each day holds:
+
+```
+2026-07-28   103 lines  🔊 103
+2026-07-19   182 lines
+2026-07-15   285 lines
+```
+
+The 🔊 count is audio still on disk. Days without it kept their transcript but
+their clips have been purged — `clips.retention_days` (7) is shorter than
+`log_retention_days` (14), so the older stretch is text-only by design.
+
+Opening a day takes over the window with a read-only transcript of it, marked
+with 🔊 wherever the audio survived, and an amber banner naming the day. Feeds
+keep transcribing and recording the whole time — new lines are held in memory
+and appear when you click **Back to live**.
+
 ```jsonc
 "clips": {
   "enabled": true,        // master switch

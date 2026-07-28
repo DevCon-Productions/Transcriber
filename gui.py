@@ -866,6 +866,81 @@ class ClipSettingsDialog(simpledialog.Dialog):
                        "retention_days": float(self.days.get())}
 
 
+class PastDayDialog(simpledialog.Dialog):
+    """Pick a feed and one of its saved days to review. Each day shows how many
+    lines it has and whether its audio is still on disk -- clips are purged on a
+    shorter schedule than logs, so an older day is often text-only.
+    result = (feed, 'YYYYMMDD')."""
+    def __init__(self, parent, app, names):
+        self._app = app
+        self._names = names
+        super().__init__(parent, title="Open a past day")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+
+        tk.Label(master, text="Feed", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w",
+                                                     padx=10, pady=(10, 2))
+        self.feed = tk.StringVar(value=self._names[0])
+        combo = ttk.Combobox(master, textvariable=self.feed, values=self._names,
+                             state="readonly", width=34)
+        combo.grid(row=0, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.feed.trace_add("write", lambda *_: self._refresh_days())
+
+        tk.Label(master, text="Day", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="nw",
+                                                     padx=10, pady=(8, 2))
+        wrap = tk.Frame(master, bg=BG)
+        wrap.grid(row=1, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.daylist = tk.Listbox(wrap, height=9, width=38, bg=BG2, fg=FG,
+                                  highlightthickness=0, activestyle="none",
+                                  exportselection=False)
+        self.daylist.pack(side="left")
+        sb = tk.Scrollbar(wrap, command=self.daylist.yview)
+        sb.pack(side="left", fill="y")
+        self.daylist.config(yscrollcommand=sb.set)
+        self.daylist.bind("<Double-Button-1>", lambda e: self.ok())
+
+        tk.Label(master, text="Newest first. 🔊 = audio still saved for that day; "
+                 "older days\nkeep their text after the clips are purged.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=2, column=1, sticky="w", padx=10, pady=(0, 8))
+
+        self._refresh_days()
+        return combo
+
+    def _refresh_days(self):
+        self._days = core.day_summaries(self.feed.get(),
+                                        clips=self._app._clip_store(),
+                                        log_dir=core.LOG_DIR)
+        self.daylist.delete(0, "end")
+        for r in self._days:
+            mark = f"  🔊 {r['clips']}" if r["clips"] else ""
+            self.daylist.insert("end", f"{_fmt_day(r['day'])}   "
+                                       f"{r['lines']} lines{mark}")
+        if not self._days:
+            self.daylist.insert("end", "(no saved transcripts for this feed)")
+        else:
+            self.daylist.selection_set(0)
+
+    def validate(self):
+        if not self._days:
+            messagebox.showwarning("Open a past day",
+                                   "That feed has no saved transcripts.",
+                                   parent=self)
+            return False
+        if not self.daylist.curselection():
+            messagebox.showwarning("Open a past day", "Pick a day.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        self.result = (self.feed.get(),
+                       self._days[self.daylist.curselection()[0]]["day"])
+
+
 class PdfExportDialog(simpledialog.Dialog):
     """Pick what goes into the PDF: which feed, and whether to use the current
     on-screen session or saved daily logs. result = (feed, source, days)
@@ -1201,6 +1276,16 @@ HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
   • These are voice recordings of live radio — they never leave your PC, but
     treat the clips folder the way you'd treat the transcripts.
 
+GOING BACK A DAY  (Streams → Open a past day…)
+  The window restores today's lines when it opens. For anything earlier, pick a
+  feed and a day from the list — newest first, showing how many lines each day
+  has and how many still have audio (🔊).
+  • Days with no 🔊 kept their text but their clips have already been deleted:
+    audio is kept for fewer days than transcripts.
+  • The day opens read-only, with an amber banner naming it. Your feeds keep
+    transcribing and recording while you read; click "Back to live" and anything
+    that arrived meanwhile is there waiting.
+
 SAVING A TRANSCRIPT AS PDF  (Streams menu, or the PDF button on a feed row)
   Pick a feed and what to include:
   • This session – exactly what's on screen for that feed right now.
@@ -1530,6 +1615,8 @@ class TranscriberGUI:
         # (name, color, text, ts, unit, clip_id)
         self.history = collections.deque(maxlen=HISTORY_MAX)
         self._restored = (0, 0)          # (lines, of which had clips) on launch
+        self.past_day = None             # (feed, day) while reviewing a past day
+        self._past_rows = []             # that day's [(ts, text, clip_id)]
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
@@ -1837,6 +1924,48 @@ class TranscriberGUI:
         n_clips = sum(1 for r in rows if r[4])
         self._restored = (len(rows), n_clips)   # surfaced once the model is ready
 
+    # ----- reviewing a past day ---------------------------------------------
+    def _open_past_day(self):
+        """Streams → 'Open a past day…': pick a feed + day and review it."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Open a past day", "No feeds to review.")
+            return
+        dlg = PastDayDialog(self.root, self, names)
+        if not dlg.result:
+            return
+        feed, day = dlg.result
+        rows = core.load_day(feed, day, clips=self._clip_store())
+        if not rows:
+            messagebox.showinfo("Open a past day",
+                                f"No saved transcript for “{feed}” on "
+                                f"{_fmt_day(day)}.", parent=self.root)
+            return
+        self.past_day = (feed, day)
+        self._past_rows = rows
+        self._build_view()
+        n_clips = sum(1 for r in rows if r[2])
+        self._set_status(f"Viewing {_fmt_day(day)} — {feed}: {len(rows)} lines, "
+                         f"{n_clips} with audio.")
+
+    def _exit_past_day(self):
+        """Back to the live transcript. Lines that arrived while reviewing were
+        still recorded to history, so they appear on the way back."""
+        self.past_day = None
+        self._past_rows = []
+        if self.engine:
+            self.engine.stop_clip()      # don't leave a clip playing over live
+        self._build_view()
+        self._set_status("Back to live.")
+
+    def _clip_store(self):
+        """A ClipStore for reading saved clips. Reuses the engine's when it has
+        one so the directory always matches what's being written."""
+        store = getattr(self.engine, "clips", None)
+        return store if store is not None else \
+            core.ClipStore(self.cfg, clip_dir=self._clip_dir())
+
     # ----- clip recording ---------------------------------------------------
     def _clip_dir(self):
         """Where clips live. Read from the engine when it has a store, so this
@@ -1926,6 +2055,8 @@ class TranscriberGUI:
         streams_menu.add_command(label="Export feed list...", command=self._export_feeds)
         streams_menu.add_command(label="Import feed list...", command=self._import_feeds)
         streams_menu.add_separator()
+        streams_menu.add_command(label="Open a past day...",
+                                 command=self._open_past_day)
         streams_menu.add_command(label="Audio recording...",
                                  command=self._open_clip_settings)
         streams_menu.add_command(label="Save transcript as PDF...",
@@ -2152,6 +2283,14 @@ class TranscriberGUI:
             w.destroy()
         self.sector_panels.clear()
 
+        # Reviewing a past day takes over the body entirely: one feed, one day,
+        # read-only. Every rebuild path (view toggle, font change, feed edit)
+        # comes through here, so the past view survives all of them until the
+        # user clicks "Back to live".
+        if self.past_day:
+            self._build_past_view()
+            return
+
         active = self._enabled_streams()
         if self.view_mode.get() == "unified":
             self.unified = self._make_text(self.body)
@@ -2185,6 +2324,37 @@ class TranscriberGUI:
                     txt.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
 
         self._replay_history()
+
+    def _build_past_view(self):
+        """The read-only transcript of one past day, with a banner back to live."""
+        feed, day = self.past_day
+        rows = self._past_rows
+        n_clips = sum(1 for r in rows if r[2])
+
+        bar = tk.Frame(self.body, bg="#3a3320")     # amber: not live
+        bar.pack(side="top", fill="x")
+        audio = (f"{n_clips} with audio" if n_clips else
+                 "no audio kept for this day")
+        tk.Label(bar, text=f"  Viewing {_fmt_day(day)} — {feed}   "
+                 f"({len(rows)} lines, {audio})",
+                 bg="#3a3320", fg="#f0d79a", anchor="w",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", pady=4)
+        tk.Button(bar, text="Back to live", command=self._exit_past_day,
+                  bg=BG2, fg=FG, relief="flat").pack(side="right", padx=6, pady=3)
+
+        txt = self._make_text(self.body)
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+        self.unified = txt                     # so font resizing still applies
+        color = (self._lib_find(feed) or {}).get("color", "white")
+        txt.configure(state="normal")
+        txt.tag_config("ts", foreground=MUTED)
+        for ts, text, clip_id in rows:
+            txt.insert("end", f"[{ts}] ", ("ts",))
+            if clip_id:
+                self._insert_clip_marker(txt, clip_id)
+            self._insert_message_text(txt, feed, text, ())
+        txt.configure(state="disabled")
+        txt.see("1.0")                          # start at the top of the day
 
     def _make_text(self, parent):
         frame = tk.Frame(parent, bg=BG)
@@ -2434,6 +2604,11 @@ class TranscriberGUI:
         unit = core.extract_callsign(text, self.extra_prefixes)
         # Always record to history (filter affects display only, not the record).
         self.history.append((name, color, text, ts, unit, clip_id))
+        # While reviewing a past day the body belongs to that day -- keep
+        # recording, but don't scribble live traffic into it. History replays on
+        # the way back, so nothing is lost.
+        if self.past_day:
+            return
         if self._passes_filter(unit):
             self._render_line(name, color, text, ts, unit, autoscroll=True,
                               clip_id=clip_id)

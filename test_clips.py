@@ -4,6 +4,7 @@ AudioPlayer's clip-over-live priority (no GPU, no network, no audio device).
 Uses whatever ffmpeg find_ffmpeg() resolves, so this exercises the real Opus
 encode when the build has libopus and the WAV fallback when it doesn't.
 """
+import json
 import os
 import tempfile
 import numpy as np
@@ -191,6 +192,49 @@ def run():
         lst == sorted(lst) for lst in cmap.values())      # ids embed a counter
     results["clip_map_empty_day"] = (mstore.clip_map("19700101") == {})
     mstore.stop()
+
+    # ---- reviewing a past day (day_summaries / load_day) ------------------
+    # Two days of logs; only the newer one still has clips, which is the normal
+    # state once clips.retention_days (7) outruns log_retention_days (14).
+    pdir = os.path.join(d, "pastlogs")
+    os.makedirs(pdir)
+    with open(os.path.join(pdir, "West-20260728.log"), "w", encoding="utf-8") as f:
+        f.write("[10:00:00] today one\n[10:00:00] today two\n[10:00:09] today three\n")
+    with open(os.path.join(pdir, "West-20260715.log"), "w", encoding="utf-8") as f:
+        f.write("[08:00:00] old one\n[08:00:01] old two\n")
+
+    cdir2 = os.path.join(d, "pastclips")
+    os.makedirs(cdir2)
+    with open(os.path.join(cdir2, "index-20260728.jsonl"), "w",
+              encoding="utf-8") as f:
+        for cid, ts in [("c1", "10:00:00"), ("c2", "10:00:00")]:
+            f.write(json.dumps({"id": cid, "feed": "West", "day": "20260728",
+                                "ts": ts, "text": "x"}) + "\n")
+    pstore = core.ClipStore(cfg, clip_dir=cdir2)
+
+    summ = core.day_summaries("West", clips=pstore, log_dir=pdir)
+    results["summary_newest_first"] = ([r["day"] for r in summ] ==
+                                       ["20260728", "20260715"])
+    results["summary_line_counts"] = ([r["lines"] for r in summ] == [3, 2])
+    # The day with clips reports them; the older, purged day reports none.
+    results["summary_clip_counts"] = ([r["clips"] for r in summ] == [2, 0])
+    results["summary_without_store"] = (
+        [r["clips"] for r in core.day_summaries("West", log_dir=pdir)] == [0, 0])
+
+    rows = core.load_day("West", "20260728", clips=pstore, log_dir=pdir)
+    results["load_day_rows"] = ([r[1] for r in rows] ==
+                                ["today one", "today two", "today three"])
+    # Same-second lines take different clips, in order; the third has none.
+    results["load_day_distinct_clips"] = ([r[2] for r in rows] ==
+                                          ["c1", "c2", None])
+    old_rows = core.load_day("West", "20260715", clips=pstore, log_dir=pdir)
+    results["load_day_text_only"] = (len(old_rows) == 2
+                                     and all(r[2] is None for r in old_rows))
+    results["load_day_missing"] = (core.load_day("West", "19700101",
+                                                 clips=pstore, log_dir=pdir) == [])
+    results["load_day_unknown_feed"] = (core.load_day("Nope", "20260728",
+                                                      clips=pstore,
+                                                      log_dir=pdir) == [])
 
     # ---- the seam: gate segment -> Transcriber -> clip + id on the line ----
     # The unit checks above test the pieces; this tests them joined up, with a

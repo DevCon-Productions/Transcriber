@@ -644,6 +644,55 @@ def read_log_lines(paths):
     return lines
 
 
+def day_summaries(stream_name, clips=None, log_dir=LOG_DIR):
+    """What's reviewable for a feed, newest day first:
+        [{"day", "lines", "clips", "path"}, ...]
+
+    Powers the "open a past day" picker, which has to tell the user two separate
+    things: a day can have a transcript but no audio left, because clips are
+    purged on a shorter schedule than logs (clips.retention_days vs
+    log_retention_days). `clips` is an optional ClipStore used to count surviving
+    audio; without one the clips counts are 0."""
+    out = []
+    for day, path in log_files_for(stream_name, log_dir=log_dir):
+        entries = read_log_entries([(day, path)])
+        n_clips = 0
+        if clips is not None:
+            cmap = clips.clip_map(day)
+            used = {}
+            for _d, ts, _text in entries:
+                ids = cmap.get((stream_name, ts), ())
+                i = used.get(ts, 0)
+                used[ts] = i + 1
+                if i < len(ids):
+                    n_clips += 1
+        out.append({"day": day, "lines": len(entries), "clips": n_clips,
+                    "path": path})
+    out.sort(key=lambda r: r["day"], reverse=True)      # newest first
+    return out
+
+
+def load_day(stream_name, day, clips=None, log_dir=LOG_DIR):
+    """One day's transcript for a feed as [(ts, text, clip_id_or_None)].
+
+    The same second can hold several transmissions, each with its own clip, so
+    ids are taken from clip_map in order rather than by lookup -- see
+    ClipStore.clip_map. Returns [] if that day has no log."""
+    paths = [(d, p) for d, p in log_files_for(stream_name, log_dir=log_dir)
+             if d == day]
+    if not paths:
+        return []
+    entries = read_log_entries(paths)
+    cmap = clips.clip_map(day) if clips is not None else {}
+    used, out = {}, []
+    for _d, ts, text in entries:
+        ids = cmap.get((stream_name, ts), ())
+        i = used.get(ts, 0)
+        used[ts] = i + 1
+        out.append((ts, text, ids[i] if i < len(ids) else None))
+    return out
+
+
 def read_log_entries(day_paths):
     """Like read_log_lines, but keeps each line's DAY: [(day, ts, text), ...].
 

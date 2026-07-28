@@ -10,12 +10,17 @@ import gui
 
 
 class FakeClips:
-    """Stands in for Engine.clips: the GUI only needs its dir and retention."""
+    """Stands in for Engine.clips. The GUI reads its dir/retention and, for the
+    past-day picker, asks it which clips exist -- delegate that to a real
+    ClipStore over the same directory so the lookup logic is genuinely exercised."""
     def __init__(self):
         import tempfile
         self.dir = tempfile.mkdtemp(prefix="fakeclips_")
         self.enabled = False
         self.retention_days = 7
+
+    def clip_map(self, day=None):
+        return core.ClipStore({}, clip_dir=self.dir).clip_map(day)
 
 
 class FakeEngine:
@@ -938,6 +943,68 @@ def run():
         app.cfg.pop("restore_lines", None)
         app.history.clear()
 
+        # --- Reviewing a past day ---------------------------------------------
+        # Reuse the restore fixture's logs, plus an older text-only day.
+        with open(os.path.join(rlogs, f"{core.safe_filename(active_feed)}-20260715.log"),
+                  "w", encoding="utf-8") as f:
+            f.write("[07:00:00] older day line\n")
+        core.log_files_for = lambda name, log_dir=rlogs: real_logs_for(name, rlogs)
+
+        class LivePastDlg(gui.PastDayDialog):
+            def wait_window(self, *a, **k): pass
+        pdlg = LivePastDlg(app.root, app, [active_feed])
+        pdlg.grab_release()
+        shown = list(pdlg.daylist.get(0, "end"))
+        results["pastdlg_newest_first"] = (shown[0].startswith(today[:4] + "-")
+                                           and "2026-07-15" in shown[-1])
+        # The day with clips advertises them; the purged day doesn't.
+        results["pastdlg_marks_audio"] = ("🔊" in shown[0] and "🔊" not in shown[-1])
+        results["pastdlg_preselects"] = (pdlg.daylist.curselection() == (0,))
+        pdlg.apply()
+        results["pastdlg_result"] = (pdlg.result == (active_feed, today))
+        pdlg.destroy()
+
+        # Entering the past view: banner + lines + markers, live traffic held back.
+        class FakePastDlg:
+            spec = None
+            def __init__(self, *a, **k):
+                self.result = FakePastDlg.spec
+        FakePastDlg.spec = (active_feed, today)
+        gui.PastDayDialog = FakePastDlg
+        app._open_past_day()
+        results["past_mode_entered"] = (app.past_day == (active_feed, today))
+        body_text = "".join(w.get("1.0", "end") for w in [app.unified])
+        results["past_shows_day"] = ("restored line one" in body_text
+                                     and "🔊" in body_text)
+        # A line arriving while reviewing is recorded but not drawn.
+        before = len(app.history)
+        app._append_line(active_feed, "cyan", "live-during-past", "23:59:59")
+        results["past_holds_live_line"] = (
+            len(app.history) == before + 1
+            and "live-during-past" not in app.unified.get("1.0", "end"))
+        # A rebuild (font change, view toggle) must not knock us out of the day.
+        app._rebuild_body()
+        results["past_survives_rebuild"] = (
+            app.past_day == (active_feed, today)
+            and "restored line one" in app.unified.get("1.0", "end"))
+
+        # Back to live: history replays, including what arrived while away.
+        app._exit_past_day()
+        results["past_mode_exited"] = (app.past_day is None)
+        live_text = app.unified.get("1.0", "end") if app.view_mode.get() == "unified" \
+            else "".join(t.get("1.0", "end") for t in app.sector_panels.values())
+        results["past_exit_replays_live"] = ("live-during-past" in live_text)
+
+        # A day with no transcript reports it instead of blanking the view.
+        FakePastDlg.spec = (active_feed, "19700101")
+        infos2 = []
+        gui.messagebox.showinfo = lambda *a, **k: infos2.append(a)
+        app._open_past_day()
+        results["past_missing_day_informs"] = (len(infos2) == 1
+                                               and app.past_day is None)
+        gui.PastDayDialog = LivePastDlg.__bases__[0]
+        core.log_files_for = real_logs_for
+
         # Global settings dialog reads config and writes it back.
         class LiveClipSettings(gui.ClipSettingsDialog):
             def wait_window(self, *a, **k): pass
@@ -969,6 +1036,7 @@ def run():
         results["menu_has_import"] = ("Import feed list..." in labels)
         results["menu_has_pdf"] = ("Save transcript as PDF..." in labels)
         results["menu_has_recording"] = ("Audio recording..." in labels)
+        results["menu_has_past_day"] = ("Open a past day..." in labels)
 
         app._on_close()
 
