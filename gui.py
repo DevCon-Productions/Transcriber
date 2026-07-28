@@ -1460,6 +1460,19 @@ FEEDS  (toolbar "Feeds" button / Streams menu)
   • PDF      – save that feed's transcript as a PDF (see SAVING below).
   • Drag the ⠿ handle to reorder feeds; the order is remembered.
 
+WHAT KIND OF RADIO A FEED CARRIES  (Feeds → Edit → Service)
+  Police / Fire-EMS / Air traffic control / General. This sets three things at
+  once: the vocabulary the speech model expects, which style of call sign to
+  look for, and whether addresses or aircraft become clickable.
+  • Police and Fire/EMS differ only in wording — the call-sign reader handles
+    both at the same time, which matters on shared PD+Fire channels.
+  • Air traffic control is the one that really changes: aircraft ("Delta 510",
+    "November 65 Juliet Charlie") are recognised and link to FlightRadar24, and
+    address links are turned off (a tail number was being read as a street).
+  • "Prompt override" tunes a single feed. Leave it blank to use the service's
+    own wording; a feed with no service keeps using the global prompt from
+    config.json, exactly as before.
+
 MOVING YOUR FEED LIST  (Feeds window, or Streams menu)
   • Export list – writes every saved feed to a .json file you can back up or
                   carry to another PC.

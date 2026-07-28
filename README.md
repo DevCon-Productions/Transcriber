@@ -316,6 +316,56 @@ Cleveland feeds **plus anything you add**). Per row:
 The built-in Cleveland feeds are: Cleveland West, Cleveland Citywide (covers east
 side), Cleveland Fire/EMS, Westlake/WestCom, and East Cleveland.
 
+### Feed service — police, fire/EMS, ATC, general
+
+Each feed can say what kind of radio it carries, in **Feeds → Edit → Service**.
+It isn't cosmetic: three parts of the pipeline are domain-specific, and a service
+sets all three together.
+
+| Service | Whisper prompt | Call signs | Links |
+|---|---|---|---|
+| *(blank)* | the global `initial_prompt` | police + fire | addresses |
+| **Police** | police wording | police + fire | addresses |
+| **Fire / EMS** | fire/EMS wording | police + fire | addresses |
+| **Air traffic control** | aviation phraseology | airline + tail numbers | **aircraft → FlightRadar24** |
+| **General** | none | off | none |
+
+**Police and Fire/EMS differ only in the prompt.** The call-sign extractor already
+handles both at once, and shared PD+Fire dispatch channels are common — three of
+the five stock Cleveland feeds are joint — so splitting it would only lose units
+on the feeds that need them most. Pick whichever wording fits the traffic better.
+
+**Air traffic control is the one that changes behaviour**, and it matters:
+
+- The police prompt actively damages ATC audio — it turned *"hold short of
+  runway"* into *"whole sort of runway"* and invented text that was never said.
+- Aircraft identify as `Delta 510` / `Speedbird 117 heavy` / `November 65 Juliet
+  Charlie`, which the police extractor can't see (it caught `Delta` only because
+  "delta" is in its NATO prefix list, and missed United and Speedbird entirely).
+- Address detection is switched **off**, because `November 65 Juliet Charlie` was
+  otherwise detected as the street address *"65 Juliet Charlie"*.
+
+**Prompt override.** The box under Service tunes one feed without touching the
+rest: empty uses the service preset, and a feed with no service falls back to the
+global `initial_prompt`. Resolution is *override → preset → global*, so existing
+feeds behave exactly as they always did until you choose otherwise.
+
+Both `service` and any override travel with an exported feed list.
+
+#### Aircraft → FlightRadar24
+
+On an ATC feed, recognised aircraft become green links: flights open
+`flightradar24.com/data/flights/dl510`, registrations open
+`…/data/aircraft/n65jc`. This only builds a URL for your browser — no API, no
+scraping. A link can miss if FR24 isn't tracking that flight right now, the same
+way a map link can miss on a garbled street name.
+
+Labels are canonicalised before use: Whisper hyphenates spoken digits
+unpredictably (`Delta 5-10` on one line, `Delta 510` the next) and controllers
+append a weight class, so `DELTA 510` is derived from the parts. Without that,
+one aircraft would scatter across several "units" and click-to-filter wouldn't
+group it.
+
 ### Exporting / importing the feed list
 
 **Export list…** (Feeds window, or Streams → Export feed list…) writes your whole
