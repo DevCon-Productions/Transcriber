@@ -1038,7 +1038,38 @@ def run():
             and "3 clips" in popped["shown"].items[0]["label"])
         gui.tk.Menu = real_menu
         u.tag_remove("sel", "1.0", "end")
+
+        # SECTORS is the default view, and its columns use _sector_menu rather
+        # than _transcript_menu -- so the export has to be on that menu too, or
+        # right-clicking the transcript offers nothing where most users are.
+        # Clear first: switching views replays history, so the unified block's
+        # lines would otherwise be redrawn into this pane and counted too.
         app.history.clear()
+        app.view_mode.set("sectors")
+        app._rebuild_body()
+        panel = app.sector_panels.get(active_feed)
+        results["mp3_sector_panel_exists"] = (panel is not None)
+        if panel is not None:
+            for i, cid in enumerate(["s-1", "s-2"]):
+                app._append_line(active_feed, "cyan", f"sector line {i}",
+                                 f"13:00:0{i}", cid)
+            panel.tag_add("sel", "1.0", "end")
+            gui.tk.Menu = FakeMenu
+            app._sector_menu(Ev(), active_feed)
+            labels_menu = [it["label"] for it in popped["shown"].items]
+            results["mp3_in_sector_menu"] = any("MP3" in l for l in labels_menu)
+            results["mp3_sector_menu_counts"] = any("2 clips" in l
+                                                    for l in labels_menu)
+            results["mp3_sector_keeps_remove"] = any("Remove" in l
+                                                     for l in labels_menu)
+            # And the selection in a sector pane resolves, not just in unified.
+            results["mp3_sector_selection_maps"] = (
+                app._selected_clip_ids() == ["s-1", "s-2"])
+            gui.tk.Menu = real_menu
+            panel.tag_remove("sel", "1.0", "end")
+        app.view_mode.set("unified")
+        app.history.clear()
+        app._rebuild_body()
 
         # --- Reviewing a past day ---------------------------------------------
         # Reuse the restore fixture's logs, plus an older text-only day.

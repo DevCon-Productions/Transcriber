@@ -2445,18 +2445,23 @@ class TranscriberGUI:
         own (unified view, and the past-day view)."""
         widget.bind("<Button-3>", lambda e, w=widget: self._transcript_menu(e, w))
 
-    def _transcript_menu(self, event, widget):
+    def _add_export_items(self, menu, widget):
+        """The clip-export entries, shared by every transcript right-click menu
+        (unified, past-day, and each sector column) so they can't drift apart."""
         n = len(self._selected_clip_ids())
-        menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
-                       activebackground="#3a3d44", activeforeground=FG)
         label = (f"Export selected audio as MP3 ({n} clip"
                  f"{'s' if n != 1 else ''})…") if n else \
                 "Export selected audio as MP3…"
         menu.add_command(label=label, command=self._export_selected_mp3,
                          state="normal" if n else "disabled")
-        menu.add_separator()
-        menu.add_command(label="Select all", command=lambda w=widget: (
-            w.tag_add("sel", "1.0", "end"), w.focus_set()))
+        if widget is not None:
+            menu.add_command(label="Select all", command=lambda w=widget: (
+                w.tag_add("sel", "1.0", "end"), w.focus_set()))
+
+    def _transcript_menu(self, event, widget):
+        menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
+                       activebackground="#3a3d44", activeforeground=FG)
+        self._add_export_items(menu, widget)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2523,6 +2528,11 @@ class TranscriberGUI:
             return
         menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
                        activebackground="#3a3d44", activeforeground=FG)
+        # Sectors is the default view, so this menu -- not _transcript_menu --
+        # is what most right-clicks on a transcript actually hit. It carries the
+        # clip export too, or the feature would be invisible where it's used most.
+        self._add_export_items(menu, self.sector_panels.get(name))
+        menu.add_separator()
         if s.get("type") == "pcaudio":
             menu.add_command(label="Change audio source…",
                              command=lambda n=name: self._change_audio_source(n))
