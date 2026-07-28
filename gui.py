@@ -105,6 +105,7 @@ MUTED = "#9aa0a6"
 NO_UNIT_COLOR = FG          # white for lines with no detected speaker/call sign
 LINK_FG = "#6db3f2"         # blue for clickable address -> Google Maps links
 CLIP_FG = "#c2a3f0"         # violet for the 🔊 "play this line's audio" marker
+AIRCRAFT_FG = "#7fd1a8"     # green for aircraft -> FlightRadar24 links
 
 # Read-aloud keyword presets: each checkbox expands to several synonyms so you
 # catch variants without typing them all. Label -> list of match terms (lower).
@@ -336,6 +337,38 @@ class AddStreamDialog(simpledialog.Dialog):
         tk.Label(master, text="e.g. Cleveland, OH", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8)).grid(row=7, column=1, sticky="w", padx=6)
 
+        # Service: what kind of radio this feed carries. Drives the Whisper
+        # prompt, which call-sign shape to look for, and whether addresses or
+        # aircraft become links. Blank = the historical behaviour.
+        tk.Label(master, text="Service", bg=BG, fg=FG).grid(
+            row=10, column=0, sticky="w", padx=6, pady=(10, 2))
+        self._service_labels = {"(default — police / fire)": ""}
+        for key, preset in core.SERVICE_PRESETS.items():
+            self._service_labels[preset["label"]] = key
+        init_service = init.get("service", "")
+        shown = next((lab for lab, k in self._service_labels.items()
+                      if k == init_service), "(default — police / fire)")
+        self.service = tk.StringVar(value=shown)
+        ttk.Combobox(master, textvariable=self.service,
+                     values=list(self._service_labels), state="readonly",
+                     width=28).grid(row=10, column=1, sticky="w", padx=6,
+                                    pady=(10, 2))
+        self.service.trace_add("write", lambda *_: self._sync_prompt_hint())
+
+        tk.Label(master, text="Prompt override", bg=BG, fg=FG).grid(
+            row=11, column=0, sticky="nw", padx=6, pady=(6, 2))
+        self.prompt_box = tk.Text(master, height=3, width=44, wrap="word",
+                                  bg=BG2, fg=FG, insertbackground=FG,
+                                  relief="flat")
+        self.prompt_box.grid(row=11, column=1, sticky="w", padx=6, pady=(6, 2))
+        if init.get("initial_prompt"):
+            self.prompt_box.insert("1.0", init["initial_prompt"])
+        self.prompt_hint = tk.Label(master, text="", bg=BG, fg=MUTED,
+                                    font=("Segoe UI", 8), justify="left",
+                                    wraplength=300)
+        self.prompt_hint.grid(row=12, column=1, sticky="w", padx=6, pady=(0, 6))
+        self._sync_prompt_hint()
+
         # Clip recording: per-feed opt-in, off by default. Saves the audio behind
         # each transcript line so you can click 🔊 and hear that transmission.
         self.record = tk.BooleanVar(value=bool(init.get("record", False)))
@@ -352,6 +385,30 @@ class AddStreamDialog(simpledialog.Dialog):
         self.provider = tk.StringVar(value=init.get("provider", "broadcastify"))
         self._sync_state()
         return None
+
+    def _sync_prompt_hint(self):
+        """Say what the empty prompt box will fall back to for this service."""
+        key = self._service_labels.get(self.service.get(), "")
+        preset = core.SERVICE_PRESETS.get(key)
+        if preset is None:
+            note = ("Leave blank to use the global prompt from config.json "
+                    "(what every feed used before).")
+        elif preset["prompt"]:
+            note = f"Leave blank to use the {preset['label']} wording: " \
+                   f"“{preset['prompt'][:70]}…”"
+        else:
+            note = "Leave blank for no prompt at all."
+        extra = []
+        if preset is not None and not preset["address_links"]:
+            extra.append("no address links")
+        if preset is not None and preset["aircraft_links"]:
+            extra.append("aircraft link to FlightRadar24")
+        if extra:
+            note += "  (" + ", ".join(extra) + ")"
+        try:
+            self.prompt_hint.config(text=note)
+        except tk.TclError:
+            pass
 
     def _refresh_apps(self):
         self._apps = core.list_audio_apps()
@@ -433,9 +490,15 @@ class AddStreamDialog(simpledialog.Dialog):
         loc = self.location.get().strip()
         if loc:
             self.result["location"] = loc
-        # Only written when on, so feeds that never opt in stay clean in config.
+        # Only written when set, so feeds that don't opt in stay clean in config.
         if self.record.get():
             self.result["record"] = True
+        svc = self._service_labels.get(self.service.get(), "")
+        if svc:
+            self.result["service"] = svc
+        override = self.prompt_box.get("1.0", "end").strip()
+        if override:
+            self.result["initial_prompt"] = override
 
 
 class ChangeDeviceDialog(simpledialog.Dialog):
@@ -3039,8 +3102,11 @@ class TranscriberGUI:
                 self._play_clip(tag[len("clip:"):])
                 return True
             if tag.startswith("addr:") and tag in self._link_targets:
-                query, location = self._link_targets[tag]
-                self._open_map(query, location)
+                kind, value, location = self._link_targets[tag]
+                if kind == "air":
+                    self._open_url(core.aircraft_url(value))
+                else:
+                    self._open_map(value, location)
                 return True
             if tag.startswith("u:") and self.color_mode.get() == "unit":
                 self.set_unit_filter(tag[len("u:"):])
@@ -3435,9 +3501,18 @@ class TranscriberGUI:
         """A line is shown if no unit filter is active or its unit matches."""
         return self.filter_unit is None or unit == self.filter_unit
 
+    def _feed_profile(self, name):
+        """The service profile for a feed by name. Reviewing a bundle or past day
+        has no live stream dict, so it falls back to the default profile."""
+        return core.service_profile(self._find(name) or self._lib_find(name) or {},
+                                    self.cfg)
+
     def _append_line(self, name, color, text, ts, clip_id=None):
         # Compute the call sign ONCE here so coloring is consistent on replay.
-        unit = core.extract_callsign(text, self.extra_prefixes)
+        # Which SHAPE of call sign depends on the feed: an ATC feed wants
+        # "DELTA 510", not the police unit prefixes.
+        unit = core.extract_callsign(text, self.extra_prefixes,
+                                     style=self._feed_profile(name)["callsigns"])
         # Always record to history (filter affects display only, not the record).
         self.history.append((name, color, text, ts, unit, clip_id))
         # While reviewing a past day the body belongs to that day -- keep
@@ -3514,9 +3589,14 @@ class TranscriberGUI:
         return self.cfg.get("default_location") or None
 
     def _open_map(self, query, location):
+        self._open_url(core.maps_url(query, location))
+
+    def _open_url(self, url):
         import webbrowser
+        if not url:
+            return
         try:
-            webbrowser.open(core.maps_url(query, location))
+            webbrowser.open(url)
         except Exception:
             pass
 
@@ -3524,7 +3604,18 @@ class TranscriberGUI:
         """Insert the message body into `widget`, turning detected addresses into
         clickable Google-Maps links. `base_tags` are applied to normal text; each
         address also gets a unique clickable link tag."""
-        addrs = core.extract_addresses(text)
+        # Which spans are linkable depends on the feed's service: street
+        # addresses are meaningless on ATC (a tail number would otherwise become
+        # a map link), and aircraft only exist there.
+        profile = self._feed_profile(name)
+        addrs = []
+        if profile["address_links"]:
+            addrs += [(span, ("map", query))
+                      for span, query in core.extract_addresses(text)]
+        if profile["aircraft_links"]:
+            addrs += [(span, ("air", ident))
+                      for span, ident, _label in core.extract_aircraft(text)]
+            addrs.sort(key=lambda a: text.find(a[0]))
         if not addrs:
             widget.insert("end", f"  {text}\n", base_tags)
             return
@@ -3537,18 +3628,20 @@ class TranscriberGUI:
                 continue
             if i > pos:
                 widget.insert("end", text[pos:i], base_tags)
-            # Unique tag per link so each opens its own address. The target is
+            # Unique tag per link so each opens its own target. The target is
             # also kept by tag name: row-selection owns <Button-1> on the widget,
             # which preempts tag bindings, so the click is dispatched from there
-            # and needs to look the address up rather than close over it.
+            # and needs to look it up rather than close over it.
+            kind, value = query
             self._link_seq = getattr(self, "_link_seq", 0) + 1
             tag = f"addr:{self._link_seq}"
-            self._link_targets[tag] = (query, location)
-            widget.tag_config(tag, foreground=LINK_FG, underline=True)
+            self._link_targets[tag] = (kind, value, location)
+            # Aircraft get their own colour so the two kinds of link stay
+            # distinguishable at a glance.
+            widget.tag_config(tag, underline=True,
+                              foreground=AIRCRAFT_FG if kind == "air" else LINK_FG)
             widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
             widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
-            widget.tag_bind(tag, "<Button-1>",
-                            lambda e, q=query, loc=location: self._open_map(q, loc))
             widget.insert("end", span, base_tags + (tag,))
             pos = i + len(span)
         if pos < len(text):

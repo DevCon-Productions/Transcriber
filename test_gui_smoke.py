@@ -1055,7 +1055,7 @@ def run():
         # Map links keep working through the same dispatch.
         opened = []
         app._open_map = lambda q, loc: opened.append((q, loc))
-        app._link_targets["addr:test"] = ("100 Main St", "Cleveland, OH")
+        app._link_targets["addr:test"] = ("map", "100 Main St", "Cleveland, OH")
         u.tag_add("addr:test", "3.0", "3.5")
         hit = u.bbox("3.1")
         if hit:
@@ -1065,6 +1065,19 @@ def run():
                                                        "Cleveland, OH")]
                                            if hit else True)
         u.tag_delete("addr:test")
+        # An aircraft link goes to FlightRadar24, not to the map.
+        urls = []
+        app._open_url = lambda u_: urls.append(u_)
+        app._link_targets["addr:air"] = ("air", "DL510", None)
+        u.tag_add("addr:air", "4.0", "4.5")
+        hit2 = u.bbox("4.1")
+        if hit2:
+            u.event_generate("<Button-1>", x=hit2[0] + 1, y=hit2[1] + 1)
+            app.root.update()
+        results["row_click_aircraft_opens"] = (
+            urls == ["https://www.flightradar24.com/data/flights/dl510"]
+            if hit2 else True)
+        u.tag_delete("addr:air")
         u.tag_remove("sel", "1.0", "end")
 
         # Select lines 1-3: picks up cid-1 and cid-2, skips the clipless line,

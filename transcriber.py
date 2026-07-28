@@ -348,7 +348,10 @@ FEED_EXPORT_VERSION = 1
 
 # Per-feed keys that are portable between machines and architectures.
 FEED_PORTABLE_KEYS = ("name", "url", "type", "provider", "color", "location",
-                      "desc", "output_device", "app_name", "record")
+                      "desc", "output_device", "app_name", "record",
+                      # What kind of radio this is, and any prompt tuning for it.
+                      # Both are preferences, not machine state, so they travel.
+                      "service", "initial_prompt")
 
 
 def _clean_feed(entry):
@@ -1452,17 +1455,234 @@ def keyword_matches(text, keywords):
     return False
 
 
-def extract_callsign(text, extra_prefixes=None):
+# --------------------------------------------------------------------------
+# Aviation call signs -> "DELTA 510", "SPEEDBIRD 117", "N65JC".
+#
+# Same precision-first stance as the police extractor, but a different shape:
+# aircraft identify by AIRLINE TELEPHONY NAME + flight number, or by registration
+# ("November six five Juliet Charlie"). The police extractor catches Delta only
+# because "delta" happens to be in the NATO alphabet it uses for unit prefixes --
+# United, Speedbird and the rest get nothing -- so aviation needs its own pass.
+#
+# The telephony table does double duty: it also yields the airline code used to
+# build a FlightRadar24 link for the line.
+# --------------------------------------------------------------------------
+AIRLINE_TELEPHONY = {
+    # US majors / regionals
+    "delta": "DL", "united": "UA", "american": "AA", "southwest": "WN",
+    "jetblue": "B6", "alaska": "AS", "spirit": "NK", "frontier": "F9",
+    "allegiant": "G4", "hawaiian": "HA", "sun country": "SY",
+    "envoy": "MQ", "republic": "YX", "endeavor": "9E", "skywest": "OO",
+    "piedmont": "PT", "cactus": "AA", "brickyard": "YX",
+    # Cargo
+    "fedex": "FX", "ups": "5X", "giant": "5Y", "polar": "PO",
+    # International
+    "speedbird": "BA", "lufthansa": "LH", "air france": "AF", "klm": "KL",
+    "shamrock": "EI", "virgin": "VS", "emirates": "EK", "qatari": "QR",
+    "cathay": "CX", "japan air": "JL", "all nippon": "NH", "korean air": "KE",
+    "singapore": "SQ", "qantas": "QF", "air canada": "AC", "westjet": "WS",
+    "aeromexico": "AM", "volaris": "Y4", "iberia": "IB", "alitalia": "AZ",
+    "swiss": "LX", "austrian": "OS", "scandinavian": "SK", "finnair": "AY",
+    "turkish": "TK", "el al": "LY", "avianca": "AV", "copa": "CM",
+    "tam": "JJ", "azul": "AD",
+}
+_AIRLINE_RE = "|".join(re.escape(k) for k in
+                       sorted(AIRLINE_TELEPHONY, key=len, reverse=True))
+
+# NATO letters, for decoding a spoken registration into an N-number.
+_NATO_LETTERS = {
+    "alpha": "A", "alfa": "A", "bravo": "B", "charlie": "C", "delta": "D",
+    "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H", "india": "I",
+    "juliet": "J", "juliett": "J", "julia": "J", "kilo": "K", "lima": "L",
+    "mike": "M", "november": "N", "oscar": "O", "papa": "P", "quebec": "Q",
+    "romeo": "R", "sierra": "S", "tango": "T", "uniform": "U", "victor": "V",
+    "whiskey": "W", "whisky": "W", "xray": "X", "x-ray": "X", "yankee": "Y",
+    "zulu": "Z",
+}
+_NATO_RE = "|".join(sorted(_NATO_LETTERS, key=len, reverse=True))
+
+# "Delta 510", "Delta 5-10" (Whisper often hyphenates spoken digits),
+# "Speedbird 117 heavy", "United 1685".
+_AIR_FLIGHT = re.compile(
+    r"\b(" + _AIRLINE_RE + r")\s+"
+    r"((?:\d[\d\s-]{0,8}\d|\d))"
+    r"(?:\s+(?:heavy|super))?\b", re.I)
+
+# "November 65 Juliet Charlie" -> N65JC. US registrations start with November;
+# requiring it keeps this from firing on stray phonetics mid-sentence.
+_AIR_TAIL = re.compile(
+    r"\bnovember\s+((?:(?:\d[\d\s-]{0,6}\d|\d)|(?:" + _NATO_RE + r"))"
+    r"(?:[\s,-]+(?:(?:\d[\d\s-]{0,6}\d|\d)|(?:" + _NATO_RE + r"))){0,4})\b",
+    re.I)
+
+
+def _digits_only(s):
+    return re.sub(r"\D", "", s)
+
+
+def extract_aircraft(text):
+    """Aircraft mentioned in `text`, in order, as (span, identifier, label).
+
+    span       the text that was matched, for linking it in place
+    identifier what FlightRadar24 wants: airline code + flight number ("DL510")
+               or a registration ("N65JC")
+    label      the canonical display name ("DELTA 510")
+
+    The label is rebuilt from the parts rather than taken from the text, because
+    it's also the grouping key for unit colouring and click-to-filter. Whisper
+    hyphenates spoken digits unpredictably ("Delta 5-10" one line, "Delta 510"
+    the next) and controllers append a weight class ("heavy", "super") that isn't
+    part of the identity -- left raw, one aircraft would scatter across several
+    labels. Precision over recall, as elsewhere: an unknown telephony word yields
+    nothing rather than a guess."""
+    if not text:
+        return []
+    out, taken = [], []
+
+    def _overlaps(a, b):
+        return any(not (b <= s or a >= e) for s, e in taken)
+
+    for m in _AIR_FLIGHT.finditer(text):
+        num = _digits_only(m.group(2))
+        if not 1 <= len(num) <= 4:
+            continue
+        word = m.group(1).lower()
+        code = AIRLINE_TELEPHONY[word]
+        out.append((m.start(), m.group(0).strip(), f"{code}{num}",
+                    f"{word.upper()} {num}"))
+        taken.append((m.start(), m.end()))
+
+    for m in _AIR_TAIL.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        ident = "N"
+        for tok in re.split(r"[\s,-]+", m.group(1)):
+            t = tok.lower()
+            if t in _NATO_LETTERS:
+                ident += _NATO_LETTERS[t]
+            elif t.isdigit():
+                ident += t
+        # A bare "November" with nothing after it isn't a registration, and real
+        # N-numbers are at most 5 characters after the N.
+        if 2 <= len(ident) <= 6:
+            out.append((m.start(), m.group(0).strip(), ident, ident))
+
+    out.sort()
+    return [(span, ident, label) for _pos, span, ident, label in out]
+
+
+def aircraft_url(identifier):
+    """FlightRadar24 page for an aircraft identifier. A registration (N-number)
+    resolves to the airframe; anything else is treated as a flight number.
+
+    This only builds a URL for the user's browser -- no API, no scraping."""
+    ident = (identifier or "").strip().lower()
+    if not ident:
+        return ""
+    base = "https://www.flightradar24.com/data"
+    if re.fullmatch(r"n[0-9][0-9a-z]*", ident):
+        return f"{base}/aircraft/{ident}"
+    return f"{base}/flights/{ident}"
+
+
+# --------------------------------------------------------------------------
+# Service profiles: what KIND of radio a feed carries.
+#
+# Three things in this pipeline are domain-specific, not one: the Whisper prompt,
+# which call-sign shape to look for, and whether "3658 East 149th" should become
+# a map link. Police and Fire/EMS differ only in the prompt -- the call-sign
+# extractor already handles both at once (52 police phonetics, 16 fire/EMS
+# designators, overlapping on "adam" alone), and shared PD+Fire dispatch channels
+# are common, so splitting the extractor would only lose units. ATC is the type
+# that genuinely changes behaviour.
+#
+# A feed with NO service set keeps the historical behaviour exactly: the global
+# initial_prompt, emergency call signs, address links on. Nothing migrates.
+# --------------------------------------------------------------------------
+_POLICE_PROMPT = (
+    "The following is police radio dispatch. Common terms: dispatch, copy, "
+    "en route, on scene, clear, 10-4, code three, signal, suspect, vehicle, "
+    "plate, registration, subject, complainant, requesting backup, be advised, "
+    "negative, affirmative, over."
+)
+_FIRE_PROMPT = (
+    "The following is fire and EMS radio dispatch. Common terms: engine, ladder, "
+    "truck, medic, ambulance, rescue, squad, battalion, chief, box alarm, "
+    "working fire, mutual aid, patient, transport, priority one, on scene, "
+    "staging, all clear, copy, be advised, en route."
+)
+_ATC_PROMPT = (
+    "The following is air traffic control radio between controllers and pilots. "
+    "Common phraseology: cleared for takeoff, cleared to land, line up and wait, "
+    "hold short, taxi via, runway, wind check, contact departure, contact ground, "
+    "climb and maintain, descend and maintain, turn left heading, turn right "
+    "heading, squawk, ident, traffic in sight, go around, heavy, roger, wilco, "
+    "affirm, negative."
+)
+
+SERVICE_PRESETS = {
+    "police": {"label": "Police", "prompt": _POLICE_PROMPT,
+               "callsigns": "emergency", "address_links": True,
+               "aircraft_links": False},
+    "fire": {"label": "Fire / EMS", "prompt": _FIRE_PROMPT,
+             "callsigns": "emergency", "address_links": True,
+             "aircraft_links": False},
+    "atc": {"label": "Air traffic control", "prompt": _ATC_PROMPT,
+            "callsigns": "aviation", "address_links": False,
+            "aircraft_links": True},
+    "general": {"label": "General", "prompt": "",
+                "callsigns": None, "address_links": False,
+                "aircraft_links": False},
+}
+
+# What a feed with no service set does -- i.e. every feed that existed before
+# service profiles were added.
+SERVICE_DEFAULT = {"label": "Police / Fire-EMS (default)", "prompt": None,
+                   "callsigns": "emergency", "address_links": True,
+                   "aircraft_links": False}
+
+
+def service_profile(stream, cfg=None):
+    """Resolve how a feed should be transcribed and rendered.
+
+    Returns a dict with: service, label, prompt, callsigns, address_links,
+    aircraft_links. The prompt resolves per-feed override -> service preset ->
+    the global initial_prompt, so a feed can always be tuned without touching
+    the others."""
+    stream = stream or {}
+    name = (stream.get("service") or "").lower() or None
+    preset = SERVICE_PRESETS.get(name, SERVICE_DEFAULT)
+    prompt = stream.get("initial_prompt")          # per-feed override
+    if not prompt:
+        prompt = preset["prompt"]
+    if prompt is None:                             # default profile: use global
+        prompt = (cfg or {}).get("initial_prompt") or ""
+    out = dict(preset)
+    out["service"] = name
+    out["prompt"] = prompt
+    return out
+
+
+def extract_callsign(text, extra_prefixes=None, style="emergency"):
     """
     Return a normalized unit call sign found in `text` (e.g. "ADAM 33",
     "ENGINE 14") or None. High precision: rejects spelled-out plates and street
     addresses. `extra_prefixes` (iterable of lowercase words) extends the set of
     recognized unit prefixes for local department lingo.
 
+    `style` selects the domain: "emergency" (police/fire units, the default) or
+    "aviation" (airline flights and registrations). A feed's service profile
+    picks this -- see SERVICE_PRESETS.
+
     NOTE: this identifies the FIRST unit MENTIONED in a transmission, which is a
     heuristic for who is involved -- not a guaranteed acoustic speaker ID.
     """
     if not text:
+        return None
+    if style == "aviation":
+        found = extract_aircraft(text)
+        return found[0][2] if found else None
+    if style in (None, "none"):
         return None
     prefixes = set(PHONETIC_WORDS) | set(DESIGNATOR_WORDS)
     if extra_prefixes:
@@ -3404,7 +3624,7 @@ class WhisperCppBackend:
 # --------------------------------------------------------------------------
 class Transcriber(threading.Thread):
     def __init__(self, model, cfg, jobq, out, stop_evt, clips=None,
-                 should_record=None):
+                 should_record=None, prompt_for=None):
         super().__init__(daemon=True, name="transcriber")
         self.model = model
         self.cfg = cfg
@@ -3417,6 +3637,10 @@ class Transcriber(threading.Thread):
         self.clips = clips              # ClipStore, or None when not recording
         # callable(stream_name) -> bool; per-feed opt-in for clip recording.
         self.should_record = should_record or (lambda _name: False)
+        # callable(stream_name) -> str; the Whisper prompt for THIS feed, so an
+        # ATC feed isn't decoded with police vocabulary. Falls back to the global.
+        self.prompt_for = prompt_for or (
+            lambda _name: cfg.get("initial_prompt") or None)
 
     def run(self):
         while not self.stop_evt.is_set():
@@ -3438,7 +3662,7 @@ class Transcriber(threading.Thread):
             beam_size=self.cfg.get("beam_size", 5),
             vad_filter=True,
             condition_on_previous_text=False,   # transmissions are independent
-            initial_prompt=self.cfg.get("initial_prompt") or None,
+            initial_prompt=self.prompt_for(name) or None,
             no_speech_threshold=0.6,
             temperature=[0.0, 0.2, 0.4],
             # Anti-hallucination: drop repetition loops + low-confidence/garbage
@@ -3500,6 +3724,9 @@ class Engine:
         # from each stream dict's "record" flag.
         self.clips = ClipStore(cfg, out=self.out, ffmpeg=self.ffmpeg)
         self.recording_feeds = set()
+        # The stream dict per running feed, so per-feed settings (service
+        # profile, prompt override) are resolvable by name at transcribe time.
+        self.stream_meta = {}
 
         # Text-to-speech state (lazy: player created only when first enabled).
         tts = cfg.get("tts", {})
@@ -3618,11 +3845,23 @@ class Engine:
         self.transcriber = Transcriber(self.model, self.cfg, self.jobq,
                                        self.out, self.stop_evt,
                                        clips=self.clips,
-                                       should_record=self.is_recording)
+                                       should_record=self.is_recording,
+                                       prompt_for=self.prompt_for)
         self.transcriber.tts_hook = self._maybe_speak
         self.transcriber.start()
         if self.tts_enabled:
             self._ensure_tts()
+
+    # -- service profiles ---------------------------------------------------
+    def profile_for(self, name):
+        """The resolved service profile for a running feed (falls back to the
+        default profile for feeds we have no dict for, e.g. after a restart)."""
+        return service_profile(self.stream_meta.get(name, {}), self.cfg)
+
+    def prompt_for(self, name):
+        """The Whisper prompt for this feed: per-feed override, else its service
+        preset, else the global initial_prompt."""
+        return self.profile_for(name)["prompt"]
 
     # -- clip recording -----------------------------------------------------
     def is_recording(self, name):
@@ -3824,6 +4063,7 @@ class Engine:
         name = stream["name"]
         # Clip recording is per-feed opt-in, carried on the stream dict.
         self.set_recording(name, stream.get("record", False))
+        self.stream_meta[name] = dict(stream)     # for prompt_for / profile
         with self._lock:
             if name in self.workers:
                 self.out.status(f"[{name}] already running.")
@@ -3852,6 +4092,7 @@ class Engine:
         with self._lock:
             w = self.workers.pop(name, None)
         self.recording_feeds.discard(name)
+        self.stream_meta.pop(name, None)
         if w:
             w.stop()
             if self.player and self.player.get_source() == name:
