@@ -403,6 +403,25 @@ status bar says how many.
 > contain PII and recorded voices: keep them somewhere you'd be comfortable
 > keeping the logs, and delete them yourself when done.
 
+#### Playing a transcript through
+
+Any transcript you're reviewing — an opened `.tscript` or a past day — gets a
+transport bar with **two** ways to play it:
+
+| | What it plays | Works on |
+|---|---|---|
+| **▶ Play audio** | the recorded radio audio, clip after clip | lines that still have a 🔊 |
+| **🗣 Read aloud** | the voice reading the transcribed text | every line |
+
+Both step one line at a time, highlighting the current line and scrolling to keep
+it in view. **⏸ Pause** holds your place, **⏹ Stop** rewinds to the top.
+
+The distinction matters more than it first looks: **Play audio** skips lines whose
+clips have been purged, while **Read aloud** works on any transcript at all —
+including an old day whose audio is long gone.
+
+Select a line before pressing play to start from there rather than the beginning.
+
 #### Reviewing an earlier day
 
 The live window restores **today's** lines on launch. To go further back, use

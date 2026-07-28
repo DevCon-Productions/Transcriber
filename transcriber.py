@@ -2273,10 +2273,23 @@ class TTSPlayer(threading.Thread):
         self._sr = 22050
         self._ok = tts_available({"engine": self._engine})
         self._muted = False
+        self._speaking = False          # an utterance is actually sounding
+        self._cancel = False            # one-shot: stop the current utterance
 
     @property
     def available(self):
         return self._ok
+
+    def busy(self):
+        """True while anything is queued or sounding. Lets a caller step through
+        lines one at a time (read-along) instead of dumping them all at once."""
+        return self._speaking or not self.q.empty()
+
+    def cancel(self):
+        """Stop the current utterance and drop the backlog, without muting --
+        pause/stop for read-along, which must be able to resume."""
+        self._drain()
+        self._cancel = True
 
     def set_muted(self, muted):
         self._muted = bool(muted)
@@ -2336,17 +2349,20 @@ class TTSPlayer(threading.Thread):
                         self.on_start(text)
                     except Exception:
                         pass
+                self._cancel = False        # only cancels from here on
+                self._speaking = True
                 sd.play(audio, self._sr)
-                # Wait for playback, but bail out promptly on stop/mute.
+                # Wait for playback, but bail out promptly on stop/mute/cancel.
                 while sd.get_stream().active and not self.stop_evt.is_set() \
-                        and not self._muted:
+                        and not self._muted and not self._cancel:
                     time.sleep(0.05)
-                if self._muted or self.stop_evt.is_set():
+                if self._muted or self.stop_evt.is_set() or self._cancel:
                     sd.stop()
             except Exception as e:
                 if self.out:
                     self.out.status(f"TTS error: {e}")
             finally:
+                self._speaking = False
                 if self.on_end:
                     try:
                         self.on_end(text)
@@ -3558,6 +3574,28 @@ class Engine:
     def stop_clip(self):
         if self.player:
             self.player.stop_clip()
+
+    def clip_playing(self):
+        """True while a saved clip is still sounding. Play-through polls this to
+        know when to advance to the next line."""
+        return bool(self.player and self.player.clip_playing())
+
+    # -- read-along (playing a saved transcript through) ---------------------
+    def speak_now(self, text):
+        """Speak one line immediately, bypassing the feed/keyword rules that
+        govern live TTS. Returns False if no voice is available."""
+        if not self._ensure_tts():
+            return False
+        self.tts.say(text)
+        return True
+
+    def tts_busy(self):
+        return bool(self.tts and self.tts.busy())
+
+    def cancel_speech(self):
+        """Stop the current utterance and drop the backlog (pause/stop)."""
+        if self.tts:
+            self.tts.cancel()
 
     # -- text-to-speech -----------------------------------------------------
     def _ensure_tts(self):

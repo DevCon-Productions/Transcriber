@@ -1302,6 +1302,17 @@ TRANSCRIPT FILES — TEXT + AUDIO IN ONE FILE  (.tscript)
   • Because they outlast the clip retention, these files keep recorded voices
     and PII indefinitely. Store and delete them as deliberately as the logs.
 
+PLAYING A TRANSCRIPT THROUGH  (the bar above a reviewed transcript)
+  Whenever you're reviewing — an opened transcript file, or a past day — you can
+  play the whole thing, two different ways:
+  • "▶ Play audio"  – the recorded radio, transmission after transmission. Lines
+                      whose clips have been purged are skipped.
+  • "🗣 Read aloud"  – the voice reads the transcribed text. Works on every line,
+                      so an old day with no audio left can still be played.
+  The line being played is highlighted and scrolled into view.
+  • "⏸ Pause" keeps your place; "⏹ Stop" returns to the top.
+  • Select a line first to start from there instead of the beginning.
+
 GOING BACK A DAY  (Streams → Open a past day…)
   The window restores today's lines when it opens. For anything earlier, pick a
   feed and a day from the list — newest first, showing how many lines each day
@@ -1646,6 +1657,8 @@ class TranscriberGUI:
         self._link_targets = {}          # "addr:N" -> (query, location)
         self.bundle = None               # open TranscriptBundle, if any
         self._bundle_name = ""           # its filename, for the banner
+        self._pb_widgets = None          # transport buttons while reviewing
+        self._pb_reset()                 # play-through state
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
@@ -2091,6 +2104,168 @@ class TranscriberGUI:
             note += f" ({len(res['missing'])} no longer on disk)"
         self._set_status(note)
 
+    # ----- playing a saved transcript through --------------------------------
+    # Two ways to play a reviewed transcript: the recorded RADIO audio, or the
+    # model reading the TEXT aloud. They differ in more than the sound -- audio
+    # can only play lines that still have a clip, while read-along works on every
+    # line, including days whose clips were purged. Both step one line at a time,
+    # highlighting and scrolling to it, so you can follow along.
+    #
+    # Advancing is driven by polling rather than a completion callback: the clip
+    # player and the TTS queue are separate subsystems on separate threads, and
+    # one .after() loop asking "still busy?" keeps the sequencing in one place.
+    PB_POLL_MS = 150
+
+    def _pb_reset(self):
+        self._pb_mode = None            # None | "audio" | "tts"
+        self._pb_index = 0
+        self._pb_running = False
+
+    def _pb_rows(self):
+        return self._past_rows or []
+
+    def _pb_start(self, mode):
+        """Play from the first selected row, else resume where we left off."""
+        rows = self._pb_rows()
+        if not rows:
+            return
+        if not self.engine:
+            self._set_status("Engine isn't ready yet.")
+            return
+        if mode == "audio" and not self.engine.audio_available():
+            self._set_status("No audio device available for playback.")
+            return
+        # Switching mode mid-play shouldn't leave the old one sounding.
+        if self._pb_running and self._pb_mode != mode:
+            self._pb_silence()
+        sel = self._selected_row_index()
+        if sel is not None:
+            self._pb_index = sel
+        if self._pb_index >= len(rows):
+            self._pb_index = 0
+        self._pb_mode = mode
+        self._pb_running = True
+        self._pb_update_controls()
+        self._pb_play_current(first=True)
+
+    def _selected_row_index(self):
+        """Index of the first selected row in the review view, or None."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if sel:
+                i = self._line_no(sel[0]) - 1
+                if 0 <= i < len(self._pb_rows()):
+                    return i
+        return None
+
+    def _pb_silence(self):
+        """Stop whatever is currently sounding, without changing position."""
+        if not self.engine:
+            return
+        self.engine.stop_clip()
+        self.engine.cancel_speech()
+
+    def _pb_pause(self):
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_update_controls()
+        rows = self._pb_rows()
+        if rows:
+            self._set_status(f"Paused at line {min(self._pb_index + 1, len(rows))} "
+                             f"of {len(rows)}.")
+
+    def _pb_stop(self):
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_index = 0
+        self._pb_clear_highlight()
+        self._pb_update_controls()
+        self._set_status("Playback stopped.")
+
+    def _pb_play_current(self, first=False):
+        """Start the line at _pb_index, then poll until it finishes."""
+        rows = self._pb_rows()
+        if not self._pb_running:
+            return
+        if self._pb_index >= len(rows):
+            self._pb_running = False
+            self._pb_clear_highlight()
+            self._pb_update_controls()
+            self._set_status("Reached the end of the transcript.")
+            return
+
+        ts, text, clip_id = rows[self._pb_index][:3]
+        self._pb_highlight(self._pb_index)
+        self._pb_update_controls()
+
+        if self._pb_mode == "audio":
+            if not clip_id:
+                # No audio for this line -- don't stall on it.
+                self._pb_index += 1
+                self.root.after(10, self._pb_play_current)
+                return
+            self.engine.play_clip(clip_id, source=self.bundle)
+        else:
+            if not self.engine.speak_now(text):
+                self._pb_running = False
+                self._pb_update_controls()
+                self._set_status("No text-to-speech voice is available.")
+                return
+        # Give the subsystem a moment to report busy before polling, or the
+        # first tick can see "idle" and skip the whole line.
+        self.root.after(self.PB_POLL_MS * 2, self._pb_tick)
+
+    def _pb_tick(self):
+        if not self._pb_running:
+            return
+        busy = (self.engine.clip_playing() if self._pb_mode == "audio"
+                else self.engine.tts_busy())
+        if busy:
+            self.root.after(self.PB_POLL_MS, self._pb_tick)
+            return
+        self._pb_index += 1
+        self._pb_play_current()
+
+    def _pb_highlight(self, index):
+        """Mark the line being played and scroll it into view."""
+        for w in self._transcript_widgets():
+            try:
+                w.tag_remove("pbline", "1.0", "end")
+                w.tag_config("pbline", background=self._HL_SPEAKING)
+                line = index + 1
+                w.tag_add("pbline", f"{line}.0", f"{line}.0 lineend")
+                w.see(f"{line}.0")
+            except tk.TclError:
+                continue
+
+    def _pb_clear_highlight(self):
+        for w in self._transcript_widgets():
+            try:
+                w.tag_remove("pbline", "1.0", "end")
+            except tk.TclError:
+                continue
+
+    def _pb_update_controls(self):
+        """Reflect state on the transport buttons and the position readout."""
+        bar = getattr(self, "_pb_widgets", None)
+        if not bar:
+            return
+        rows = self._pb_rows()
+        try:
+            pos = min(self._pb_index + 1, len(rows)) if rows else 0
+            bar["pos"].config(text=f"{pos} / {len(rows)}")
+            playing = self._pb_running
+            bar["audio"].config(relief="sunken" if playing and
+                                self._pb_mode == "audio" else "flat")
+            bar["tts"].config(relief="sunken" if playing and
+                              self._pb_mode == "tts" else "flat")
+            bar["pause"].config(state="normal" if playing else "disabled")
+        except tk.TclError:
+            self._pb_widgets = None      # bar was rebuilt underneath us
+
     # ----- transcript bundles (.tscript) ------------------------------------
     def _write_bundle(self, feed, rows, day, suggested):
         """Shared tail of both bundle exports: ask where, write on a thread."""
@@ -2192,6 +2367,9 @@ class TranscriberGUI:
                                 parent=self.root)
             return
         self._close_bundle()
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()                 # a new file starts from its first line
         self.bundle = bundle
         self.past_day = (bundle.feed, bundle.day)
         self._past_rows = bundle.rows
@@ -2225,6 +2403,9 @@ class TranscriberGUI:
                                 f"No saved transcript for “{feed}” on "
                                 f"{_fmt_day(day)}.", parent=self.root)
             return
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()                 # a new day starts from its first line
         self.past_day = (feed, day)
         self._past_rows = rows
         self._build_view()
@@ -2235,6 +2416,12 @@ class TranscriberGUI:
     def _exit_past_day(self):
         """Back to the live transcript. Lines that arrived while reviewing were
         still recorded to history, so they appear on the way back."""
+        # Stop play-through first: it would otherwise keep stepping through rows
+        # that are no longer on screen, talking over the live feed.
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()
+        self._pb_widgets = None
         self.past_day = None
         self._past_rows = []
         self._close_bundle()             # release the archive's file handle
@@ -2767,6 +2954,31 @@ class TranscriberGUI:
                  font=("Segoe UI", 10, "bold")).pack(side="left", pady=4)
         tk.Button(bar, text="Back to live", command=self._exit_past_day,
                   bg=BG2, fg=FG, relief="flat").pack(side="right", padx=6, pady=3)
+
+        # Transport: play the recorded audio, or have the voice read the text.
+        # Only meaningful while reviewing, so it lives on this bar.
+        tp = tk.Frame(self.body, bg=BG2)
+        tp.pack(side="top", fill="x")
+        b_audio = tk.Button(tp, text="▶ Play audio",
+                            command=lambda: self._pb_start("audio"),
+                            bg=BG2, fg=FG, relief="flat")
+        b_audio.pack(side="left", padx=(8, 2), pady=3)
+        b_tts = tk.Button(tp, text="🗣 Read aloud",
+                          command=lambda: self._pb_start("tts"),
+                          bg=BG2, fg=FG, relief="flat")
+        b_tts.pack(side="left", padx=2, pady=3)
+        b_pause = tk.Button(tp, text="⏸ Pause", command=self._pb_pause,
+                            bg=BG2, fg=FG, relief="flat", state="disabled")
+        b_pause.pack(side="left", padx=2, pady=3)
+        tk.Button(tp, text="⏹ Stop", command=self._pb_stop,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2, pady=3)
+        pos = tk.Label(tp, text="", bg=BG2, fg=MUTED)
+        pos.pack(side="left", padx=10)
+        tk.Label(tp, text="Select a line first to start there.",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
+        self._pb_widgets = {"audio": b_audio, "tts": b_tts, "pause": b_pause,
+                            "pos": pos}
+        self._pb_update_controls()
 
         txt = self._make_text(self.body)
         txt.pack(fill="both", expand=True, padx=6, pady=6)

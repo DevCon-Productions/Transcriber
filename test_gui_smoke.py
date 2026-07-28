@@ -51,12 +51,42 @@ class FakeEngine:
         self.recording = {}
         self.played = []
         self.play_sources = []      # None for live clips, the bundle when open
+        self.spoken = []            # lines sent to read-aloud
+        self.cancels = 0
+        self.tts_ok = True          # flip off to model "no voice installed"
+        self._clip_busy = False
+        self._tts_busy = False
     def set_recording(self, name, on): self.recording[name] = on
     def set_clips_enabled(self, on): self.clips.enabled = on
     def play_clip(self, clip_id, source=None):
         self.played.append(clip_id)
         self.play_sources.append(source)
+        self._clip_busy = True          # play-through polls until this clears
         return True
+
+    # -- play-through: the transport drives these, so they model the real
+    # engine's "start it, then poll until it's finished" contract.
+    def clip_playing(self):
+        return self._clip_busy
+
+    def speak_now(self, text):
+        if not self.tts_ok:
+            return False
+        self.spoken.append(text)
+        self._tts_busy = True
+        return True
+
+    def tts_busy(self):
+        return self._tts_busy
+
+    def cancel_speech(self):
+        self._tts_busy = False
+        self.cancels += 1
+
+    def finish_current(self):
+        """Test hook: pretend whatever was sounding has just ended."""
+        self._clip_busy = False
+        self._tts_busy = False
     def stop_clip(self): pass
     def load_model(self): pass
     def start_streams(self, streams): self.added += [s["name"] for s in streams]
@@ -1242,6 +1272,113 @@ def run():
                                                      and not asked2)
         app.history.clear()
         app._rebuild_body()
+
+        # --- Playing a reviewed transcript through -----------------------------
+        # Drive the transport directly: start a line, declare it finished, and
+        # pump Tk's after() queue so the poll loop advances exactly as it would
+        # when a real clip or utterance ends.
+        def pump(n=10):
+            # Sleep THEN update, so a callback scheduled during the last update
+            # still gets one to run in -- advancing chains after(10) onto
+            # after(300), and updating first would leave the tail unprocessed.
+            for _ in range(n):
+                _time_mod.sleep(0.06)
+                app.root.update()
+
+        app.past_day = ("PlayFeed", "20260728")
+        app._past_rows = [("09:00:00", "first line", "p1"),
+                          ("09:00:01", "second line has no audio", None),
+                          ("09:00:02", "third line", "p3")]
+        app.bundle = None
+        app._pb_reset()
+        app._build_view()
+        results["pb_bar_built"] = (app._pb_widgets is not None)
+        results["pb_position_initial"] = (app._pb_widgets["pos"].cget("text")
+                                          == "1 / 3")
+
+        # Audio mode: plays clip 1, skips the clipless line, then plays clip 3.
+        app.engine.played.clear()
+        app._pb_start("audio")
+        results["pb_audio_starts"] = (app.engine.played == ["p1"]
+                                      and app._pb_running)
+        results["pb_highlights_line"] = bool(
+            app.unified.tag_ranges("pbline"))
+        app.engine.finish_current()
+        pump()
+        # Line 2 has no clip, so it must not stall there -- it should already
+        # have moved on to line 3.
+        results["pb_skips_clipless"] = (app.engine.played == ["p1", "p3"])
+        results["pb_position_advances"] = (app._pb_widgets["pos"].cget("text")
+                                           == "3 / 3")
+        app.engine.finish_current()
+        pump()
+        results["pb_stops_at_end"] = (not app._pb_running)
+        results["pb_clears_highlight"] = (not app.unified.tag_ranges("pbline"))
+
+        # Read-aloud mode speaks every line, including the one with no audio.
+        app.engine.spoken.clear()
+        app._pb_reset()
+        app._pb_start("tts")
+        results["pb_tts_starts"] = (app.engine.spoken == ["first line"])
+        app.engine.finish_current()
+        pump()
+        results["pb_tts_reads_clipless"] = (
+            app.engine.spoken == ["first line", "second line has no audio"])
+
+        # Pause holds position and silences; resuming continues from there.
+        app._pb_pause()
+        results["pb_pause_stops"] = (not app._pb_running
+                                     and app.engine.cancels > 0)
+        held = app._pb_index
+        app.engine.spoken.clear()
+        app._pb_start("tts")
+        results["pb_resumes_where_paused"] = (app._pb_index == held
+                                              and app.engine.spoken == [
+                                                  app._past_rows[held][1]])
+
+        # Stop rewinds to the top and clears the highlight.
+        app._pb_stop()
+        results["pb_stop_rewinds"] = (app._pb_index == 0
+                                      and not app._pb_running
+                                      and not app.unified.tag_ranges("pbline"))
+
+        # Selecting a row makes play start there instead of the beginning.
+        app.unified.tag_add("sel", "3.0", "3.0 lineend")
+        app.engine.played.clear()
+        app._pb_start("audio")
+        results["pb_starts_at_selection"] = (app._pb_index == 2
+                                             and app.engine.played == ["p3"])
+        app._pb_stop()
+        app.unified.tag_remove("sel", "1.0", "end")
+
+        # Switching mode mid-play silences the old one rather than doubling up.
+        app.engine.played.clear()
+        app.engine.spoken.clear()
+        app._pb_start("audio")
+        before_cancels = app.engine.cancels
+        app._pb_start("tts")
+        results["pb_mode_switch_silences"] = (
+            app.engine.cancels > before_cancels and app._pb_mode == "tts")
+        app._pb_stop()
+
+        # With no voice installed, read-aloud says so instead of hanging.
+        app.engine.tts_ok = False
+        app._pb_start("tts")
+        results["pb_tts_unavailable"] = (not app._pb_running
+                                         and "text-to-speech" in
+                                         app.status.cget("text"))
+        app.engine.tts_ok = True
+
+        # Leaving review must stop playback -- otherwise it keeps stepping
+        # through rows that are no longer on screen, over the live feed.
+        app._pb_start("audio")
+        app._exit_past_day()
+        results["pb_exit_stops"] = (not app._pb_running
+                                    and app._pb_widgets is None)
+        app.engine.finish_current()
+        pump(3)
+        results["pb_exit_no_further_play"] = (len(app.engine.played) <= 2)
+        app._pb_reset()
 
         # --- Reviewing a past day ---------------------------------------------
         # Reuse the restore fixture's logs, plus an older text-only day.
