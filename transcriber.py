@@ -757,7 +757,9 @@ def format_transcript_span(first, last):
 # --------------------------------------------------------------------------
 CLIP_DIR = os.path.join(DATA_DIR, "clips")
 CLIP_QUEUE_MAX = 200          # bounded: never let a stalled disk eat memory
-CLIP_DEFAULTS = {"enabled": False, "retention_days": 7, "bitrate": "24k"}
+CLIP_CAP_CHECK_EVERY = 100    # writes between size-cap sweeps while running
+CLIP_DEFAULTS = {"enabled": False, "retention_days": 7, "bitrate": "24k",
+                 "max_gb": 0}          # 0 = no size cap, days only
 
 
 def clip_settings(cfg):
@@ -813,6 +815,7 @@ class ClipStore:
         s = clip_settings(cfg)
         self.enabled = bool(s["enabled"])
         self.retention_days = s["retention_days"]
+        self.max_gb = s.get("max_gb", 0)
         self.bitrate = s["bitrate"]
         self.dir = clip_dir
         self.out = out
@@ -825,6 +828,7 @@ class ClipStore:
         self._opus = None           # None = not probed yet, then True/False
         self._warned = False
         self.dropped = 0            # clips lost to a full queue (writer too slow)
+        self._since_cap_check = 0   # writes since the last size-cap sweep
 
     # -- lifecycle ---------------------------------------------------------
     def start(self):
@@ -902,6 +906,19 @@ class ClipStore:
         item["bytes"] = os.path.getsize(path)
         with open(self._index_path(item["day"]), "a", encoding="utf-8") as f:
             f.write(json.dumps(item) + "\n")
+
+        # Hold the size cap while running, not only at startup: a session left up
+        # for days would otherwise sail past it. Checked periodically rather than
+        # per clip -- it's a directory scan, and a hundred clips is a few MB of
+        # overshoot at most.
+        self._since_cap_check += 1
+        if self.max_gb and self._since_cap_check >= CLIP_CAP_CHECK_EVERY:
+            self._since_cap_check = 0
+            evicted = purge_clips_over_size(float(self.max_gb) * (1 << 30),
+                                            self.dir)
+            if evicted and self.out:
+                self.out.status(f"Clip storage reached {self.max_gb:g} GB — "
+                                f"removed the {len(evicted)} oldest clip(s).")
 
     def _encode_opus(self, pcm, path):
         cmd = [self.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
@@ -1290,6 +1307,70 @@ def clips_disk_usage(clip_dir=CLIP_DIR):
             except OSError:
                 pass
     return n, total
+
+
+def logs_disk_usage(log_dir=LOG_DIR):
+    """(file count, total bytes) of saved transcripts. Text is tiny next to the
+    audio -- showing both side by side is what makes the separate policies
+    obviously right rather than fussy."""
+    n = total = 0
+    for path in glob.glob(os.path.join(log_dir, "*.log")):
+        try:
+            total += os.path.getsize(path)
+            n += 1
+        except OSError:
+            pass
+    return n, total
+
+
+def purge_clips_over_size(max_bytes, clip_dir=CLIP_DIR):
+    """Delete the OLDEST clips until the folder fits inside max_bytes.
+
+    A day limit alone can't bound the disk: a quiet week and a busy one differ by
+    an order of magnitude at the same retention. This is the setting that
+    actually caps it. max_bytes <= 0 disables. Returns deleted paths.
+
+    Index files are left alone -- they're tiny, and the day-based purge removes
+    them. A clip missing from disk with an index entry still present is already
+    handled everywhere (the marker just doesn't render)."""
+    if not max_bytes or max_bytes <= 0:
+        return []
+    if not os.path.isdir(clip_dir):
+        return []
+    files = []
+    for pattern in ("*.opus", "*.wav"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                files.append((os.path.getmtime(path), os.path.getsize(path), path))
+            except OSError:
+                pass
+    total = sum(f[1] for f in files)
+    if total <= max_bytes:
+        return []
+    deleted = []
+    for _mtime, size, path in sorted(files):        # oldest first
+        if total <= max_bytes:
+            break
+        try:
+            os.remove(path)
+            total -= size
+            deleted.append(path)
+        except OSError:
+            pass
+    return deleted
+
+
+def apply_clip_retention(settings, clip_dir=CLIP_DIR):
+    """Run both clip policies: age first, then the size cap on what's left.
+
+    Order matters -- expiring by age first means the size cap only has to evict
+    clips that are still within their retention window, so it takes the fewest
+    files it can. Returns (aged_out, over_size)."""
+    aged = purge_old_clips(settings.get("retention_days"), clip_dir)
+    cap_gb = settings.get("max_gb") or 0
+    over = purge_clips_over_size(float(cap_gb) * (1 << 30), clip_dir) \
+        if cap_gb else []
+    return aged, over
 
 
 # --------------------------------------------------------------------------
@@ -3433,11 +3514,15 @@ class Engine:
             if deleted:
                 self.out.status(f"Purged {len(deleted)} log file(s) older than {days} day(s).")
         # Same for clips -- voice recordings, so bounding them matters more.
-        cdays = self.clips.retention_days
-        cdeleted = purge_old_clips(cdays, self.clips.dir)
-        if cdeleted:
-            self.out.status(f"Purged {len(cdeleted)} clip file(s) older than "
-                            f"{cdays} day(s).")
+        aged, over = apply_clip_retention(
+            {"retention_days": self.clips.retention_days,
+             "max_gb": self.clips.max_gb}, self.clips.dir)
+        if aged:
+            self.out.status(f"Purged {len(aged)} clip file(s) older than "
+                            f"{self.clips.retention_days:g} day(s).")
+        if over:
+            self.out.status(f"Purged {len(over)} more clip file(s) to stay "
+                            f"under {self.clips.max_gb:g} GB.")
 
     # -- auth ---------------------------------------------------------------
     def _build_auth(self):

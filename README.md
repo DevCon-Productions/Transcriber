@@ -217,12 +217,41 @@ dropdown. The `-E` flag avoids this machine's PYTHONPATH trap — see below.
 - `vad.silence_hangover_sec` — silence gap that ends a transmission.
 - `filters.max_no_speech_prob` / `min_avg_logprob` — drop low-confidence/garbage
   output (helps suppress Whisper "hallucinations" on static).
-- `log_retention_days` — on startup, delete log files older than this many days
-  (default 14). Set to `0` to keep logs forever. Because logs contain sensitive
-  PII, this keeps the on-disk footprint bounded automatically.
-- `clips.enabled` / `clips.retention_days` / `clips.bitrate` — audio clip
-  recording (off by default). Same purge-on-startup contract as the logs, and it
-  matters more here: clips are voice recordings. See "Clip recording" below.
+- `log_retention_days` — delete log files older than this many days (default 14).
+  `0` keeps them forever.
+- `clips.enabled` / `clips.retention_days` / `clips.max_gb` / `clips.bitrate` —
+  audio clip recording (off by default). See "Retention" and "Clip recording".
+
+### Retention
+
+**Streams → Retention…** sets how long saved data is kept. Transcripts and clips
+are configured separately, because their sizes aren't comparable — a day of text
+is kilobytes, a day of audio is tens of megabytes. One shared number would either
+throw away cheap transcripts early or keep expensive audio far too long.
+
+| | Setting | Default |
+|---|---|---|
+| Transcripts (text) | `log_retention_days` | 14 days |
+| Audio clips | `clips.retention_days` | 7 days |
+| Audio clips | `clips.max_gb` — optional size cap | off |
+
+`0` days means "keep forever" for either.
+
+The **size cap** is the setting that actually bounds the disk. Days alone can't:
+a busy week and a quiet one differ by an order of magnitude at the same
+retention. When the clips folder exceeds the cap, the **oldest clips are deleted
+first** until it fits.
+
+Age is applied before the cap, so the cap only ever has to evict clips that are
+still inside their retention window. Day-based purging runs at startup; the size
+cap is *also* enforced while the app runs, so a session left up for days can't
+sail past it.
+
+**Apply and purge now** in the dialog runs both policies immediately against the
+values on screen, so you can see the effect before committing.
+
+Saved `.tscript` files are never touched by any of this — deleting those is
+always your call.
 
 The GUI keeps recent transcript lines in memory and **replays them** when you
 toggle a feed or switch views, so the visible scrollback no longer resets.

@@ -1442,26 +1442,73 @@ def run():
         gui.PastDayDialog = LivePastDlg.__bases__[0]
         core.log_files_for = real_logs_for
 
-        # Global settings dialog reads config and writes it back.
+        # Recording dialog now owns only the on/off switch -- retention moved to
+        # its own dialog, so it must not still be writing a retention value.
         class LiveClipSettings(gui.ClipSettingsDialog):
             def wait_window(self, *a, **k): pass
-        app.cfg["clips"] = {"enabled": False, "retention_days": 7}
+        app.cfg["clips"] = {"enabled": False, "retention_days": 7, "max_gb": 0}
         cs = LiveClipSettings(app.root, app)
         cs.grab_release()
-        results["clipdlg_reads_cfg"] = (cs.enabled.get() is False
-                                        and cs.days.get() == "7")
-        results["clipdlg_days_disabled"] = (str(cs.days_spin.cget("state"))
-                                            == "disabled")
+        results["clipdlg_reads_cfg"] = (cs.enabled.get() is False)
+        results["clipdlg_shows_policy"] = ("7 day" in cs.days_label.cget("text"))
         cs.enabled.set(True)
-        cs._sync_state()
-        results["clipdlg_days_enable"] = (str(cs.days_spin.cget("state")) == "normal")
-        cs.days.set("-3")
-        results["clipdlg_rejects_negative"] = (cs.validate() is False)
-        cs.days.set("3")
         cs.apply()
-        results["clipdlg_applies"] = (cs.result == {"enabled": True,
-                                                    "retention_days": 3.0})
+        results["clipdlg_applies"] = (cs.result == {"enabled": True})
+        results["clipdlg_no_retention"] = ("retention_days" not in cs.result)
         cs.destroy()
+
+        # --- Retention dialog -------------------------------------------------
+        class LiveRetention(gui.RetentionDialog):
+            def wait_window(self, *a, **k): pass
+        app.cfg["log_retention_days"] = 14
+        app.cfg["clips"] = {"enabled": True, "retention_days": 7, "max_gb": 0}
+        rd = LiveRetention(app.root, app)
+        rd.grab_release()
+        results["retdlg_reads_both"] = (rd.log_days.get() == "14"
+                                        and rd.clip_days.get() == "7")
+        # No cap configured -> the box is off and its entry disabled.
+        results["retdlg_cap_off"] = (rd.cap_on.get() is False
+                                     and str(rd.cap_entry.cget("state"))
+                                     == "disabled")
+        rd.cap_on.set(True)
+        rd._sync_state()
+        results["retdlg_cap_enables"] = (str(rd.cap_entry.cget("state"))
+                                         == "normal")
+        rd.max_gb.set("0")
+        results["retdlg_rejects_zero_cap"] = (rd.validate() is False)
+        rd.log_days.set("-1")
+        rd.max_gb.set("2")
+        results["retdlg_rejects_negative"] = (rd.validate() is False)
+        rd.log_days.set("30")
+        rd.clip_days.set("3")
+        rd.apply()
+        results["retdlg_applies"] = (rd.result == {"log_days": 30.0,
+                                                   "clip_days": 3.0,
+                                                   "max_gb": 2.0})
+        # Unticking the cap zeroes it rather than keeping a stale number.
+        rd.cap_on.set(False)
+        rd.apply()
+        results["retdlg_cap_off_zeroes"] = (rd.result["max_gb"] == 0.0)
+        rd.destroy()
+
+        # The app writes both policies back and pushes them to the live store.
+        class FakeRetention:
+            spec = {"log_days": 21.0, "clip_days": 5.0, "max_gb": 1.5}
+            def __init__(self, *a, **k):
+                self.result = FakeRetention.spec
+        real_ret = gui.RetentionDialog
+        gui.RetentionDialog = FakeRetention
+        app._open_retention()
+        results["retention_saved_logs"] = (app.cfg["log_retention_days"] == 21.0)
+        results["retention_saved_clips"] = (
+            app.cfg["clips"]["retention_days"] == 5.0
+            and app.cfg["clips"]["max_gb"] == 1.5)
+        results["retention_pushed_to_engine"] = (
+            app.engine.clips.retention_days == 5.0
+            and app.engine.clips.max_gb == 1.5)
+        results["retention_status"] = ("1.5 GB" in app.status.cget("text"))
+        # Enabling recording must not clobber the retention just set.
+        gui.RetentionDialog = real_ret
 
         # --- Streams menu exposes the new commands ---------------------------
         menubar = app.root.nametowidget(app.root.cget("menu"))

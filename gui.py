@@ -763,6 +763,153 @@ def _fmt_bytes(n):
         n /= 1024.0
 
 
+class RetentionDialog(simpledialog.Dialog):
+    """How long saved data is kept: transcripts and clip audio, separately.
+
+    They're separated because their sizes aren't comparable -- a day of text is
+    kilobytes, a day of audio is tens of megabytes -- so one shared number would
+    either throw away cheap transcripts early or keep expensive audio too long.
+    Clips also take an optional size cap, since days alone can't bound the disk:
+    a busy week and a quiet one differ by an order of magnitude at the same
+    retention. result = {"log_days", "clip_days", "max_gb"}."""
+    def __init__(self, parent, app):
+        self._app = app
+        super().__init__(parent, title="Retention")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        clips = core.clip_settings(self._app.cfg)
+
+        tk.Label(master, text="How long to keep saved data",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(10, 2))
+        tk.Label(master, text="Old files are deleted when the app starts, and "
+                 "the size cap is\nkept up to date while it runs.",
+                 bg=BG, fg=MUTED, justify="left").grid(
+                     row=1, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(0, 10))
+
+        # --- transcripts ---------------------------------------------------
+        tk.Label(master, text="Transcripts (text)", bg=BG, fg=FG,
+                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0,
+                                                    columnspan=3, sticky="w",
+                                                    padx=10)
+        tk.Label(master, text="Keep for", bg=BG, fg=FG).grid(
+            row=3, column=0, sticky="w", padx=(24, 4), pady=3)
+        self.log_days = tk.StringVar(value=str(
+            self._app.cfg.get("log_retention_days", 14)))
+        tk.Spinbox(master, from_=0, to=3650, width=6,
+                   textvariable=self.log_days).grid(row=3, column=1, sticky="w")
+        tk.Label(master, text="days   (0 = forever)", bg=BG, fg=MUTED).grid(
+            row=3, column=2, sticky="w", padx=4)
+        ln, lb = core.logs_disk_usage()
+        tk.Label(master, text=f"On disk now: {ln} file(s), {_fmt_bytes(lb)}",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=4, column=0, columnspan=3, sticky="w",
+                     padx=24, pady=(0, 10))
+
+        # --- clips ----------------------------------------------------------
+        tk.Label(master, text="Audio clips", bg=BG, fg=FG,
+                 font=("Segoe UI", 9, "bold")).grid(row=5, column=0,
+                                                    columnspan=3, sticky="w",
+                                                    padx=10)
+        tk.Label(master, text="Keep for", bg=BG, fg=FG).grid(
+            row=6, column=0, sticky="w", padx=(24, 4), pady=3)
+        self.clip_days = tk.StringVar(value=str(clips["retention_days"]))
+        tk.Spinbox(master, from_=0, to=3650, width=6,
+                   textvariable=self.clip_days).grid(row=6, column=1, sticky="w")
+        tk.Label(master, text="days   (0 = forever)", bg=BG, fg=MUTED).grid(
+            row=6, column=2, sticky="w", padx=4)
+
+        cap = float(clips.get("max_gb") or 0)
+        self.cap_on = tk.BooleanVar(value=cap > 0)
+        tk.Checkbutton(master, text="Also cap total size at",
+                       variable=self.cap_on, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       command=self._sync_state).grid(
+                           row=7, column=0, sticky="w", padx=(20, 0), pady=3)
+        self.max_gb = tk.StringVar(value=f"{cap:g}" if cap else "2")
+        self.cap_entry = tk.Spinbox(master, from_=0.1, to=1000, increment=0.5,
+                                    width=6, textvariable=self.max_gb)
+        self.cap_entry.grid(row=7, column=1, sticky="w")
+        self.cap_unit = tk.Label(master, text="GB   (oldest deleted first)",
+                                 bg=BG, fg=MUTED)
+        self.cap_unit.grid(row=7, column=2, sticky="w", padx=4)
+        cn, cb = core.clips_disk_usage(self._app._clip_dir())
+        self.clip_usage = tk.Label(
+            master, text=f"On disk now: {cn} clip(s), {_fmt_bytes(cb)}",
+            bg=BG, fg=MUTED, font=("Segoe UI", 8))
+        self.clip_usage.grid(row=8, column=0, columnspan=3, sticky="w",
+                             padx=24, pady=(0, 6))
+
+        tk.Label(master, text="Transcript files you've saved (.tscript) are "
+                 "never touched by these.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=9, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(4, 6))
+        tk.Button(master, text="Apply and purge now", command=self._purge_now,
+                  bg=BG2, fg=FG, relief="flat").grid(
+                      row=10, column=0, columnspan=3, sticky="w",
+                      padx=10, pady=(0, 8))
+
+        self._sync_state()
+        return None
+
+    def _sync_state(self):
+        on = self.cap_on.get()
+        self.cap_entry.config(state="normal" if on else "disabled")
+        self.cap_unit.config(fg=MUTED if on else "#5b5f66")
+
+    def _values(self):
+        return (float(self.log_days.get()), float(self.clip_days.get()),
+                float(self.max_gb.get()) if self.cap_on.get() else 0.0)
+
+    def _purge_now(self):
+        """Apply what's on screen immediately, so the effect is visible before
+        committing to it."""
+        if not self.validate():
+            return
+        log_days, clip_days, max_gb = self._values()
+        gone_logs = core.purge_old_logs(log_days)
+        aged, over = core.apply_clip_retention(
+            {"retention_days": clip_days, "max_gb": max_gb},
+            self._app._clip_dir())
+        cn, cb = core.clips_disk_usage(self._app._clip_dir())
+        self.clip_usage.config(text=f"On disk now: {cn} clip(s), "
+                                    f"{_fmt_bytes(cb)}")
+        messagebox.showinfo(
+            "Retention",
+            f"Deleted {len(gone_logs)} transcript file(s) and "
+            f"{len(aged) + len(over)} clip(s)"
+            + (f" ({len(over)} to fit the size cap)." if over else "."),
+            parent=self)
+
+    def validate(self):
+        try:
+            log_days, clip_days, max_gb = self._values()
+        except ValueError:
+            messagebox.showwarning("Retention", "Those need to be numbers.",
+                                   parent=self)
+            return False
+        if log_days < 0 or clip_days < 0:
+            messagebox.showwarning("Retention", "Days can't be negative.",
+                                   parent=self)
+            return False
+        if self.cap_on.get() and max_gb <= 0:
+            messagebox.showwarning("Retention",
+                                   "A size cap has to be greater than zero "
+                                   "(untick it to disable).", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        log_days, clip_days, max_gb = self._values()
+        self.result = {"log_days": log_days, "clip_days": clip_days,
+                       "max_gb": max_gb}
+
+
 class ClipSettingsDialog(simpledialog.Dialog):
     """Global controls for clip recording: the master switch, how long clips are
     kept, and what's on disk now. Which FEEDS record is set per feed in Edit."""
@@ -794,15 +941,21 @@ class ClipSettingsDialog(simpledialog.Dialog):
                  bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
                      row=3, column=0, columnspan=2, sticky="w", padx=30, pady=(0, 8))
 
-        self.days_label = tk.Label(master, text="Keep clips for (days)", bg=BG, fg=FG)
-        self.days_label.grid(row=4, column=0, sticky="w", padx=10, pady=4)
-        self.days = tk.StringVar(value=str(cfg["retention_days"]))
-        self.days_spin = tk.Spinbox(master, from_=0, to=365, width=6,
-                                    textvariable=self.days)
-        self.days_spin.grid(row=4, column=1, sticky="w", padx=10, pady=4)
-        tk.Label(master, text="0 = keep forever (watch your disk).",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
-                     row=5, column=1, sticky="w", padx=10)
+        # Retention lives in its own dialog, alongside the transcript policy --
+        # keeping half of it here would mean two places to look.
+        cap = float(cfg.get("max_gb") or 0)
+        keep = ("kept forever" if not cfg["retention_days"]
+                else f"kept {cfg['retention_days']:g} day(s)")
+        if cap:
+            keep += f", capped at {cap:g} GB"
+        self.days_label = tk.Label(master, text=f"Clips are {keep}.",
+                                   bg=BG, fg=FG)
+        self.days_label.grid(row=4, column=0, columnspan=2, sticky="w",
+                             padx=10, pady=(4, 2))
+        tk.Button(master, text="Change retention…", command=self._open_retention,
+                  bg=BG2, fg=FG, relief="flat").grid(
+                      row=5, column=0, columnspan=2, sticky="w", padx=8,
+                      pady=(0, 6))
 
         n, total = core.clips_disk_usage(self._app._clip_dir())
         self.usage = tk.Label(master, text=f"On disk now: {n} clip(s), "
@@ -820,9 +973,18 @@ class ClipSettingsDialog(simpledialog.Dialog):
         return None
 
     def _sync_state(self):
-        on = self.enabled.get()
-        self.days_spin.config(state="normal" if on else "disabled")
-        self.days_label.config(fg=FG if on else MUTED)
+        self.days_label.config(fg=FG if self.enabled.get() else MUTED)
+
+    def _open_retention(self):
+        """Hand off to the retention dialog, then re-read what it settled on."""
+        self._app._open_retention(parent=self)
+        cfg = core.clip_settings(self._app.cfg)
+        cap = float(cfg.get("max_gb") or 0)
+        keep = ("kept forever" if not cfg["retention_days"]
+                else f"kept {cfg['retention_days']:g} day(s)")
+        if cap:
+            keep += f", capped at {cap:g} GB"
+        self.days_label.config(text=f"Clips are {keep}.")
 
     def _open_folder(self):
         d = self._app._clip_dir()
@@ -848,22 +1010,10 @@ class ClipSettingsDialog(simpledialog.Dialog):
         messagebox.showinfo("Delete clips", f"Deleted {len(removed)} file(s).",
                             parent=self)
 
-    def validate(self):
-        try:
-            d = float(self.days.get())
-        except ValueError:
-            messagebox.showwarning("Retention",
-                                   "Days must be a number.", parent=self)
-            return False
-        if d < 0:
-            messagebox.showwarning("Retention",
-                                   "Days can't be negative.", parent=self)
-            return False
-        return True
-
     def apply(self):
-        self.result = {"enabled": bool(self.enabled.get()),
-                       "retention_days": float(self.days.get())}
+        # Retention is owned by RetentionDialog now; this one only switches
+        # recording on and off.
+        self.result = {"enabled": bool(self.enabled.get())}
 
 
 class PastDayDialog(simpledialog.Dialog):
@@ -1269,10 +1419,24 @@ HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
   • Clicking a line's 🔊 takes over the speakers for a moment; whatever you were
     listening to live resumes when the clip finishes. Click another 🔊 to skip
     straight to that one.
-  • Roughly 100 MB per day for a busy feed. Clips are deleted automatically
-    after the number of days you set (7 by default; 0 keeps them forever).
+  • Roughly 100 MB per day for a busy feed. How long they're kept is set in
+    Streams → "Retention…" (see below).
   • "Audio recording…" also shows what's on disk, opens the clips folder, and
     can delete every saved clip at once.
+
+HOW LONG THINGS ARE KEPT  (Streams → Retention…)
+  Transcripts and audio are set separately, because their sizes aren't
+  comparable — a day of text is kilobytes, a day of audio is tens of megabytes.
+  • Transcripts (text): 14 days by default.
+  • Audio clips: 7 days by default.
+  • Either can be set to 0 to keep forever.
+  • Clips can also have a SIZE CAP ("never use more than N GB"). This is the
+    setting that really bounds the disk — days alone can't, since a busy week
+    and a quiet one differ enormously at the same retention. When the folder
+    goes over, the OLDEST clips are deleted until it fits.
+  Old files are removed when the app starts, and the size cap is also kept up to
+  date while it runs. "Apply and purge now" does it immediately so you can see
+  the effect. Transcript files you've saved (.tscript) are never touched.
   • These are voice recordings of live radio — they never leave your PC, but
     treat the clips folder the way you'd treat the transcripts.
 
@@ -2461,10 +2625,30 @@ class TranscriberGUI:
         self._save_cfg()
         if self.engine is not None:
             self.engine.set_clips_enabled(clips["enabled"])
-            self.engine.clips.retention_days = clips["retention_days"]
         state = "on" if clips["enabled"] else "off"
-        self._set_status(f"Clip recording {state}; keeping "
-                         f"{clips['retention_days']:g} day(s).")
+        self._set_status(f"Clip recording {state}.")
+
+    def _open_retention(self, parent=None):
+        """Set how long transcripts and clips are kept. Takes effect at once:
+        the engine reads these live, so the next size-cap sweep uses them."""
+        dlg = RetentionDialog(parent or self.root, self)
+        if not dlg.result:
+            return
+        self.cfg["log_retention_days"] = dlg.result["log_days"]
+        clips = dict(self.cfg.get("clips") or {})
+        clips["retention_days"] = dlg.result["clip_days"]
+        clips["max_gb"] = dlg.result["max_gb"]
+        self.cfg["clips"] = clips
+        self._save_cfg()
+        if self.engine is not None:
+            self.engine.clips.retention_days = clips["retention_days"]
+            self.engine.clips.max_gb = clips["max_gb"]
+        def _for(days):
+            return "forever" if not days else f"{days:g} day(s)"
+
+        cap = f", capped at {clips['max_gb']:g} GB" if clips["max_gb"] else ""
+        self._set_status(f"Retention: transcripts {_for(dlg.result['log_days'])}, "
+                         f"clips {_for(clips['retention_days'])}{cap}.")
 
     def _recording_feeds(self):
         """Names of feeds with recording opted in (regardless of the global switch)."""
@@ -2540,6 +2724,8 @@ class TranscriberGUI:
                                  command=self._export_day_bundle)
         streams_menu.add_command(label="Audio recording...",
                                  command=self._open_clip_settings)
+        streams_menu.add_command(label="Retention...",
+                                 command=self._open_retention)
         streams_menu.add_command(label="Export selected audio as MP3...",
                                  command=self._export_selected_mp3)
         streams_menu.add_command(label="Save transcript as PDF...",

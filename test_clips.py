@@ -294,6 +294,77 @@ def run():
                                                       clips=pstore,
                                                       log_dir=pdir) == [])
 
+    # ---- retention: size cap and the combined policy -----------------------
+    import time as _t2
+    sdir = os.path.join(d, "sizecap")
+    os.makedirs(sdir)
+
+    def _seed(n_files, mb, age_days_start):
+        """n_files clips of mb MB each, ages counting DOWN from age_days_start."""
+        made = []
+        for i in range(n_files):
+            p = os.path.join(sdir, f"West-2026070{i}-000000-{i:05d}.opus")
+            with open(p, "wb") as f:
+                f.write(b"x" * int(mb * (1 << 20)))
+            when = _t2.time() - (age_days_start - i) * 86400
+            os.utime(p, (when, when))
+            made.append(p)
+        return made
+
+    _seed(10, 1, 10)                     # 10 MB total, ages 10d..1d
+    results["cap_usage_before"] = (core.clips_disk_usage(sdir) == (10, 10 << 20))
+    evicted = core.purge_clips_over_size(4 << 20, sdir)
+    surviving = sorted(os.listdir(sdir))
+    results["cap_evicts_to_fit"] = (core.clips_disk_usage(sdir)[1] <= (4 << 20))
+    # It must take the OLDEST, not an arbitrary set.
+    results["cap_evicts_oldest"] = (len(evicted) == 6
+                                    and surviving == [f"West-2026070{i}-000000-"
+                                                      f"{i:05d}.opus"
+                                                      for i in range(6, 10)])
+    results["cap_disabled_noop"] = (core.purge_clips_over_size(0, sdir) == [])
+    results["cap_under_noop"] = (core.purge_clips_over_size(1 << 30, sdir) == [])
+    results["cap_missing_dir"] = (
+        core.purge_clips_over_size(1, os.path.join(d, "nope")) == [])
+
+    # Combined: age first, then the cap on what's left. Ordering matters --
+    # expiring by age first means the cap evicts as few live clips as possible.
+    cdir3 = os.path.join(d, "combined")
+    os.makedirs(cdir3)
+    sdir_save = sdir
+    sdir = cdir3
+    _seed(6, 1, 30)                      # ages 30d..25d -> all past a 7-day window
+    _seed(4, 1, 4)                       # overwrites 4 of them at ages 4d..1d
+    sdir = sdir_save
+    aged, over = core.apply_clip_retention(
+        {"retention_days": 7, "max_gb": 2 / 1024.0}, cdir3)     # 2 MB cap
+    results["combined_ages_out"] = (len(aged) >= 1)
+    results["combined_then_caps"] = (core.clips_disk_usage(cdir3)[1] <= (2 << 20))
+    results["combined_reports_both"] = (isinstance(aged, list)
+                                        and isinstance(over, list))
+    # No cap set -> only the age policy runs.
+    cdir4 = os.path.join(d, "agesonly")
+    os.makedirs(cdir4)
+    sdir_save2, sdir = sdir, cdir4
+    _seed(3, 1, 2)                       # all recent
+    sdir = sdir_save2
+    aged2, over2 = core.apply_clip_retention({"retention_days": 7, "max_gb": 0},
+                                             cdir4)
+    results["combined_no_cap"] = (aged2 == [] and over2 == []
+                                  and core.clips_disk_usage(cdir4)[0] == 3)
+
+    # Settings default the cap off, so existing configs behave exactly as before.
+    results["cap_default_off"] = (core.clip_settings({})["max_gb"] == 0)
+    results["cap_from_cfg"] = (
+        core.clip_settings({"clips": {"max_gb": 3}})["max_gb"] == 3)
+
+    # Log usage readout (the retention dialog shows both side by side).
+    ldir2 = os.path.join(d, "logsize")
+    os.makedirs(ldir2)
+    with open(os.path.join(ldir2, "West-20260728.log"), "w", encoding="utf-8") as f:
+        f.write("[00:00:00] hello\n")
+    results["logs_usage"] = (core.logs_disk_usage(ldir2)[0] == 1
+                             and core.logs_disk_usage(ldir2)[1] > 0)
+
     # ---- transcript bundles (.tscript) ------------------------------------
     import zipfile
     bdir = os.path.join(d, "bundle")
