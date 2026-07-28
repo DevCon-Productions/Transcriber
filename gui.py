@@ -1277,9 +1277,14 @@ HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
     treat the clips folder the way you'd treat the transcripts.
 
 SAVING CLIPS AS AN MP3  (right-click the transcript)
-  Drag across the lines you want, then right-click → "Export selected audio as
-  MP3…". The selected lines' audio is joined, in the order shown, into one MP3
-  with a short gap between transmissions. One line exports just that clip.
+  Click a line to select that whole row, drag up or down for more, then
+  right-click → "Export selected audio as MP3…". The selected lines' audio is
+  joined, in the order shown, into one MP3 with a short gap between
+  transmissions. One line exports just that clip.
+  • Selection works in whole rows only — never half a line. Shift-click extends
+    to the row you click, and dragging past the edge scrolls.
+  • Clicking a 🔊, an address link, or a unit label still does its own thing
+    rather than selecting.
   • The menu tells you how many clips your selection covers before you save.
   • "Select all" is on the same menu if you want the whole pane.
   • Lines without a 🔊 are skipped; if a clip has already been deleted it's
@@ -1626,6 +1631,7 @@ class TranscriberGUI:
         self._restored = (0, 0)          # (lines, of which had clips) on launch
         self.past_day = None             # (feed, day) while reviewing a past day
         self._past_rows = []             # that day's [(ts, text, clip_id)]
+        self._link_targets = {}          # "addr:N" -> (query, location)
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
@@ -2394,6 +2400,9 @@ class TranscriberGUI:
         for w in self.body.winfo_children():
             w.destroy()
         self.sector_panels.clear()
+        # Link tags belong to the widgets being destroyed; the replay re-creates
+        # them, so clearing here keeps this from growing all session.
+        self._link_targets.clear()
 
         # Reviewing a past day takes over the body entirely: one feed, one day,
         # read-only. Every rebuild path (view toggle, font change, feed edit)
@@ -2444,6 +2453,91 @@ class TranscriberGUI:
         """Right-click menu for a transcript pane that has no sector menu of its
         own (unified view, and the past-day view)."""
         widget.bind("<Button-3>", lambda e, w=widget: self._transcript_menu(e, w))
+
+    # ----- whole-row selection in transcript panes ---------------------------
+    # Transmissions are the unit here: a line either goes in the MP3 or it
+    # doesn't, so Tk's default character-level drag (which happily selects half a
+    # sentence) only invites confusion. These bindings snap selection to whole
+    # lines -- click takes a row, drag extends by rows, shift-click extends from
+    # the last anchor -- and return "break" so the default Text behaviour, which
+    # lives in the class bindings, never runs.
+    @staticmethod
+    def _line_no(index):
+        try:
+            return int(str(index).split(".")[0])
+        except ValueError:
+            return 1
+
+    def _select_rows(self, widget, a, b):
+        """Select every whole line between two indices, in either drag direction."""
+        lo, hi = sorted((self._line_no(a), self._line_no(b)))
+        widget.tag_remove("sel", "1.0", "end")
+        widget.tag_add("sel", f"{lo}.0", f"{hi}.0 lineend")
+
+    def _click_targets(self, widget, index):
+        """Dispatch a click on the interactive spans of a line.
+
+        A widget-level <Button-1> preempts Text TAG bindings entirely (verified:
+        with the widget handler returning "break", tag_bind handlers never fire).
+        Since row-selection needs that binding, the clickable spans -- the 🔊
+        marker, address map-links, and unit labels -- are dispatched here instead
+        of relying on their tag_bind. Their <Enter>/<Leave> cursor bindings are
+        untouched and still work."""
+        for tag in widget.tag_names(index):
+            if tag.startswith("clip:"):
+                self._play_clip(tag[len("clip:"):])
+                return True
+            if tag.startswith("addr:") and tag in self._link_targets:
+                query, location = self._link_targets[tag]
+                self._open_map(query, location)
+                return True
+            if tag.startswith("u:") and self.color_mode.get() == "unit":
+                self.set_unit_filter(tag[len("u:"):])
+                return True
+        return False
+
+    def _row_press(self, event, widget):
+        idx = widget.index(f"@{event.x},{event.y}")
+        # Acting on a link/marker shouldn't also move the selection -- and a unit
+        # filter rebuilds the view, so the widget may be gone after this.
+        if self._click_targets(widget, idx):
+            return "break"
+        widget._row_anchor = idx
+        self._select_rows(widget, idx, idx)
+        widget.focus_set()
+        return "break"
+
+    def _row_motion(self, event, widget):
+        anchor = getattr(widget, "_row_anchor", None)
+        if anchor is None:
+            return "break"
+        # Dragging past the top or bottom edge scrolls, so a selection can run
+        # beyond one screenful.
+        if event.y < 0:
+            widget.yview_scroll(-1, "units")
+        elif event.y > widget.winfo_height():
+            widget.yview_scroll(1, "units")
+        self._select_rows(widget, anchor,
+                          widget.index(f"@{event.x},{event.y}"))
+        return "break"
+
+    def _row_shift_press(self, event, widget):
+        """Shift-click extends the selection to the clicked row."""
+        anchor = getattr(widget, "_row_anchor", None)
+        idx = widget.index(f"@{event.x},{event.y}")
+        self._select_rows(widget, anchor or idx, idx)
+        widget.focus_set()
+        return "break"
+
+    def _bind_row_selection(self, widget):
+        widget.bind("<Button-1>", lambda e, w=widget: self._row_press(e, w))
+        widget.bind("<B1-Motion>", lambda e, w=widget: self._row_motion(e, w))
+        widget.bind("<Shift-Button-1>",
+                    lambda e, w=widget: self._row_shift_press(e, w))
+        # Double/triple click would otherwise fall through to the class bindings
+        # and re-introduce word/character selection.
+        widget.bind("<Double-Button-1>", lambda e, w=widget: self._row_press(e, w))
+        widget.bind("<Triple-Button-1>", lambda e, w=widget: self._row_press(e, w))
 
     def _add_export_items(self, menu, widget):
         """The clip-export entries, shared by every transcript right-click menu
@@ -2508,6 +2602,8 @@ class TranscriberGUI:
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
+        # Every transcript pane selects by whole rows (unified, sectors, past).
+        self._bind_row_selection(txt)
         # Return a thin wrapper that .pack/.grid forwards to the frame.
         txt.frame = frame
         txt.pack = frame.pack
@@ -2851,9 +2947,13 @@ class TranscriberGUI:
                 continue
             if i > pos:
                 widget.insert("end", text[pos:i], base_tags)
-            # Unique tag per link so each opens its own address.
+            # Unique tag per link so each opens its own address. The target is
+            # also kept by tag name: row-selection owns <Button-1> on the widget,
+            # which preempts tag bindings, so the click is dispatched from there
+            # and needs to look the address up rather than close over it.
             self._link_seq = getattr(self, "_link_seq", 0) + 1
             tag = f"addr:{self._link_seq}"
+            self._link_targets[tag] = (query, location)
             widget.tag_config(tag, foreground=LINK_FG, underline=True)
             widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
             widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))

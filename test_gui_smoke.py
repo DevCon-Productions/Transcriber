@@ -964,6 +964,65 @@ def run():
         u.tag_remove("sel", "1.0", "end")
         results["mp3_no_selection"] = (app._selected_clip_ids() == [])
 
+        # --- Whole-row selection ---------------------------------------------
+        # Clicking anywhere in a line must take the WHOLE line, and dragging
+        # must extend by whole lines -- partial rows can't map to whole clips.
+        app.root.update()
+        mid = u.bbox("2.6")             # mid-text on line 2, not on the marker
+        if mid:
+            u.event_generate("<Button-1>", x=mid[0] + 2, y=mid[1] + 2)
+            app.root.update()
+            sel = u.tag_ranges("sel")
+            results["row_click_whole_row"] = (
+                bool(sel) and str(sel[0]) == "2.0"
+                and u.get(sel[0], sel[1]) == u.get("2.0", "2.0 lineend"))
+            # Drag down to line 4 -> lines 2..4 entirely.
+            low = u.bbox("4.6")
+            if low:
+                u.event_generate("<B1-Motion>", x=low[0] + 2, y=low[1] + 2)
+                app.root.update()
+                sel2 = u.tag_ranges("sel")
+                results["row_drag_extends"] = (
+                    str(sel2[0]) == "2.0" and str(sel2[1]).startswith("4."))
+                # Dragging back UP past the anchor selects upward, not nothing.
+                top = u.bbox("1.6")
+                if top:
+                    u.event_generate("<B1-Motion>", x=top[0] + 2, y=top[1] + 2)
+                    app.root.update()
+                    sel3 = u.tag_ranges("sel")
+                    results["row_drag_upward"] = (str(sel3[0]) == "1.0"
+                                                  and str(sel3[1]).startswith("2."))
+            u.event_generate("<ButtonRelease-1>", x=mid[0] + 2, y=mid[1] + 2)
+        else:
+            for k in ("row_click_whole_row", "row_drag_extends", "row_drag_upward"):
+                results[k] = True       # no geometry in this environment
+
+        # Clicking the 🔊 marker still plays rather than just selecting: the
+        # widget-level Button-1 preempts tag bindings, so the click is dispatched
+        # by _click_targets and this would silently regress without a check.
+        app.engine.played.clear()
+        marker = u.bbox("1.11")         # the marker sits after "[hh:mm:ss] "
+        if marker:
+            u.event_generate("<Button-1>", x=marker[0] + 1, y=marker[1] + 1)
+            app.root.update()
+            u.event_generate("<ButtonRelease-1>", x=marker[0] + 1, y=marker[1] + 1)
+        results["row_click_marker_plays"] = (app.engine.played == ["cid-1"]
+                                             if marker else True)
+        # Map links keep working through the same dispatch.
+        opened = []
+        app._open_map = lambda q, loc: opened.append((q, loc))
+        app._link_targets["addr:test"] = ("100 Main St", "Cleveland, OH")
+        u.tag_add("addr:test", "3.0", "3.5")
+        hit = u.bbox("3.1")
+        if hit:
+            u.event_generate("<Button-1>", x=hit[0] + 1, y=hit[1] + 1)
+            app.root.update()
+        results["row_click_link_opens"] = (opened == [("100 Main St",
+                                                       "Cleveland, OH")]
+                                           if hit else True)
+        u.tag_delete("addr:test")
+        u.tag_remove("sel", "1.0", "end")
+
         # Select lines 1-3: picks up cid-1 and cid-2, skips the clipless line,
         # and stops before cid-3.
         u.tag_add("sel", "1.0", "3.end")

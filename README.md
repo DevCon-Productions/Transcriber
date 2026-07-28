@@ -350,14 +350,16 @@ the recording dialog at any time.
 
 #### Exporting clips as an MP3
 
-Drag across transcript lines, then **right-click → Export selected audio as MP3…**
-(or Streams → the same). Every selected line that has a 🔊 is decoded, joined in
-transcript order with a short silence between transmissions, and written as a
-single MP3. Selecting one line exports just that one.
+Click a line to select that whole row, drag up or down to take more, then
+**right-click → Export selected audio as MP3…** (or Streams → the same). Every
+selected line that has a 🔊 is decoded, joined in transcript order with a short
+silence between transmissions, and written as a single MP3. Selecting one line
+exports just that one.
 
-The transcript panes are read-only but still selectable, so ordinary click-drag
-works; the right-click menu also has **Select all**, and reports how many clips
-your selection covers before you commit.
+Selection is by whole rows, never part of one — a transmission either goes in the
+MP3 or it doesn't. Shift-click extends to the clicked row, dragging past the top
+or bottom edge scrolls, and the right-click menu has **Select all** plus a count
+of how many clips your selection covers before you commit.
 
 Joining happens as raw PCM, not by concatenating the Opus files — stitching
 compressed frames would need matching encoder state. Clips decode, join, then
