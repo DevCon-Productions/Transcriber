@@ -767,6 +767,34 @@ def clip_settings(cfg):
     return s
 
 
+def decode_audio_file(path, ffmpeg=None):
+    """Decode an audio FILE to raw 16 kHz mono s16 bytes. b"" on any failure."""
+    cmd = [ffmpeg or find_ffmpeg(), "-nostdin", "-loglevel", "error", "-i", path,
+           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30,
+                              **_no_window_kwargs())
+        return proc.stdout if proc.returncode == 0 else b""
+    except Exception:
+        return b""
+
+
+def decode_audio_bytes(data, ffmpeg=None):
+    """Same, but for audio already in memory -- lets a clip inside a transcript
+    bundle play without ever being written to disk."""
+    if not data:
+        return b""
+    cmd = [ffmpeg or find_ffmpeg(), "-nostdin", "-loglevel", "error",
+           "-i", "pipe:0", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+           "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=30,
+                              **_no_window_kwargs())
+        return proc.stdout if proc.returncode == 0 else b""
+    except Exception:
+        return b""
+
+
 def _f32_to_s16_bytes(audio):
     """Gate segments are float32 in [-1, 1]; clips are int16 PCM."""
     clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
@@ -935,14 +963,7 @@ class ClipStore:
                     return w.readframes(w.getnframes())
             except Exception:
                 return b""
-        cmd = [self.ffmpeg, "-nostdin", "-loglevel", "error", "-i", path,
-               "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=30,
-                                  **_no_window_kwargs())
-            return proc.stdout if proc.returncode == 0 else b""
-        except Exception:
-            return b""
+        return decode_audio_file(path, self.ffmpeg)
 
     def index_for_day(self, day):
         """Every clip record saved on `day` (YYYYMMDD), oldest first."""
@@ -997,6 +1018,197 @@ class ClipStore:
             if r.get("feed") and r.get("ts") and r.get("id"):
                 out.setdefault((r["feed"], r["ts"]), []).append(r["id"])
         return out
+
+
+# --------------------------------------------------------------------------
+# Transcript bundles: a transcript plus the audio behind it, in one file.
+#
+# The point is to outlive purge_old_clips -- to keep an incident, or hand it to
+# someone else, after the 7-day clip retention has taken the originals. That
+# inverts the usual safety property, so it's deliberate and opt-in only.
+#
+# The container is a plain ZIP with a distinct extension. A private binary format
+# would be readable only by this app, which is a poor bet for something whose
+# whole purpose is archival: rename a .tscript to .zip and any tool gets the
+# transcript as JSON and the audio as ordinary .opus files. Using zipfile also
+# keeps this dependency-free on both architectures.
+#
+#   manifest.json    format/version/app, feed, day, span, counts
+#   transcript.json  [{"ts", "text", "clip"}, ...] in order
+#   clips/<id>.opus  only the clips the lines reference
+#
+# Clips are read straight out of the archive and decoded in memory (see
+# TranscriptBundle.load_pcm) rather than extracted: these are voice recordings,
+# and scattering copies through temp folders to play them would undo the care
+# taken everywhere else.
+# --------------------------------------------------------------------------
+TRANSCRIPT_FORMAT = "transcriber-transcript"
+TRANSCRIPT_VERSION = 1
+TRANSCRIPT_EXT = ".tscript"
+
+
+def write_transcript_bundle(path, feed, rows, store, app_version="", day=None):
+    """Write a .tscript bundle.
+
+    rows  -- [(ts, text, clip_id_or_None)], the shape load_day returns
+    store -- ClipStore (or TranscriptBundle) supplying the audio
+
+    Lines whose clip has already been purged are still written; they simply
+    carry no audio, exactly as they appear in the app. Returns
+    {"lines": n, "clips": n, "missing": [ids], "bytes": size}."""
+    import zipfile
+
+    entries, missing, added = [], [], {}
+    for ts, text, clip_id in rows:
+        rec = {"ts": ts, "text": text}
+        if clip_id:
+            src = store.path_for(clip_id) if hasattr(store, "path_for") else None
+            data = None
+            if src and os.path.isfile(src):
+                ext = os.path.splitext(src)[1]
+                with open(src, "rb") as f:
+                    data = f.read()
+            elif hasattr(store, "clip_bytes"):        # re-bundling a bundle
+                data, ext = store.clip_bytes(clip_id)
+            if data:
+                added[clip_id] = (f"clips/{clip_id}{ext}", data)
+                rec["clip"] = clip_id
+            else:
+                missing.append(clip_id)
+        entries.append(rec)
+
+    stamps = [r["ts"] for r in entries if r.get("ts")]
+    manifest = {
+        "format": TRANSCRIPT_FORMAT,
+        "version": TRANSCRIPT_VERSION,
+        "app_version": app_version,
+        "created": dt.datetime.now().isoformat(timespec="seconds"),
+        "feed": feed,
+        "day": day or "",
+        "lines": len(entries),
+        "clips": len(added),
+        "first": stamps[0] if stamps else "",
+        "last": stamps[-1] if stamps else "",
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        # The transcript compresses well; the clips are already Opus, so storing
+        # them uncompressed saves time and gains nothing to deflate.
+        z.writestr("transcript.json", json.dumps(entries, indent=2))
+        for name, data in added.values():
+            z.writestr(zipfile.ZipInfo(name), data,
+                       compress_type=zipfile.ZIP_STORED)
+    return {"lines": len(entries), "clips": len(added), "missing": missing,
+            "bytes": os.path.getsize(path)}
+
+
+class TranscriptBundle:
+    """A .tscript opened for review. Exposes the same (ts, text, clip_id) rows
+    the live views use, and decodes clips from inside the archive.
+
+    Use as a context manager, or call close(). Raises ValueError if the file
+    isn't a readable bundle."""
+
+    def __init__(self, path, ffmpeg=None):
+        import zipfile
+        self.path = path
+        self.ffmpeg = ffmpeg or find_ffmpeg()
+        try:
+            self._zip = zipfile.ZipFile(path, "r")
+        except Exception as e:
+            raise ValueError(f"Not a readable transcript file: {e}")
+        try:
+            self.manifest = json.loads(self._zip.read("manifest.json"))
+            entries = json.loads(self._zip.read("transcript.json"))
+        except KeyError:
+            self._zip.close()
+            raise ValueError("That file isn't a Transcriber transcript "
+                             "(no manifest inside).")
+        except Exception as e:
+            self._zip.close()
+            raise ValueError(f"That transcript file is damaged: {e}")
+        if self.manifest.get("format") != TRANSCRIPT_FORMAT:
+            self._zip.close()
+            raise ValueError("That file isn't a Transcriber transcript.")
+        if self.manifest.get("version", 0) > TRANSCRIPT_VERSION:
+            self._zip.close()
+            raise ValueError(
+                f"That transcript was written by a newer version of "
+                f"Transcriber (format {self.manifest['version']}). Update the "
+                f"app to open it.")
+
+        # Map clip id -> member name from what's actually in the archive, rather
+        # than trusting ids from the JSON to build paths.
+        self._members = {}
+        for name in self._zip.namelist():
+            if name.startswith("clips/") and "/" not in name[len("clips/"):]:
+                base = os.path.basename(name)
+                self._members[os.path.splitext(base)[0]] = name
+
+        self.rows = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            cid = e.get("clip")
+            self.rows.append((e.get("ts", ""), e.get("text", ""),
+                              cid if cid in self._members else None))
+
+    # -- context manager ---------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._zip.close()
+        except Exception:
+            pass
+
+    # -- what the viewer needs --------------------------------------------
+    @property
+    def feed(self):
+        return self.manifest.get("feed", "(unknown feed)")
+
+    @property
+    def day(self):
+        return self.manifest.get("day", "")
+
+    def clip_bytes(self, clip_id):
+        """(raw encoded bytes, extension) for a clip, or (None, "")."""
+        name = self._members.get(clip_id)
+        if not name:
+            return None, ""
+        try:
+            return self._zip.read(name), os.path.splitext(name)[1]
+        except Exception:
+            return None, ""
+
+    def load_pcm(self, clip_id):
+        """Decode a clip to raw PCM without extracting it. Same contract as
+        ClipStore.load_pcm, so the player and MP3 export take either source."""
+        data, ext = self.clip_bytes(clip_id)
+        if not data:
+            return b""
+        if ext == ".wav":
+            import io
+            import wave
+            try:
+                with wave.open(io.BytesIO(data), "rb") as w:
+                    return w.readframes(w.getnframes())
+            except Exception:
+                return b""
+        return decode_audio_bytes(data, self.ffmpeg)
+
+    def clip_info(self, clip_id):
+        """Minimal record for a clip, so MP3 export can name its output."""
+        for ts, text, cid in self.rows:
+            if cid == clip_id:
+                return {"id": clip_id, "feed": self.feed, "ts": ts,
+                        "text": text, "day": self.day}
+        return None
 
 
 MP3_DEFAULT_BITRATE = "64k"     # mono 16 kHz speech; plenty, and small
@@ -3325,13 +3537,17 @@ class Engine:
         if on:
             self.clips.start()
 
-    def play_clip(self, clip_id):
+    def play_clip(self, clip_id, source=None):
         """Play a saved clip through the speakers. Returns True if audio started.
-        Decoding runs on a worker thread so a click never blocks the UI."""
+        Decoding runs on a worker thread so a click never blocks the UI.
+        `source` overrides where the audio comes from -- anything with a
+        load_pcm(), which is how an opened transcript bundle plays its own
+        clips instead of the live store's."""
         if not (self.player and self.player.available and clip_id):
             return False
+        store = source if source is not None else self.clips
         def _go():
-            pcm = self.clips.load_pcm(clip_id)
+            pcm = store.load_pcm(clip_id)
             if pcm:
                 self.player.play_clip(pcm)
             else:

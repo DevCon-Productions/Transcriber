@@ -22,6 +22,9 @@ logs/
 # Recorded audio behind transcript lines. Voice recordings of live radio --
 # treat like logs, only more so. Never commit.
 clips/
+# Saved transcript bundles: the same audio plus its transcript, in one file, and
+# they deliberately outlive the clip retention. Same rule.
+*.tscript
 
 # === TTS voice models (large; downloaded on demand) ===
 tts_voices/

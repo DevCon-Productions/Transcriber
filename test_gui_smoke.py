@@ -4,6 +4,8 @@ Verifies: window builds, lines render in both unified and sectors views,
 view switching works, add/remove updates the listen choices. Does NOT load the
 Whisper model or touch the network (Engine is stubbed).
 """
+import time as _time_mod
+import zipfile
 import tkinter as tk
 import transcriber as core
 import gui
@@ -28,6 +30,14 @@ class FakeClips:
     def clip_info(self, clip_id):
         return self._real().clip_info(clip_id)
 
+    def path_for(self, clip_id):
+        # Bundling reads the clip files through this; without it the writer
+        # would treat every clip as missing.
+        return self._real().path_for(clip_id)
+
+    def load_pcm(self, clip_id):
+        return self._real().load_pcm(clip_id)
+
 
 class FakeEngine:
     def __init__(self, *a, **k):
@@ -40,9 +50,13 @@ class FakeEngine:
         self.clips = FakeClips()
         self.recording = {}
         self.played = []
+        self.play_sources = []      # None for live clips, the bundle when open
     def set_recording(self, name, on): self.recording[name] = on
     def set_clips_enabled(self, on): self.clips.enabled = on
-    def play_clip(self, clip_id): self.played.append(clip_id); return True
+    def play_clip(self, clip_id, source=None):
+        self.played.append(clip_id)
+        self.play_sources.append(source)
+        return True
     def stop_clip(self): pass
     def load_model(self): pass
     def start_streams(self, streams): self.added += [s["name"] for s in streams]
@@ -1127,6 +1141,105 @@ def run():
             gui.tk.Menu = real_menu
             panel.tag_remove("sel", "1.0", "end")
         app.view_mode.set("unified")
+        app.history.clear()
+        app._rebuild_body()
+
+        # --- Transcript bundles (.tscript) ------------------------------------
+        app.past_day = None
+        app.view_mode.set("unified")
+        app.history.clear()
+        app._rebuild_body()
+        # Give the fake clip store real audio so a bundle can carry it.
+        bstore = core.ClipStore({"clips": {"enabled": True}},
+                                clip_dir=app.engine.clips.dir)
+        bstore.start()
+        import numpy as _np
+        tone = (0.3 * _np.sin(_np.arange(core.SAMPLE_RATE // 2) * 0.05)
+                ).astype(_np.float32)
+        bid = bstore.save(active_feed, tone, text="bundle-line-one")
+        bstore._q.join()
+        bstore.stop()
+
+        for i, (txt, cid) in enumerate([("bundle-line-one", bid),
+                                        ("bundle-line-two", None)]):
+            app._append_line(active_feed, "cyan", txt, f"14:00:0{i}", cid)
+
+        # A selection recovers full rows -- text and timestamps, not just ids.
+        u = app.unified
+        u.tag_add("sel", "1.0", "end")
+        rows_sel = app._selected_rows()
+        results["bundle_selected_rows"] = (
+            [r[1] for r in rows_sel] == ["bundle-line-one", "bundle-line-two"]
+            and rows_sel[0][0] == "14:00:00" and rows_sel[0][3] == active_feed)
+        results["bundle_rows_keep_clipless"] = (rows_sel[1][2] is None)
+
+        bpath = os.path.join(tmp, "sel" + core.TRANSCRIPT_EXT)
+        gui.filedialog.asksaveasfilename = lambda *a, **k: bpath
+        app._export_selected_bundle()
+        # The write runs on a worker thread; wait for the file to land.
+        for _ in range(100):
+            if os.path.exists(bpath) and os.path.getsize(bpath) > 0:
+                break
+            app.root.update()
+            _time_mod.sleep(0.05)
+        results["bundle_export_writes"] = (os.path.exists(bpath)
+                                           and zipfile.is_zipfile(bpath))
+
+        # Opening it switches into review mode, named after the file.
+        gui.filedialog.askopenfilename = lambda *a, **k: bpath
+        app._open_bundle()
+        results["bundle_opened"] = (app.bundle is not None
+                                    and app.past_day is not None)
+        results["bundle_banner_names_file"] = (
+            "sel" + core.TRANSCRIPT_EXT in app._bundle_name)
+        shown_b = app.unified.get("1.0", "end")
+        results["bundle_shows_lines"] = ("bundle-line-one" in shown_b
+                                         and "bundle-line-two" in shown_b)
+        results["bundle_shows_marker"] = (shown_b.count("🔊") == 1)
+        # Clip playback must route to the BUNDLE, not the live store -- the
+        # originals may not exist wherever this file gets opened.
+        app.engine.played.clear()
+        app.engine.play_sources.clear()
+        app._play_clip(bid)
+        results["bundle_plays_from_bundle"] = (
+            app.engine.played == [bid]
+            and app.engine.play_sources[0] is app.bundle)
+        # MP3 export of an open bundle uses it as the source too.
+        results["bundle_is_clip_store"] = (app._clip_store() is app.bundle)
+
+        # Leaving review closes the archive (releases the file handle).
+        opened_zip = app.bundle
+        app._exit_past_day()
+        results["bundle_closed_on_exit"] = (app.bundle is None
+                                            and app.past_day is None)
+        try:
+            opened_zip._zip.read("manifest.json")
+            results["bundle_handle_released"] = False
+        except Exception:
+            results["bundle_handle_released"] = True
+
+        # A file that isn't a transcript reports it rather than blanking.
+        junk_b = os.path.join(tmp, "junk" + core.TRANSCRIPT_EXT)
+        with open(junk_b, "w", encoding="utf-8") as f:
+            f.write("not a bundle")
+        gui.filedialog.askopenfilename = lambda *a, **k: junk_b
+        errs3 = []
+        gui.messagebox.showerror = lambda *a, **k: errs3.append(a)
+        app._open_bundle()
+        results["bundle_bad_file_errors"] = (len(errs3) == 1
+                                             and app.bundle is None)
+
+        # Nothing selected -> explains itself, opens no save dialog.
+        # Leaving review rebuilt the body, so the old widget is gone.
+        u = app.unified
+        u.tag_remove("sel", "1.0", "end")
+        infos4 = []
+        asked2 = []
+        gui.messagebox.showinfo = lambda *a, **k: infos4.append(a)
+        gui.filedialog.asksaveasfilename = lambda *a, **k: asked2.append(1) or ""
+        app._export_selected_bundle()
+        results["bundle_empty_selection_informs"] = (len(infos4) == 1
+                                                     and not asked2)
         app.history.clear()
         app._rebuild_body()
 

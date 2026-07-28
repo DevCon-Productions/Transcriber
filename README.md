@@ -369,6 +369,40 @@ rather than failing the export.
 
 Encoding runs on a worker thread, so a long selection never freezes the window.
 
+#### Transcript files (`.tscript`) — text and audio in one file
+
+A transcript file keeps the lines **and the audio behind them** together, so an
+incident can be archived or handed to someone else. Unlike the live logs and
+clips, it isn't touched by any retention setting.
+
+- **Save selected as transcript file…** — right-click a row selection.
+- **Streams → Save whole day as transcript file…** — pick a feed and day.
+- **Streams → Open transcript file…** — opens it for review, exactly like a past
+  day: the text, with 🔊 on every line whose audio came along.
+
+It's an ordinary **ZIP with a different extension** — deliberately, not a private
+format. Rename it `.zip` and anything can read it:
+
+```
+manifest.json     format/version, feed, day, span, counts
+transcript.json   [{"ts", "text", "clip"}, ...]
+clips/*.opus      only the clips those lines reference
+```
+
+That matters for something meant to be an archive: the text is JSON and the audio
+is ordinary Opus, so it stays readable even without Transcriber. `zipfile` is
+stdlib, so this adds no dependency on either build.
+
+Clips are decoded **from inside the archive** rather than extracted, so opening
+one doesn't scatter copies of voice recordings through temp folders. Lines whose
+clip was already purged are still saved — they just carry no audio, and the
+status bar says how many.
+
+> **These files deliberately outlive `clips.retention_days`.** That's the point
+> of having them, but it does mean `purge_old_clips` can't reach inside one. They
+> contain PII and recorded voices: keep them somewhere you'd be comfortable
+> keeping the logs, and delete them yourself when done.
+
 #### Reviewing an earlier day
 
 The live window restores **today's** lines on launch. To go further back, use

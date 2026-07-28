@@ -294,6 +294,104 @@ def run():
                                                       clips=pstore,
                                                       log_dir=pdir) == [])
 
+    # ---- transcript bundles (.tscript) ------------------------------------
+    import zipfile
+    bdir = os.path.join(d, "bundle")
+    bstore = core.ClipStore(cfg, clip_dir=bdir)
+    bstore.start()
+    b_ids = [bstore.save("West", _tone(0.4), text=f"bundle line {i}")
+             for i in range(3)]
+    bstore._q.join()
+    b_rows = [("09:00:00", "bundle line 0", b_ids[0]),
+              ("09:00:01", "bundle line 1", b_ids[1]),
+              ("09:00:02", "no audio here", None),          # kept, just silent
+              ("09:00:03", "bundle line 2", b_ids[2])]
+
+    bpath = os.path.join(d, "incident" + core.TRANSCRIPT_EXT)
+    wres = core.write_transcript_bundle(bpath, "West", b_rows, bstore,
+                                        app_version="test", day="20260728")
+    results["bundle_written"] = (os.path.isfile(bpath) and wres["lines"] == 4
+                                 and wres["clips"] == 3 and wres["missing"] == [])
+
+    # It must be an ordinary ZIP anyone can open -- that's the whole argument
+    # for not inventing a private container.
+    with zipfile.ZipFile(bpath) as z:
+        names = z.namelist()
+        man = json.loads(z.read("manifest.json"))
+        tr = json.loads(z.read("transcript.json"))
+    results["bundle_is_zip"] = ("manifest.json" in names
+                                and "transcript.json" in names)
+    results["bundle_carries_clips"] = (
+        sum(1 for n in names if n.startswith("clips/")) == 3)
+    results["bundle_manifest"] = (man["format"] == core.TRANSCRIPT_FORMAT
+                                  and man["feed"] == "West"
+                                  and man["lines"] == 4 and man["clips"] == 3
+                                  and man["first"] == "09:00:00"
+                                  and man["last"] == "09:00:03")
+    results["bundle_text_readable"] = ([e["text"] for e in tr] ==
+                                       [r[1] for r in b_rows])
+
+    # Reading it back gives the same rows the live views use.
+    with core.TranscriptBundle(bpath) as b:
+        results["bundle_rows"] = (len(b.rows) == 4
+                                  and b.feed == "West" and b.day == "20260728")
+        results["bundle_keeps_clipless"] = (b.rows[2][2] is None
+                                            and b.rows[2][1] == "no audio here")
+        results["bundle_clip_ids"] = ([r[2] for r in b.rows] ==
+                                      [b_ids[0], b_ids[1], None, b_ids[2]])
+        # Audio decodes straight from inside the archive, no extraction.
+        pcm = b.load_pcm(b_ids[0])
+        results["bundle_plays_from_zip"] = (
+            abs(len(pcm) / 2 / core.SAMPLE_RATE - 0.4) < 0.15)
+        results["bundle_missing_clip"] = (b.load_pcm("nope") == b"")
+        results["bundle_clip_info"] = (
+            (b.clip_info(b_ids[1]) or {}).get("text") == "bundle line 1")
+        # MP3 export takes a bundle as its source unchanged.
+        bmp3 = os.path.join(d, "from_bundle.mp3")
+        mres = core.export_clips_mp3([b_ids[0], b_ids[2]], bmp3, b)
+        results["bundle_feeds_mp3"] = (mres["clips"] == 2
+                                       and os.path.getsize(bmp3) > 0)
+
+    # The audio survives the originals being purged -- the reason to save one.
+    for f in os.listdir(bdir):
+        os.remove(os.path.join(bdir, f))
+    results["bundle_outlives_purge"] = (bstore.load_pcm(b_ids[0]) == b"")
+    with core.TranscriptBundle(bpath) as b:
+        results["bundle_still_plays"] = (len(b.load_pcm(b_ids[0])) > 0)
+    bstore.stop()
+
+    # Malformed inputs fail with a clear message, never a traceback.
+    notzip = os.path.join(d, "notzip" + core.TRANSCRIPT_EXT)
+    with open(notzip, "w", encoding="utf-8") as f:
+        f.write("this is just text")
+    try:
+        core.TranscriptBundle(notzip)
+        results["bundle_rejects_nonzip"] = False
+    except ValueError:
+        results["bundle_rejects_nonzip"] = True
+
+    wrongzip = os.path.join(d, "wrong.zip")
+    with zipfile.ZipFile(wrongzip, "w") as z:
+        z.writestr("hello.txt", "not a transcript")
+    try:
+        core.TranscriptBundle(wrongzip)
+        results["bundle_rejects_other_zip"] = False
+    except ValueError:
+        results["bundle_rejects_other_zip"] = True
+
+    futurezip = os.path.join(d, "future" + core.TRANSCRIPT_EXT)
+    with zipfile.ZipFile(futurezip, "w") as z:
+        z.writestr("manifest.json", json.dumps({
+            "format": core.TRANSCRIPT_FORMAT,
+            "version": core.TRANSCRIPT_VERSION + 5, "feed": "X"}))
+        z.writestr("transcript.json", "[]")
+    try:
+        core.TranscriptBundle(futurezip)
+        results["bundle_rejects_future"] = False
+    except ValueError as e:
+        # Must say WHY, so the user knows to update rather than assume damage.
+        results["bundle_rejects_future"] = ("newer version" in str(e))
+
     # ---- the seam: gate segment -> Transcriber -> clip + id on the line ----
     # The unit checks above test the pieces; this tests them joined up, with a
     # stub model so no Whisper/GPU is involved.

@@ -871,10 +871,10 @@ class PastDayDialog(simpledialog.Dialog):
     lines it has and whether its audio is still on disk -- clips are purged on a
     shorter schedule than logs, so an older day is often text-only.
     result = (feed, 'YYYYMMDD')."""
-    def __init__(self, parent, app, names):
+    def __init__(self, parent, app, names, title="Open a past day"):
         self._app = app
         self._names = names
-        super().__init__(parent, title="Open a past day")
+        super().__init__(parent, title=title)
 
     def body(self, master):
         self.configure(bg=BG)
@@ -1290,6 +1290,18 @@ SAVING CLIPS AS AN MP3  (right-click the transcript)
   • Lines without a 🔊 are skipped; if a clip has already been deleted it's
     noted in the status bar rather than failing the whole export.
 
+TRANSCRIPT FILES — TEXT + AUDIO IN ONE FILE  (.tscript)
+  Saves the lines AND the audio behind them together, so you can archive an
+  incident or hand it to someone else. Nothing purges these.
+  • Right-click a selection → "Save selected as transcript file…", or
+    Streams → "Save whole day as transcript file…".
+  • Streams → "Open transcript file…" opens it for review just like a past day,
+    with 🔊 on every line whose audio came along.
+  • It's really a ZIP: rename it to .zip and you'll find the transcript as JSON
+    and the clips as ordinary .opus files, readable without this app.
+  • Because they outlast the clip retention, these files keep recorded voices
+    and PII indefinitely. Store and delete them as deliberately as the logs.
+
 GOING BACK A DAY  (Streams → Open a past day…)
   The window restores today's lines when it opens. For anything earlier, pick a
   feed and a day from the list — newest first, showing how many lines each day
@@ -1632,6 +1644,8 @@ class TranscriberGUI:
         self.past_day = None             # (feed, day) while reviewing a past day
         self._past_rows = []             # that day's [(ts, text, clip_id)]
         self._link_targets = {}          # "addr:N" -> (query, location)
+        self.bundle = None               # open TranscriptBundle, if any
+        self._bundle_name = ""           # its filename, for the banner
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
@@ -1955,6 +1969,43 @@ class TranscriberGUI:
         except ValueError:
             return (0, 0)
 
+    def _rendered_rows(self, widget):
+        """The rows currently drawn in `widget`, as (ts, text, clip_id, feed).
+
+        Rebuilt with the same filters _replay_history applies, so index N here is
+        the widget's line N+1 -- every transcript line renders as exactly one
+        logical line. That's what lets a row selection recover the text and
+        timestamps a clip id alone can't give."""
+        if self.past_day:
+            feed = self.past_day[0]
+            return [(ts, text, cid, feed) for ts, text, cid in self._past_rows]
+        if self.view_mode.get() == "unified":
+            return [(ts, text, cid, name)
+                    for name, _c, text, ts, unit, cid in self.history
+                    if self._passes_filter(unit)]
+        for name, w in self.sector_panels.items():
+            if w is widget:
+                return [(ts, text, cid, name)
+                        for n, _c, text, ts, unit, cid in self.history
+                        if n == name and self._passes_filter(unit)]
+        return []
+
+    def _selected_rows(self):
+        """Full (ts, text, clip_id, feed) for the selected rows, in order."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if not sel:
+                continue
+            lo, hi = self._line_no(sel[0]), self._line_no(sel[1])
+            src = self._rendered_rows(w)
+            rows = [src[i - 1] for i in range(lo, hi + 1) if 0 < i <= len(src)]
+            if rows:
+                return rows
+        return []
+
     def _selected_clip_ids(self):
         """Clip ids whose 🔊 marker falls inside the current selection, in the
         order they appear. Tk keeps `sel` per-widget, so this finds the one
@@ -2040,6 +2091,122 @@ class TranscriberGUI:
             note += f" ({len(res['missing'])} no longer on disk)"
         self._set_status(note)
 
+    # ----- transcript bundles (.tscript) ------------------------------------
+    def _write_bundle(self, feed, rows, day, suggested):
+        """Shared tail of both bundle exports: ask where, write on a thread."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save transcript file",
+            defaultextension=core.TRANSCRIPT_EXT, initialfile=suggested,
+            filetypes=[("Transcriber transcript", f"*{core.TRANSCRIPT_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        store = self._clip_store()
+        self._set_status(f"Writing {len(rows)} line(s) to "
+                         f"{os.path.basename(path)}…")
+
+        def _go():
+            try:
+                res = core.write_transcript_bundle(
+                    path, feed, [(ts, text, cid) for ts, text, cid, _f in rows],
+                    store, app_version=APP_VERSION, day=day)
+            except Exception as e:
+                self.events.put(("bundle_done", (False, str(e), None)))
+                return
+            self.events.put(("bundle_done",
+                             (True, os.path.basename(path), res)))
+
+        threading.Thread(target=_go, daemon=True, name="bundlewrite").start()
+
+    def _export_selected_bundle(self):
+        """Save the selected rows -- text and audio together -- as one file."""
+        rows = self._selected_rows()
+        if not rows:
+            messagebox.showinfo(
+                "Save transcript file",
+                "Select one or more transcript lines first.\n\nThe saved file "
+                "keeps the text and the audio together, so it can be opened "
+                "later even after the clips have been purged.",
+                parent=self.root)
+            return
+        feeds = {r[3] for r in rows}
+        feed = feeds.pop() if len(feeds) == 1 else "(multiple feeds)"
+        day = self.past_day[1] if self.past_day else \
+            _dt.datetime.now().strftime("%Y%m%d")
+        stem = core.safe_filename(feed if len(feeds) == 0 else "transcript")
+        self._write_bundle(feed, rows, day,
+                           f"{stem}-{day}-{len(rows)}lines{core.TRANSCRIPT_EXT}")
+
+    def _export_day_bundle(self):
+        """Archive a whole day for one feed, audio included."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Save transcript file", "No feeds to export.")
+            return
+        dlg = PastDayDialog(self.root, self, names,
+                            title="Save a whole day as a transcript file")
+        if not dlg.result:
+            return
+        feed, day = dlg.result
+        rows = core.load_day(feed, day, clips=self._clip_store())
+        if not rows:
+            messagebox.showinfo("Save transcript file",
+                                f"No saved transcript for “{feed}” on "
+                                f"{_fmt_day(day)}.", parent=self.root)
+            return
+        self._write_bundle(feed, [(ts, text, cid, feed) for ts, text, cid in rows],
+                           day, f"{core.safe_filename(feed)}-{day}"
+                                f"{core.TRANSCRIPT_EXT}")
+
+    def _handle_bundle_done(self, ok, msg, res):
+        if not ok:
+            messagebox.showerror("Save transcript file", msg, parent=self.root)
+            self._set_status("Transcript file failed.")
+            return
+        mb = res["bytes"] / 1e6
+        note = (f"Saved {res['lines']} line(s) and {res['clips']} clip(s) "
+                f"to {msg} ({mb:.1f} MB)")
+        if res["missing"]:
+            note += f" — {len(res['missing'])} clip(s) already purged"
+        self._set_status(note)
+
+    def _open_bundle(self):
+        """Open a .tscript for review: same view as a past day, audio included."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Open transcript file",
+            filetypes=[("Transcriber transcript", f"*{core.TRANSCRIPT_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            bundle = core.TranscriptBundle(path)
+        except ValueError as e:
+            messagebox.showerror("Open transcript file", str(e),
+                                 parent=self.root)
+            return
+        if not bundle.rows:
+            bundle.close()
+            messagebox.showinfo("Open transcript file",
+                                "That transcript file has no lines in it.",
+                                parent=self.root)
+            return
+        self._close_bundle()
+        self.bundle = bundle
+        self.past_day = (bundle.feed, bundle.day)
+        self._past_rows = bundle.rows
+        self._bundle_name = os.path.basename(path)
+        self._build_view()
+        n_clips = sum(1 for r in bundle.rows if r[2])
+        self._set_status(f"Opened {self._bundle_name}: {len(bundle.rows)} lines, "
+                         f"{n_clips} with audio.")
+
+    def _close_bundle(self):
+        if self.bundle is not None:
+            self.bundle.close()
+            self.bundle = None
+            self._bundle_name = ""
+
     # ----- reviewing a past day ---------------------------------------------
     def _open_past_day(self):
         """Streams → 'Open a past day…': pick a feed + day and review it."""
@@ -2070,14 +2237,21 @@ class TranscriberGUI:
         still recorded to history, so they appear on the way back."""
         self.past_day = None
         self._past_rows = []
+        self._close_bundle()             # release the archive's file handle
         if self.engine:
             self.engine.stop_clip()      # don't leave a clip playing over live
         self._build_view()
         self._set_status("Back to live.")
 
     def _clip_store(self):
-        """A ClipStore for reading saved clips. Reuses the engine's when it has
-        one so the directory always matches what's being written."""
+        """Where clip audio should be read from right now.
+
+        An open bundle wins: its clips live inside the archive and may no longer
+        exist on disk at all, which is the whole point of having saved it. It
+        exposes the same load_pcm/clip_info/path_for surface, so playback, MP3
+        export and re-bundling all work unchanged."""
+        if self.bundle is not None:
+            return self.bundle
         store = getattr(self.engine, "clips", None)
         return store if store is not None else \
             core.ClipStore(self.cfg, clip_dir=self._clip_dir())
@@ -2173,6 +2347,10 @@ class TranscriberGUI:
         streams_menu.add_separator()
         streams_menu.add_command(label="Open a past day...",
                                  command=self._open_past_day)
+        streams_menu.add_command(label="Open transcript file...",
+                                 command=self._open_bundle)
+        streams_menu.add_command(label="Save whole day as transcript file...",
+                                 command=self._export_day_bundle)
         streams_menu.add_command(label="Audio recording...",
                                  command=self._open_clip_settings)
         streams_menu.add_command(label="Export selected audio as MP3...",
@@ -2548,6 +2726,14 @@ class TranscriberGUI:
                 "Export selected audio as MP3…"
         menu.add_command(label=label, command=self._export_selected_mp3,
                          state="normal" if n else "disabled")
+        # Rows, not clips: a transcript file keeps lines that have no audio too.
+        rows = len(self._selected_rows())
+        menu.add_command(
+            label=(f"Save selected as transcript file ({rows} line"
+                   f"{'s' if rows != 1 else ''})…") if rows else
+                  "Save selected as transcript file…",
+            command=self._export_selected_bundle,
+            state="normal" if rows else "disabled")
         if widget is not None:
             menu.add_command(label="Select all", command=lambda w=widget: (
                 w.tag_add("sel", "1.0", "end"), w.focus_set()))
@@ -2569,10 +2755,14 @@ class TranscriberGUI:
 
         bar = tk.Frame(self.body, bg="#3a3320")     # amber: not live
         bar.pack(side="top", fill="x")
-        audio = (f"{n_clips} with audio" if n_clips else
-                 "no audio kept for this day")
-        tk.Label(bar, text=f"  Viewing {_fmt_day(day)} — {feed}   "
-                 f"({len(rows)} lines, {audio})",
+        if self.bundle is not None:
+            audio = f"{n_clips} with audio"
+            what = f"  Transcript file: {self._bundle_name} — {feed}"
+        else:
+            audio = (f"{n_clips} with audio" if n_clips else
+                     "no audio kept for this day")
+            what = f"  Viewing {_fmt_day(day)} — {feed}"
+        tk.Label(bar, text=f"{what}   ({len(rows)} lines, {audio})",
                  bg="#3a3320", fg="#f0d79a", anchor="w",
                  font=("Segoe UI", 10, "bold")).pack(side="left", pady=4)
         tk.Button(bar, text="Back to live", command=self._exit_past_day,
@@ -2786,6 +2976,8 @@ class TranscriberGUI:
                     self._set_status(payload)
                 elif kind == "mp3_done":
                     self._handle_mp3_done(*payload)
+                elif kind == "bundle_done":
+                    self._handle_bundle_done(*payload)
                 elif kind == "ready":
                     n, n_clips = getattr(self, "_restored", (0, 0))
                     if n:
@@ -2985,7 +3177,8 @@ class TranscriberGUI:
         if not self.engine.audio_available():
             self._set_status("No audio device available for playback.")
             return
-        if self.engine.play_clip(clip_id):
+        # An open bundle plays its own audio, straight out of the archive.
+        if self.engine.play_clip(clip_id, source=self.bundle):
             self._set_status("Playing saved audio for that line…")
 
     def _insert_clip_marker(self, widget, clip_id):
