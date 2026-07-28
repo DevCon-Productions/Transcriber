@@ -22,7 +22,7 @@ import queue
 import threading
 import collections
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 import tkinter.font as tkfont
 
 import transcriber as core
@@ -516,7 +516,7 @@ class CatalogDialog(tk.Toplevel):
         super().__init__(parent)
         self.app = app
         self.title("Feeds")
-        self.geometry("600x460")
+        self.geometry("680x460")
         self.configure(bg=BG)
         self.transient(parent)
 
@@ -531,6 +531,10 @@ class CatalogDialog(tk.Toplevel):
         btns = tk.Frame(self, bg=BG2)
         btns.pack(side="bottom", fill="x")
         tk.Button(btns, text="+ Add new feed", command=self._add_new,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
+        tk.Button(btns, text="Export list...", command=self._export_list,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
+        tk.Button(btns, text="Import list...", command=self._import_list,
                   bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
         tk.Button(btns, text="Close", command=self.destroy,
                   bg=BG2, fg=FG, relief="flat").pack(side="right", padx=4, pady=6)
@@ -573,6 +577,8 @@ class CatalogDialog(tk.Toplevel):
             tk.Button(row, text="Delete", command=lambda n=name: self._delete(n),
                       bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
             tk.Button(row, text="Edit", command=lambda n=name: self._edit(n),
+                      bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
+            tk.Button(row, text="PDF", command=lambda n=name: self._pdf(n),
                       bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
             # Toggle action: active feeds get "Remove" (stop transcribing); the
             # rest get "Add" (start). Both keep the feed in the library.
@@ -675,6 +681,152 @@ class CatalogDialog(tk.Toplevel):
                                parent=self):
             self.app._lib_delete([name])
             self._render()
+
+    def _pdf(self, name):
+        """Row 'PDF': save this feed's transcript, feed pre-selected."""
+        self.app._export_pdf(name)
+
+    def _export_list(self):
+        self.app._export_feeds()
+
+    def _import_list(self):
+        self.app._import_feeds()
+        self._render()               # imported feeds appear as new rows
+
+
+def _fmt_day(day):
+    """'20260719' -> '2026-07-19'. Falls back to the raw string if it's odd."""
+    return f"{day[:4]}-{day[4:6]}-{day[6:8]}" if len(day) == 8 else day
+
+
+class ImportConflictDialog(simpledialog.Dialog):
+    """Asked only when an imported list names feeds already in the library.
+    result = 'skip' | 'replace' | 'rename' (or None if cancelled)."""
+    def __init__(self, parent, total, dupes):
+        self._total = total
+        self._dupes = dupes
+        super().__init__(parent, title="Feeds already in library")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        n = len(self._dupes)
+        tk.Label(master, text=f"{n} of {self._total} imported feed"
+                 f"{'s' if self._total != 1 else ''} already exist by name:",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold"), anchor="w",
+                 wraplength=380, justify="left").pack(anchor="w", padx=10, pady=(10, 4))
+        shown = ", ".join(self._dupes[:6]) + (" …" if n > 6 else "")
+        tk.Label(master, text=shown, bg=BG, fg=MUTED, wraplength=380,
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.mode = tk.StringVar(value="skip")
+        for val, lab in [
+                ("skip", "Skip them — keep what I already have"),
+                ("replace", "Replace them with the imported version"),
+                ("rename", "Keep both — import as “Name (2)”")]:
+            tk.Radiobutton(master, text=lab, variable=self.mode, value=val,
+                           bg=BG, fg=FG, selectcolor=BG2, activebackground=BG,
+                           activeforeground=FG, anchor="w").pack(
+                               anchor="w", padx=14, pady=1)
+        tk.Label(master, text="Feeds that aren't duplicates are imported either way.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(
+                     anchor="w", padx=10, pady=(8, 6))
+        return None
+
+    def apply(self):
+        self.result = self.mode.get()
+
+
+class PdfExportDialog(simpledialog.Dialog):
+    """Pick what goes into the PDF: which feed, and whether to use the current
+    on-screen session or saved daily logs. result = (feed, source, days)
+    where source is 'session' | 'logs' and days is a list of 'YYYYMMDD'."""
+    def __init__(self, parent, app, names, preselect=None):
+        self._app = app
+        self._names = names
+        self._preselect = preselect if preselect in names else names[0]
+        super().__init__(parent, title="Save transcript as PDF")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+
+        tk.Label(master, text="Feed", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w",
+                                                     padx=10, pady=(10, 2))
+        self.feed = tk.StringVar(value=self._preselect)
+        combo = ttk.Combobox(master, textvariable=self.feed, values=self._names,
+                             state="readonly", width=36)
+        combo.grid(row=0, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.feed.trace_add("write", lambda *_: self._refresh_days())
+
+        tk.Label(master, text="Include", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="nw",
+                                                     padx=10, pady=(10, 2))
+        box = tk.Frame(master, bg=BG)
+        box.grid(row=1, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.source = tk.StringVar(value="logs")
+        for val, lab in [("session", "This session (what's on screen)"),
+                         ("logs", "Saved logs — pick days below")]:
+            tk.Radiobutton(box, text=lab, variable=self.source, value=val,
+                           bg=BG, fg=FG, selectcolor=BG2, activebackground=BG,
+                           activeforeground=FG, anchor="w",
+                           command=self._sync_state).pack(anchor="w")
+
+        self.days_label = tk.Label(master, text="Days", bg=BG, fg=FG,
+                                   font=("Segoe UI", 10, "bold"))
+        self.days_label.grid(row=2, column=0, sticky="nw", padx=10, pady=(8, 2))
+        listwrap = tk.Frame(master, bg=BG)
+        listwrap.grid(row=2, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.daylist = tk.Listbox(listwrap, height=7, width=34,
+                                  selectmode="extended", bg=BG2, fg=FG,
+                                  highlightthickness=0, activestyle="none",
+                                  exportselection=False)
+        self.daylist.pack(side="left")
+        sb = tk.Scrollbar(listwrap, command=self.daylist.yview)
+        sb.pack(side="left", fill="y")
+        self.daylist.config(yscrollcommand=sb.set)
+        tk.Label(master, text="Ctrl/Shift-click for several days. "
+                 "Nothing selected = all of them.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=3, column=1, sticky="w", padx=10, pady=(0, 8))
+
+        self._refresh_days()
+        self._sync_state()
+        return combo
+
+    def _refresh_days(self):
+        self._days = [d for d, _p in core.log_files_for(self.feed.get())]
+        self.daylist.delete(0, "end")
+        for d in reversed(self._days):                 # newest first
+            self.daylist.insert("end", _fmt_day(d))
+        if not self._days:
+            self.daylist.insert("end", "(no saved logs for this feed)")
+            self.source.set("session")
+        self._sync_state()
+
+    def _sync_state(self):
+        on = self.source.get() == "logs" and bool(getattr(self, "_days", []))
+        self.daylist.config(state="normal" if on else "disabled")
+        self.days_label.config(fg=FG if on else MUTED)
+
+    def validate(self):
+        if self.source.get() == "logs" and not self._days:
+            messagebox.showwarning("No logs", "That feed has no saved logs. "
+                                   "Choose 'This session' instead.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        if self.source.get() == "session":
+            self.result = (self.feed.get(), "session", [])
+            return
+        # The listbox shows newest-first; hand back days oldest-first so the PDF
+        # reads chronologically.
+        sel = self.daylist.curselection()
+        shown = list(reversed(self._days))
+        days = [shown[i] for i in sel] if sel else list(self._days)
+        self.result = (self.feed.get(), "logs", sorted(days))
 
 
 class TTSDialog(tk.Toplevel):
@@ -888,7 +1040,30 @@ FEEDS  (toolbar "Feeds" button / Streams menu)
   • + Add new feed – save a new feed (Broadcastify feed id / URL, or a PC-audio
                      or application source). New feeds are saved but NOT started
                      until you click Add.
+  • PDF      – save that feed's transcript as a PDF (see SAVING below).
   • Drag the ⠿ handle to reorder feeds; the order is remembered.
+
+MOVING YOUR FEED LIST  (Feeds window, or Streams menu)
+  • Export list – writes every saved feed to a .json file you can back up or
+                  carry to another PC.
+  • Import list – reads one back in. Imported feeds are SAVED only; nothing
+                  starts transcribing until you click Add. If a name already
+                  exists you choose: skip it, replace it, or keep both.
+  The file holds feeds only — never your model/GPU settings — so a list exported
+  from the standard (x64) build imports into the ARM64 build and vice versa. Two
+  kinds of feed are tied to the machine they were made on: "pc audio" feeds name
+  a specific speaker device, and "application" feeds capture a running program
+  (not supported at all on ARM64). Those import fine but need re-pointing, and
+  the app tells you which ones after an import.
+  You can also point Import at another install's config.json directly.
+
+SAVING A TRANSCRIPT AS PDF  (Streams menu, or the PDF button on a feed row)
+  Pick a feed and what to include:
+  • This session – exactly what's on screen for that feed right now.
+  • Saved logs   – pick one day, several (Ctrl/Shift-click), or leave the day
+                   list alone to take all of them.
+  The PDF is timestamped, wrapped, and page-numbered. Note that logs are purged
+  after the retention period, so old days may no longer be listed.
 
 VIEWS  (toolbar / View menu)
   • Sectors  – one scrolling column per feed, side by side. Drag a column's
@@ -1378,12 +1553,146 @@ class TranscriberGUI:
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
+    # ----- feed list export / import ---------------------------------------
+    def _export_feeds(self):
+        """Write the whole library to a portable .json the other install (or
+        another machine, or the other architecture) can import."""
+        if not self.library:
+            messagebox.showinfo("Export feeds", "The feed library is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Export feed list",
+            defaultextension=".json", initialfile="transcriber-feeds.json",
+            filetypes=[("Transcriber feed list", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            n = core.export_feeds(path, self.library, app_version=APP_VERSION)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+        self._set_status(f"Exported {n} feed{'s' if n != 1 else ''} to "
+                         f"{os.path.basename(path)}")
+
+    def _import_feeds(self):
+        """Read a feed list and merge it into the library. Imported feeds are
+        saved only -- nothing starts transcribing until the user clicks Add."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Import feed list",
+            filetypes=[("Transcriber feed list", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            feeds, warnings = core.import_feeds(path)
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
+            return
+
+        dupes = [f["name"] for f in feeds if self._lib_find(f["name"])]
+        mode = "add"
+        if dupes:
+            dlg = ImportConflictDialog(self.root, len(feeds), dupes)
+            if not dlg.result:
+                return
+            mode = dlg.result           # "skip" | "replace" | "rename"
+
+        added = replaced = skipped = 0
+        for entry in feeds:
+            if self._lib_find(entry["name"]):
+                if mode == "skip":
+                    skipped += 1
+                    continue
+                if mode == "replace":
+                    self._lib_upsert(entry)
+                    replaced += 1
+                    continue
+                entry = dict(entry)
+                entry["name"] = self._unique_lib_name(entry["name"])
+            self._lib_upsert(entry)
+            added += 1
+        self._save_cfg()
+
+        parts = []
+        if added:
+            parts.append(f"{added} added")
+        if replaced:
+            parts.append(f"{replaced} replaced")
+        if skipped:
+            parts.append(f"{skipped} skipped (already in library)")
+        summary = f"Imported from {os.path.basename(path)}: " + \
+                  (", ".join(parts) or "nothing to do") + "."
+        if warnings:
+            summary += "\n\nNote:\n  • " + "\n  • ".join(warnings)
+        messagebox.showinfo("Import feeds", summary, parent=self.root)
+        self._set_status(", ".join(parts) or "Nothing imported.")
+
+    def _unique_lib_name(self, name):
+        """'Cleveland West' -> 'Cleveland West (2)' when the name is taken."""
+        n = 2
+        while self._lib_find(f"{name} ({n})"):
+            n += 1
+        return f"{name} ({n})"
+
+    # ----- transcript -> PDF -----------------------------------------------
+    def _export_pdf(self, name=None):
+        """Save one feed's transcript as a PDF: either the current on-screen
+        session, or the saved daily logs."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Save as PDF", "No feeds to export.")
+            return
+        dlg = PdfExportDialog(self.root, self, names, preselect=name)
+        if not dlg.result:
+            return
+        feed, source, days = dlg.result
+
+        if source == "session":
+            # history rows are (name, color, text, ts, unit); the PDF wants the
+            # same "[HH:MM:SS] text" shape the disk logs use.
+            lines = [f"[{ts}] {text}" for nm, _c, text, ts, _u in self.history
+                     if nm == feed]
+            subtitle = f"Current session — {len(lines)} lines"
+        else:
+            paths = [p for d, p in core.log_files_for(feed) if d in days]
+            lines = core.read_log_lines(paths)
+            span = (f"{_fmt_day(days[0])} – {_fmt_day(days[-1])}"
+                    if len(days) > 1 else _fmt_day(days[0]))
+            subtitle = f"{span} — {len(lines)} lines"
+        if not lines:
+            messagebox.showinfo("Save as PDF",
+                                f"No transcript lines for “{feed}”.",
+                                parent=self.root)
+            return
+
+        default = f"{core.safe_filename(feed)}-transcript.pdf"
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title=f"Save “{feed}” transcript as PDF",
+            defaultextension=".pdf", initialfile=default,
+            filetypes=[("PDF document", "*.pdf"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            pages = core.write_transcript_pdf(path, feed, lines, subtitle=subtitle)
+        except Exception as e:
+            messagebox.showerror("PDF export failed", str(e))
+            return
+        self._set_status(f"Saved {len(lines)} lines to "
+                         f"{os.path.basename(path)} ({pages} page"
+                         f"{'s' if pages != 1 else ''})")
+
     # ----- UI construction -------------------------------------------------
     def _build_menu(self):
         m = tk.Menu(self.root)
         streams_menu = tk.Menu(m, tearoff=0)
         streams_menu.add_command(label="Feeds...", command=self._open_library)
         streams_menu.add_command(label="Broadcastify login...", command=self._open_login)
+        streams_menu.add_separator()
+        streams_menu.add_command(label="Export feed list...", command=self._export_feeds)
+        streams_menu.add_command(label="Import feed list...", command=self._import_feeds)
+        streams_menu.add_separator()
+        streams_menu.add_command(label="Save transcript as PDF...",
+                                 command=self._export_pdf)
         streams_menu.add_separator()
         streams_menu.add_command(label="Save config", command=self._save_cfg)
         m.add_cascade(label="Streams", menu=streams_menu)

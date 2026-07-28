@@ -275,6 +275,7 @@ Cleveland feeds **plus anything you add**). Per row:
 - **Edit** — fix a typo, rename, change color, or update a changed URL. If the
   feed is currently active, it restarts live with the new settings.
 - **Delete** — permanently forget the feed.
+- **PDF** — save that feed's transcript as a PDF (see below).
 - **+ Add new feed** — add a brand-new feed (URL or feed id). It's saved to the
   library but does **not** start transcribing until you click its **Add**.
 - **Reorder** — drag the **⠿** handle on the left of a row up or down to change
@@ -282,6 +283,48 @@ Cleveland feeds **plus anything you add**). Per row:
 
 The built-in Cleveland feeds are: Cleveland West, Cleveland Citywide (covers east
 side), Cleveland Fire/EMS, Westlake/WestCom, and East Cleveland.
+
+### Exporting / importing the feed list
+
+**Export list…** (Feeds window, or Streams → Export feed list…) writes your whole
+library to a small JSON file. **Import list…** reads one back and merges it in.
+
+- Imported feeds are **saved only** — nothing starts transcribing until you click
+  **Add** on the row.
+- On a name collision you pick once for the whole import: **skip** (keep yours),
+  **replace** (take theirs), or **keep both** (imports as `Name (2)`).
+- Import also accepts a raw `config.json` from another install, so you don't have
+  to export first if you already have one in hand.
+
+**x64 ↔ ARM64:** the file carries feeds only — never `model` / `device` /
+`compute_type` / `engine` — so a list moves cleanly between the two builds. That
+matters because the two installs keep **separate** data directories
+(`%APPDATA%\Transcriber` vs `%APPDATA%\Transcriber-ARM64`) and have very
+different engine defaults (large-v3 on CUDA vs. a small whisper.cpp model);
+carrying engine settings across would hand an ARM machine a model it can't run.
+
+URL feeds are fully portable. Two feed types are bound to the machine that
+created them and are reported as warnings after import rather than silently
+dropped:
+
+| Feed type | Travels? | Why |
+|---|---|---|
+| URL / Broadcastify | Yes | Just a URL |
+| `pc audio` | Needs re-pointing | Names a specific output device on the old PC |
+| `application` | No on ARM64 | Per-app capture has no ARM64 build; the pid is session-only |
+
+### Saving a transcript as PDF
+
+Streams → **Save transcript as PDF…**, or the **PDF** button on a feed row. Choose
+the feed, then what to include:
+
+- **This session** — what's currently on screen for that feed.
+- **Saved logs** — one day, several (Ctrl/Shift-click), or all of them if you
+  select none. Only days still on disk appear (see `log_retention_days`).
+
+Output is a timestamped, wrapped, page-numbered PDF. The writer is plain stdlib —
+no reportlab — so it behaves identically on the x64 and ARM64 builds and adds
+nothing to either installer.
 
 ## How it works
 

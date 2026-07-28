@@ -325,6 +325,305 @@ def is_enabled(stream):
 
 
 # --------------------------------------------------------------------------
+# Feed-list export / import.
+#
+# The exported file holds ONLY feed entries -- never the engine settings around
+# them (model/device/compute_type/engine). That is deliberate: the x64 build
+# defaults to large-v3 on CUDA and the ARM64 build to a small whisper.cpp model,
+# and the two installs keep SEPARATE data dirs (see _user_data_dir). Carrying
+# engine keys across would hand an ARM machine a 3 GB CUDA model it can't run.
+# Feed entries themselves are plain data, so a list exported on either
+# architecture imports cleanly into the other.
+#
+# Two fields do NOT travel meaningfully and are dropped on export:
+#   pid        -- a process id; meaningless in another session, let alone another box
+#   disabled   -- "currently transcribing" is per-install state, not part of the feed
+# Two feed TYPES are machine-bound even though they survive the round trip:
+#   pcaudio    -- names a local output device that may not exist on the target
+#   app        -- per-app capture has no ARM64 build (proctap_available() is False)
+# import_feeds() reports both in `warnings` rather than silently dropping them.
+# --------------------------------------------------------------------------
+FEED_EXPORT_FORMAT = "transcriber-feeds"
+FEED_EXPORT_VERSION = 1
+
+# Per-feed keys that are portable between machines and architectures.
+FEED_PORTABLE_KEYS = ("name", "url", "type", "provider", "color", "location",
+                      "desc", "output_device", "app_name")
+
+
+def _clean_feed(entry):
+    """Strip a feed entry down to its portable keys (see module notes above)."""
+    return {k: entry[k] for k in FEED_PORTABLE_KEYS
+            if k in entry and entry[k] not in (None, "")}
+
+
+def export_feeds(path, feeds, app_version=None):
+    """Write `feeds` (a list of feed dicts) to `path` as a portable JSON file.
+    Returns the number of feeds written."""
+    clean = [_clean_feed(e) for e in feeds if e.get("name")]
+    doc = {
+        "format": FEED_EXPORT_FORMAT,
+        "version": FEED_EXPORT_VERSION,
+        "exported": dt.datetime.now().isoformat(timespec="seconds"),
+        "app_version": app_version or "",
+        "feeds": clean,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    return len(clean)
+
+
+def import_feeds(path):
+    """Read a feed list from `path`. Returns (feeds, warnings).
+
+    Accepts, in order of preference:
+      - a file written by export_feeds()               {"format": ..., "feeds": [...]}
+      - a bare JSON array of feed dicts                [{...}, {...}]
+      - a whole config.json                            (uses feed_library + streams)
+    The last case means a user can point this at the other architecture's
+    config.json directly and still get their feeds. Raises ValueError if the file
+    parses but holds no recognisable feeds."""
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+
+    if isinstance(doc, list):
+        raw = doc
+    elif isinstance(doc, dict) and isinstance(doc.get("feeds"), list):
+        raw = doc["feeds"]
+    elif isinstance(doc, dict) and ("feed_library" in doc or "streams" in doc):
+        # A full config.json: library first, then any active streams not in it.
+        raw, seen = [], set()
+        for e in list(doc.get("feed_library") or []) + list(doc.get("streams") or []):
+            if isinstance(e, dict) and e.get("name") and e["name"] not in seen:
+                seen.add(e["name"])
+                raw.append(e)
+    else:
+        raise ValueError("Not a Transcriber feed list (no 'feeds' array found).")
+
+    feeds, warnings = [], []
+    for e in raw:
+        if not isinstance(e, dict) or not e.get("name"):
+            continue
+        entry = _clean_feed(e)
+        kind = entry.get("type")
+        if kind == "app":
+            # Per-app capture: the pid is gone (not exported) and on ARM64 the
+            # proctap native module doesn't exist at all.
+            if not proctap_available():
+                warnings.append(f"“{entry['name']}” captures an application — "
+                                "per-app capture isn't available on this build.")
+            else:
+                warnings.append(f"“{entry['name']}” captures an application — "
+                                "re-pick the running app before starting it.")
+        elif kind == "pcaudio":
+            dev = entry.get("output_device")
+            names = [n for n, _d in list_output_devices()]
+            if dev and names and dev not in names:
+                warnings.append(f"“{entry['name']}” captures speakers named "
+                                f"“{dev}”, which this machine doesn't have.")
+        feeds.append(entry)
+
+    if not feeds:
+        raise ValueError("No feeds found in that file.")
+    return feeds, warnings
+
+
+# --------------------------------------------------------------------------
+# Transcript -> PDF.
+#
+# Written by hand against the PDF 1.4 spec rather than pulling in reportlab:
+# the ARM64 build installs from a hand-curated wheel list (requirements-arm.txt)
+# and every added dependency is a wheel that might not exist for win_arm64. This
+# needs no dependency at all, so PDF export behaves identically on both builds.
+#
+# Scope matches the content: transcripts are plain text, so this emits the base-14
+# fonts (Courier body / Helvetica headings), which every reader has built in and
+# which need no font embedding.
+# --------------------------------------------------------------------------
+PDF_PAGE_W, PDF_PAGE_H = 612.0, 792.0        # US Letter, in points
+PDF_MARGIN = 54.0                            # 0.75"
+PDF_BODY_SIZE = 9.0
+PDF_LEADING = 11.5
+# Courier is metrically fixed: every glyph is exactly 0.6 em wide.
+PDF_COURIER_WIDTH = 0.6
+
+
+def _pdf_escape(text):
+    """Encode a string for a PDF literal. PDF's base-14 fonts use WinAnsi, so
+    anything outside latin-1 (a stray smart quote from the transcriber) becomes
+    '?' rather than corrupting the stream."""
+    out = []
+    for ch in text:
+        if ch in "()\\":
+            out.append("\\" + ch)
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            try:
+                b = ch.encode("cp1252")
+            except (UnicodeEncodeError, LookupError):
+                out.append("?")
+                continue
+            out.append("".join(f"\\{c:03o}" for c in b))
+    return "".join(out)
+
+
+def _pdf_wrap(text, max_chars):
+    """Word-wrap to `max_chars`, breaking any single word longer than a line.
+    Always returns at least one (possibly empty) line."""
+    if max_chars < 8:
+        max_chars = 8
+    lines, cur = [], ""
+    for word in text.split():
+        while len(word) > max_chars:            # unbreakable run (URL, long id)
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:max_chars])
+            word = word[max_chars:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= max_chars:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines
+
+
+def write_transcript_pdf(path, title, lines, subtitle=""):
+    """Render a transcript to a PDF at `path`.
+
+    title    -- feed name, shown as the heading on page 1 and in the tab title
+    lines    -- iterable of transcript strings, e.g. "[20:50:01] Copy that."
+    subtitle -- optional grey line under the title (date range, source, count)
+
+    Returns the number of pages written."""
+    usable_w = PDF_PAGE_W - 2 * PDF_MARGIN
+    max_chars = int(usable_w / (PDF_BODY_SIZE * PDF_COURIER_WIDTH))
+
+    # Lay out: wrap every line, then fill pages. Continuation lines are indented
+    # to the width of a "[HH:MM:SS] " stamp so the timestamp column stays readable.
+    body = []
+    for raw in lines:
+        raw = raw.rstrip("\n")
+        wrapped = _pdf_wrap(raw, max_chars) if raw.strip() else [""]
+        body.append(wrapped[0])
+        body.extend(" " * 11 + w for w in wrapped[1:])
+
+    first_top = PDF_PAGE_H - PDF_MARGIN - 46      # room for title block on page 1
+    rest_top = PDF_PAGE_H - PDF_MARGIN
+    bottom = PDF_MARGIN + 16                      # room for the page footer
+    first_rows = max(1, int((first_top - bottom) / PDF_LEADING))
+    rest_rows = max(1, int((rest_top - bottom) / PDF_LEADING))
+
+    pages, i = [], 0
+    if not body:
+        body = ["(no transcript lines)"]
+    while i < len(body):
+        rows = first_rows if not pages else rest_rows
+        pages.append(body[i:i + rows])
+        i += rows
+    total = len(pages)
+
+    def content_stream(idx, rows):
+        parts = []
+        y = rest_top
+        if idx == 0:
+            y = PDF_PAGE_H - PDF_MARGIN - 14
+            parts.append(f"BT /F2 15 Tf 1 1 1 rg {PDF_MARGIN} {y:.1f} Td "
+                         f"({_pdf_escape(title)}) Tj ET")
+            parts.append("0 0 0 rg")
+            if subtitle:
+                y -= 15
+                parts.append(f"BT /F1 8.5 Tf 0.35 0.35 0.35 rg {PDF_MARGIN} "
+                             f"{y:.1f} Td ({_pdf_escape(subtitle)}) Tj ET")
+            y -= 10
+            parts.append(f"0.8 0.8 0.8 RG 0.6 w {PDF_MARGIN} {y:.1f} m "
+                         f"{PDF_PAGE_W - PDF_MARGIN} {y:.1f} l S")
+            y = first_top
+        parts.append("0 0 0 rg")
+        parts.append(f"BT /F1 {PDF_BODY_SIZE} Tf {PDF_LEADING} TL "
+                     f"{PDF_MARGIN} {y:.1f} Td")
+        for row in rows:
+            parts.append(f"({_pdf_escape(row)}) Tj T*")
+        parts.append("ET")
+        foot = f"Page {idx + 1} of {total}"
+        parts.append(f"BT /F1 8 Tf 0.45 0.45 0.45 rg "
+                     f"{PDF_PAGE_W - PDF_MARGIN - len(foot) * 8 * PDF_COURIER_WIDTH:.1f} "
+                     f"{PDF_MARGIN - 2:.1f} Td ({_pdf_escape(foot)}) Tj ET")
+        return "\n".join(parts).encode("latin-1", "replace")
+
+    # --- assemble the file: 1 catalog + 1 pages node + 2 fonts + 2 objs/page ---
+    objs = {}                                    # number -> bytes (object body)
+    n_catalog, n_pages, n_f1, n_f2 = 1, 2, 3, 4
+    first_page_obj = 5
+    page_nums = [first_page_obj + 2 * i for i in range(total)]
+
+    objs[n_catalog] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join(f"{n} 0 R" for n in page_nums)
+    objs[n_pages] = (f"<< /Type /Pages /Count {total} /Kids [{kids}] >>"
+                     ).encode("latin-1")
+    objs[n_f1] = (b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier "
+                  b"/Encoding /WinAnsiEncoding >>")
+    objs[n_f2] = (b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+                  b"/Encoding /WinAnsiEncoding >>")
+    for idx, rows in enumerate(pages):
+        pnum = page_nums[idx]
+        cnum = pnum + 1
+        data = content_stream(idx, rows)
+        objs[pnum] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_W:g} {PDF_PAGE_H:g}] "
+            f"/Resources << /Font << /F1 {n_f1} 0 R /F2 {n_f2} 0 R >> >> "
+            f"/Contents {cnum} 0 R >>").encode("latin-1")
+        objs[cnum] = (f"<< /Length {len(data)} >>\nstream\n".encode("latin-1")
+                      + data + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += f"{num} 0 obj\n".encode("latin-1") + objs[num] + b"\nendobj\n"
+    xref_at = len(out)
+    count = max(objs) + 1
+    out += f"xref\n0 {count}\n".encode("latin-1")
+    out += b"0000000000 65535 f \n"
+    for num in range(1, count):
+        out += f"{offsets.get(num, 0):010d} 00000 n \n".encode("latin-1")
+    out += (f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n"
+            f"{xref_at}\n%%EOF\n").encode("latin-1")
+
+    with open(path, "wb") as f:
+        f.write(bytes(out))
+    return total
+
+
+def log_files_for(stream_name, log_dir=LOG_DIR):
+    """Every saved log file for a feed, oldest first: [(YYYYMMDD, path), ...]."""
+    pattern = os.path.join(log_dir, f"{safe_filename(stream_name)}-*.log")
+    out = []
+    for p in glob.glob(pattern):
+        day = os.path.splitext(os.path.basename(p))[0].rsplit("-", 1)[-1]
+        if len(day) == 8 and day.isdigit():
+            out.append((day, p))
+    return sorted(out)
+
+
+def read_log_lines(paths):
+    """Read transcript lines from log files, in the order given. Unreadable files
+    are skipped -- a partial export beats no export."""
+    lines = []
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines.extend(ln.rstrip("\n") for ln in f)
+        except OSError:
+            continue
+    return lines
+
+
+# --------------------------------------------------------------------------
 # Call-sign / unit extraction.
 #
 # On police/fire radio, units self-identify ("Adam 33", "Engine 14", "Medic 7").

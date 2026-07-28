@@ -649,6 +649,174 @@ def run():
         if app._update_dialog:
             app._update_dialog.destroy()
 
+        # --- Feed list export / import ---------------------------------------
+        import json
+        import os
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="guifeeds_")
+        exported = os.path.join(tmp, "feeds.json")
+        gui.filedialog.asksaveasfilename = lambda *a, **k: exported
+        app._export_feeds()
+        doc = json.load(open(exported, encoding="utf-8"))
+        names = [f["name"] for f in doc["feeds"]]
+        results["export_wrote_file"] = (doc["format"] == core.FEED_EXPORT_FORMAT
+                                        and names == [e["name"] for e in app.library])
+        results["export_no_engine_keys"] = ("model" not in doc and "device" not in doc)
+
+        # Import a list with one new feed and one that collides by name.
+        incoming = os.path.join(tmp, "incoming.json")
+        core.export_feeds(incoming, [
+            {"name": "Imported Feed", "url": "https://audio.example/9.mp3",
+             "color": "magenta", "provider": "broadcastify"},
+            {"name": "West", "url": "https://audio.example/CHANGED.mp3",
+             "color": "blue", "provider": "broadcastify"},
+        ])
+        gui.filedialog.askopenfilename = lambda *a, **k: incoming
+
+        class FakeConflict:
+            mode = "skip"
+            def __init__(self, *a, **k):
+                self.result = FakeConflict.mode
+        RealConflictDialog = gui.ImportConflictDialog     # exercised for real below
+        gui.ImportConflictDialog = FakeConflict
+
+        before_west = dict(app._lib_find("West") or {})
+        app._import_feeds()                                   # mode = skip
+        results["import_adds_new"] = (app._lib_find("Imported Feed") is not None)
+        results["import_skip_keeps_mine"] = (
+            app._lib_find("West").get("url") == before_west.get("url"))
+        # Imported feeds are saved only -- they must not start transcribing.
+        results["import_does_not_start"] = ("Imported Feed" not in app.engine.added)
+
+        FakeConflict.mode = "rename"
+        app._import_feeds()
+        results["import_rename_suffixes"] = (app._lib_find("West (2)") is not None)
+
+        FakeConflict.mode = "replace"
+        app._import_feeds()
+        results["import_replace_overwrites"] = (
+            app._lib_find("West")["url"].endswith("CHANGED.mp3"))
+
+        # A file that isn't a feed list surfaces an error, not a traceback.
+        junk = os.path.join(tmp, "junk.json")
+        json.dump({"nope": 1}, open(junk, "w"))
+        gui.filedialog.askopenfilename = lambda *a, **k: junk
+        errs_before = len([p for p in _popups if p[0] == "err"])
+        app._import_feeds()
+        results["import_bad_file_errors"] = (
+            len([p for p in _popups if p[0] == "err"]) == errs_before + 1)
+
+        # Cancelling the file picker is a no-op.
+        gui.filedialog.askopenfilename = lambda *a, **k: ""
+        lib_before = len(app.library)
+        app._import_feeds()
+        results["import_cancel_noop"] = (len(app.library) == lib_before)
+
+        # --- Transcript -> PDF ------------------------------------------------
+        pdf_path = os.path.join(tmp, "out.pdf")
+        gui.filedialog.asksaveasfilename = lambda *a, **k: pdf_path
+
+        class FakePdfDlg:
+            spec = ("East", "session", [])
+            def __init__(self, *a, **k):
+                self.result = FakePdfDlg.spec
+        RealPdfDialog = gui.PdfExportDialog               # exercised for real below
+        gui.PdfExportDialog = FakePdfDlg
+
+        app._append_line("East", "yellow", "pdf-session-line", "11:00:00")
+        app._export_pdf()
+        blob = open(pdf_path, "rb").read()
+        results["pdf_session_written"] = blob.startswith(b"%PDF-1.4")
+        results["pdf_session_content"] = (b"pdf-session-line" in blob
+                                          and b"11:00:00" in blob)
+        results["pdf_titled_by_feed"] = (b"(East) Tj" in blob)
+
+        # Log-backed export reads the day files for that feed.
+        logdir = os.path.join(tmp, "logs")
+        os.makedirs(logdir)
+        with open(os.path.join(logdir, "East-20260719.log"), "w",
+                  encoding="utf-8") as f:
+            f.write("[09:00:00] pdf-log-line\n")
+        real_lookup = core.log_files_for
+        core.log_files_for = lambda name, log_dir=logdir: real_lookup(name, logdir)
+        FakePdfDlg.spec = ("East", "logs", ["20260719"])
+        pdf2 = os.path.join(tmp, "out2.pdf")
+        gui.filedialog.asksaveasfilename = lambda *a, **k: pdf2
+        app._export_pdf()
+        results["pdf_logs_written"] = (b"pdf-log-line" in open(pdf2, "rb").read())
+        core.log_files_for = real_lookup
+
+        # A feed with nothing to export informs the user instead of writing
+        # ("Imported Feed" was never started, so it has no transcript lines).
+        # showinfo was re-stubbed further up, so capture it fresh here.
+        FakePdfDlg.spec = ("Imported Feed", "session", [])
+        infos = []
+        gui.messagebox.showinfo = lambda *a, **k: infos.append(a)
+        pdf3 = os.path.join(tmp, "never.pdf")
+        gui.filedialog.asksaveasfilename = lambda *a, **k: pdf3
+        app._export_pdf()
+        results["pdf_empty_informs"] = (len(infos) == 1
+                                        and not os.path.exists(pdf3))
+
+        # --- The real (normally modal) dialogs build and apply correctly ------
+        # simpledialog.Dialog blocks in wait_window(); bypass just that so the
+        # widgets are really constructed and the apply() logic is really run.
+        class LivePdfDlg(RealPdfDialog):
+            def wait_window(self, *a, **k): pass
+
+        class LiveConflictDlg(RealConflictDialog):
+            def wait_window(self, *a, **k): pass
+
+        core.log_files_for = lambda name, log_dir=logdir: real_lookup(name, logdir)
+        pd = LivePdfDlg(app.root, app, ["East", "West"], preselect="East")
+        pd.grab_release()
+        results["pdfdlg_preselects"] = (pd.feed.get() == "East")
+        # East has one log day (created above) -> listed, and logs stay selectable.
+        results["pdfdlg_lists_days"] = (list(pd.daylist.get(0, "end")) == ["2026-07-19"])
+        results["pdfdlg_days_enabled"] = (str(pd.daylist.cget("state")) == "normal")
+        # No day selected == every day.
+        pd.apply()
+        results["pdfdlg_all_days"] = (pd.result == ("East", "logs", ["20260719"]))
+        # A feed with no logs falls back to the session and greys the day list.
+        pd.feed.set("West")
+        results["pdfdlg_no_logs_fallback"] = (pd.source.get() == "session"
+                                              and str(pd.daylist.cget("state")) == "disabled")
+        pd.apply()
+        results["pdfdlg_session_result"] = (pd.result == ("West", "session", []))
+        pd.destroy()
+        core.log_files_for = real_lookup
+
+        # The Feeds window renders a row per library feed, each with a PDF button,
+        # plus the Export/Import buttons -- build it once so a bad widget shows up.
+        cat = gui.CatalogDialog(app.root, app)
+        row_buttons = [w.cget("text") for row, _n in cat._rows
+                       for w in row.winfo_children() if isinstance(w, tk.Button)]
+        results["catalog_rows_built"] = (len(cat._rows) == len(app.library))
+        results["catalog_row_has_pdf"] = (row_buttons.count("PDF") == len(cat._rows))
+        footer = [w.cget("text") for f in cat.winfo_children()
+                  for w in f.winfo_children() if isinstance(w, tk.Button)]
+        results["catalog_has_list_buttons"] = ("Export list..." in footer
+                                               and "Import list..." in footer)
+        cat.destroy()
+
+        cd = LiveConflictDlg(app.root, 5, ["West", "East"])
+        cd.grab_release()
+        results["conflictdlg_defaults_skip"] = (cd.mode.get() == "skip")
+        cd.mode.set("rename")
+        cd.apply()
+        results["conflictdlg_applies"] = (cd.result == "rename")
+        cd.destroy()
+
+        # --- Streams menu exposes the new commands ---------------------------
+        menubar = app.root.nametowidget(app.root.cget("menu"))
+        streams = app.root.nametowidget(menubar.entrycget(1, "menu"))
+        labels = [streams.entrycget(i, "label")
+                  for i in range(streams.index("end") + 1)
+                  if streams.type(i) != "separator"]
+        results["menu_has_export"] = ("Export feed list..." in labels)
+        results["menu_has_import"] = ("Import feed list..." in labels)
+        results["menu_has_pdf"] = ("Save transcript as PDF..." in labels)
+
         app._on_close()
 
     # Tkinter swallows exceptions raised inside after() callbacks (prints to
