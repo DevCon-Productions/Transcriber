@@ -57,6 +57,21 @@ def run():
     r["av_hyphens_normalise"] = (av("Delta 5-10, wind check.") == "DELTA 510")
     r["av_same_label"] = (av("Delta 5-10 heavy") == av("Delta 510"))
     r["av_drops_heavy"] = (av("Speedbird 117 heavy") == av("Speedbird 117"))
+    # Whisper splits compound telephony names and punctuates flight numbers
+    # freely -- all of these are from real KCLE Tower transcripts.
+    r["av_split_name"] = (av("South West 46, 94, contact departure.")
+                          == "SOUTHWEST 4694")
+    r["av_split_same_as_joined"] = (av("South West 46, 94")
+                                    == av("Southwest 4694"))
+    r["av_split_jetblue"] = (av("Jet Blue 231 heavy, turn right.") == "JETBLUE 231")
+    # ...and a name that really contains a space may arrive joined.
+    r["av_joined_air_france"] = (av("AirFrance 22, contact ground.")
+                                 == av("Air France 22, contact ground."))
+    # The comma rule must not invent flight numbers out of following digits,
+    # nor throw away a call sign when it over-runs.
+    r["av_comma_lone_digit"] = (av("Delta 510, 2 miles out.") == "DELTA 510")
+    r["av_comma_overflow"] = (av("Delta 510, 20 miles out.") == "DELTA 510")
+    r["av_comma_joins_pair"] = (av("United 16, 85 on frequency.") == "UNITED 1685")
     r["av_unknown_airline"] = (av("Skyhawk 12345, cleared to land.") is None)
     r["av_no_aircraft"] = (av("Cleared to land, runway 22 left.") is None)
     r["av_ignores_police"] = (av("Adam 33 responding to the call.") is None)

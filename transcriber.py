@@ -1488,7 +1488,37 @@ AIRLINE_TELEPHONY = {
     "turkish": "TK", "el al": "LY", "avianca": "AV", "copa": "CM",
     "tam": "JJ", "azul": "AD",
 }
-_AIRLINE_RE = "|".join(re.escape(k) for k in
+# Whisper splits compound telephony names unpredictably: real logs show one
+# aircraft as "So 46-94", "South 46-94" and "South West 46, 94" within a minute.
+# Allow a space wherever the canonical name has none, so "South West" still
+# resolves to Southwest -- otherwise a line that transcribed perfectly well
+# yields no call sign and no FlightRadar24 link.
+# Compound names may arrive split ("South West") or joined ("Southwest"), and
+# names that really contain a space may arrive joined. Accept optional
+# whitespace between the parts of every compound name, in both directions.
+_COMPOUND_PARTS = {
+    "southwest": ("south", "west"), "jetblue": ("jet", "blue"),
+    "westjet": ("west", "jet"), "skywest": ("sky", "west"),
+    "speedbird": ("speed", "bird"), "aeromexico": ("aero", "mexico"),
+    "fedex": ("fed", "ex"), "finnair": ("finn", "air"),
+    "brickyard": ("brick", "yard"), "air france": ("air", "france"),
+    "all nippon": ("all", "nippon"), "japan air": ("japan", "air"),
+    "korean air": ("korean", "air"), "sun country": ("sun", "country"),
+    "air canada": ("air", "canada"), "el al": ("el", "al"),
+}
+
+
+def _telephony_pattern(name):
+    parts = _COMPOUND_PARTS.get(name, (name,))
+    return r"\s*".join(re.escape(p) for p in parts)
+
+
+# Lookup by the name with all spacing removed, so however Whisper spelled it we
+# land on the canonical entry: "south west" and "southwest" -> "southwest";
+# "airfrance" and "air france" -> "air france".
+_TELEPHONY_BY_KEY = {re.sub(r"\s+", "", k): k for k in AIRLINE_TELEPHONY}
+
+_AIRLINE_RE = "|".join(_telephony_pattern(k) for k in
                        sorted(AIRLINE_TELEPHONY, key=len, reverse=True))
 
 # NATO letters, for decoding a spoken registration into an N-number.
@@ -1507,8 +1537,32 @@ _NATO_RE = "|".join(sorted(_NATO_LETTERS, key=len, reverse=True))
 # "Speedbird 117 heavy", "United 1685".
 _AIR_FLIGHT = re.compile(
     r"\b(" + _AIRLINE_RE + r")\s+"
-    r"((?:\d[\d\s-]{0,8}\d|\d))"
+    r"((?:\d[\d\s,-]{0,8}\d|\d))"
     r"(?:\s+(?:heavy|super))?\b", re.I)
+
+
+def _flight_number(raw):
+    """Join a spoken flight number into digits.
+
+    Whisper punctuates these freely -- "4694", "46-94", "46, 94" are all the same
+    aircraft. Commas are accepted, but only between groups of 2+ digits: without
+    that guard "Delta 510, 2 miles out" would read as flight 5102. Anything after
+    a suspect group is dropped rather than the whole match rejected."""
+    groups = [g for g in re.split(r",", raw) if g.strip()]
+    digits = ""
+    for i, g in enumerate(groups):
+        d = re.sub(r"\D", "", g)
+        if not d:
+            break
+        if i and len(d) < 2:        # a lone digit after a comma isn't part of it
+            break
+        # Flight numbers are at most 4 digits. Stop before overflowing rather
+        # than building a too-long number, which would fail validation and throw
+        # away a call sign we had: "Delta 510, 20 miles out" is flight 510.
+        if len(digits) + len(d) > 4:
+            break
+        digits += d
+    return digits
 
 # "November 65 Juliet Charlie" -> N65JC. US registrations start with November;
 # requiring it keeps this from firing on stray phonetics mid-sentence.
@@ -1545,12 +1599,15 @@ def extract_aircraft(text):
         return any(not (b <= s or a >= e) for s, e in taken)
 
     for m in _AIR_FLIGHT.finditer(text):
-        num = _digits_only(m.group(2))
+        num = _flight_number(m.group(2))
         if not 1 <= len(num) <= 4:
             continue
-        word = m.group(1).lower()
-        code = AIRLINE_TELEPHONY[word]
-        out.append((m.start(), m.group(0).strip(), f"{code}{num}",
+        # However it was spelled, resolve to the canonical telephony name so the
+        # label groups: "South West 46, 94" and "Southwest 4694" are one aircraft.
+        word = _TELEPHONY_BY_KEY.get(re.sub(r"\s+", "", m.group(1).lower()))
+        if not word:
+            continue
+        out.append((m.start(), m.group(0).strip(), f"{AIRLINE_TELEPHONY[word]}{num}",
                     f"{word.upper()} {num}"))
         taken.append((m.start(), m.end()))
 
@@ -1619,7 +1676,13 @@ _ATC_PROMPT = (
     "hold short, taxi via, runway, wind check, contact departure, contact ground, "
     "climb and maintain, descend and maintain, turn left heading, turn right "
     "heading, squawk, ident, traffic in sight, go around, heavy, roger, wilco, "
-    "affirm, negative."
+    "affirm, negative, approved, request, ramp, gate, tower, approach, "
+    "left, right, center. "
+    # Airline telephony names, spelled the way they should come out. Whisper
+    # otherwise produces "So 46-94" / "South 46-94" for Southwest, and the call
+    # sign is lost. Seeded from real transcripts, not guessed.
+    "Airlines: Southwest, Delta, United, American, JetBlue, Spirit, Frontier, "
+    "Alaska, Republic, Envoy, Endeavor, SkyWest, FedEx, UPS."
 )
 
 SERVICE_PRESETS = {
