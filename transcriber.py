@@ -1621,9 +1621,14 @@ def extract_aircraft(text):
                 ident += _NATO_LETTERS[t]
             elif t.isdigit():
                 ident += t
-        # A bare "November" with nothing after it isn't a registration, and real
-        # N-numbers are at most 5 characters after the N.
-        if 2 <= len(ident) <= 6:
+        # Validate against how US registrations are actually formed, or garbled
+        # phonetics become dead FlightRadar24 links. A real line, "November 0,
+        # Fox Try Yankee Cross", yielded "N0" and linked to /aircraft/n0:
+        # "Fox Try" isn't Foxtrot so nothing more was decoded, and a one-digit
+        # tail number was accepted. Rules: 2-5 characters after the N, and the
+        # first is a digit 1-9 (the FAA never issues a leading zero).
+        body = ident[1:]
+        if (2 <= len(body) <= 5 and body[0].isdigit() and body[0] != "0"):
             out.append((m.start(), m.group(0).strip(), ident, ident))
 
     out.sort()

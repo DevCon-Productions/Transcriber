@@ -72,6 +72,17 @@ def run():
     r["av_comma_lone_digit"] = (av("Delta 510, 2 miles out.") == "DELTA 510")
     r["av_comma_overflow"] = (av("Delta 510, 20 miles out.") == "DELTA 510")
     r["av_comma_joins_pair"] = (av("United 16, 85 on frequency.") == "UNITED 1685")
+    # Registrations must be shaped like real ones, or garbled phonetics become
+    # dead FlightRadar24 links. This exact line came off KCLE Tower and produced
+    # "N0" -> /aircraft/n0: "Fox Try" isn't Foxtrot, so nothing more decoded.
+    r["av_tail_rejects_single"] = (
+        av("November 0, Fox Try Yankee Cross, runway 86, sighted.") is None)
+    r["av_tail_rejects_bare"] = (av("November, go ahead.") is None)
+    r["av_tail_rejects_leading_zero"] = (av("November 0-1-2 Alpha.") is None)
+    r["av_tail_still_works"] = (
+        av("November 1-2-3 Alpha Bravo, cleared for takeoff.") == "N123AB")
+    r["av_tail_letters"] = (av("November 774 Sierra Papa on the ground.")
+                            == "N774SP")
     r["av_unknown_airline"] = (av("Skyhawk 12345, cleared to land.") is None)
     r["av_no_aircraft"] = (av("Cleared to land, runway 22 left.") is None)
     r["av_ignores_police"] = (av("Adam 33 responding to the call.") is None)
