@@ -3475,6 +3475,24 @@ _HALLUCINATION_PHRASES = {
 }
 
 
+# Whisper annotates non-speech in brackets -- "[unintelligible]", "[buzzing]",
+# "[Airplane engine]", "(static)", "♪♪". The bigger models do it far more than
+# the small ones: switching base.en -> small.en took these from occasional to
+# 8% of all lines on ATC feeds, each one also saving a clip nothing points at.
+_NONSPEECH_TAG = re.compile(r"[\[(][^\])]*[\])]|[♪`]+")
+
+
+def _strip_nonspeech(text):
+    """Remove non-speech annotations. Returns "" if that's all there was.
+
+    Strips rather than rejecting whole lines, so a real transmission that merely
+    contains an aside -- "(static) Delta 510 cleared to land" -- keeps its
+    content instead of being thrown away."""
+    if not text:
+        return ""
+    return " ".join(_NONSPEECH_TAG.sub(" ", text).split()).strip()
+
+
 def _is_hallucination(text, no_speech_prob):
     """True if `text` is just a known silence-hallucination phrase (optionally
     repeated) and the model wasn't confident this was speech."""
@@ -3767,6 +3785,7 @@ class Transcriber(threading.Thread):
             if getattr(s, "avg_logprob", 0.0) < self.min_logprob:
                 continue
             txt = s.text.strip()
+            txt = _strip_nonspeech(txt)
             if txt and not _is_hallucination(txt, getattr(s, "no_speech_prob", 0.0)):
                 parts.append(txt)
         text = _collapse_repeats(" ".join(parts).strip())
