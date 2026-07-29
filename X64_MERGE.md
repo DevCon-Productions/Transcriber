@@ -26,16 +26,46 @@ Do **not** reimplement anything.
 `arm-support` is 39 commits ahead of `master`; 18 of those are the 2.0 feature
 work. 26 files, ~8,400 insertions.
 
-## Decide first: how much to merge
+## Merge the whole branch — don't cherry-pick
 
-The 21 older commits underneath are ARM packaging — a separate Inno installer, a
-distinct `%APPDATA%` data dir, an arch-aware updater asset picker. They are
-harmless on `master` but conceptually belong to the ARM build.
+This was considered and rejected on evidence. Cherry-picking just the 18 feature
+commits looks tidier and would ship a regression.
 
-- **Merge everything** — simplest, keeps the branches from diverging further.
-- **Cherry-pick the 18 feature commits** — keeps `master` free of ARM packaging.
+**`master` is stale.** Its HEAD is `31f08b6`, dated **2026-07-09**, tagged v1.0.
+But x64 releases 1.1, 1.2, 1.3 and 1.4 shipped through 2026-07-20, and none of
+that work is on `master`. It is a v1.0 snapshot plus installer packaging — not
+the x64 mainline. `arm-support` is where development actually happened.
 
-This is the repo owner's call. Ask before assuming.
+**Most of the older commits are not ARM-specific.** Of the 21 commits beneath the
+2.0 work, only 9 carry an `ARM:` prefix. The other 12 are general features that
+simply live on this branch:
+
+```
+Add GitHub-release app self-updater
+Add in-app Broadcastify login dialog
+Clickable address -> Google Maps links in transcript
+TTS: WinRT/OneCore backend, SAPI5 backend, engine picker
+Add device selection (Auto/GPU/CPU) + graceful CPU fallback
+GUI: preserve scroll position when new lines arrive
+ffmpeg: find an app-bundled binary; warn once when missing
+```
+
+So cherry-picking the 18 would produce **v1.0 plus 2.0's features** — an x64
+build with no self-updater, no Broadcastify login, no address links, no TTS
+engine picker and no device selection. That is a regression against the x64 1.4
+users are already running, shipped under a higher version number.
+
+The 18 feature commits themselves are clean: they reference none of
+`interpreter_is_arm64`, `select_backend` or `_pick_installer_asset`, so they
+would apply. They would just be landing on a foundation missing a great deal.
+
+**The ARM-specific commits are inert on x64.** A separate Inno script nothing
+invokes, an ARM PyInstaller spec nothing runs, and a distinct `%APPDATA%` dir
+chosen by `interpreter_is_arm64()` — which returns False on x64, so the data
+path is unchanged. They cost some unused files, not behaviour.
+
+If `master` should end up conceptually free of ARM packaging, treat that as a
+separate cleanup afterwards. Don't attempt it as part of shipping 2.0.
 
 ## Verify on x64, highest risk first
 
