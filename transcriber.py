@@ -3119,12 +3119,36 @@ def soundcard_available():
         return False
 
 
-def list_output_devices():
+_OUTPUT_DEVICES = None          # cached [(name, is_default)]; see warm_audio_devices
+
+
+def warm_audio_devices():
+    """Enumerate output devices ONCE, before any Tk window exists.
+
+    On Windows-on-ARM64, enumerating through soundcard AFTER Tk has started
+    corrupts the heap and kills the process (0xC0000374) -- Tk initialises OLE,
+    and soundcard's COM use conflicts when it initialises second. Doing it first
+    and serving a cache afterwards avoids the collision entirely. It's also just
+    faster: the add/edit dialog no longer re-queries WASAPI every time it opens.
+
+    Call this before creating the root window. Safe to call more than once."""
+    return list_output_devices(force=True)
+
+
+def list_output_devices(force=False):
     """Return [(name, is_default)] of output devices that can be loopback-captured
-    via soundcard. Empty if soundcard is unavailable. Names are de-duplicated."""
+    via soundcard. Empty if soundcard is unavailable. Names are de-duplicated.
+
+    Served from the cache once warmed (see warm_audio_devices) -- so a device
+    plugged in mid-session won't appear until restart, which is the price of not
+    crashing the app on ARM."""
+    global _OUTPUT_DEVICES
+    if _OUTPUT_DEVICES is not None and not force:
+        return list(_OUTPUT_DEVICES)
     try:
         import soundcard as sc
     except Exception:
+        _OUTPUT_DEVICES = []
         return []
     try:
         default_name = sc.default_speaker().name

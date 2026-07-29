@@ -294,23 +294,22 @@ class AddStreamDialog(simpledialog.Dialog):
         self.url_entry.grid(row=2, column=1, padx=6, pady=4)
 
         # PC-audio device row: pick the OUTPUT device (speakers) to capture.
+        #
+        # The device list is NOT fetched here. Enumerating output devices goes
+        # through soundcard/WASAPI COM, which on Windows-on-ARM64 can corrupt the
+        # heap and kill the process outright (0xC0000374, no traceback -- the
+        # window simply disappears). Opening this dialog at all used to risk that,
+        # even to add a plain URL feed, which is the overwhelmingly common case.
+        # Now nothing touches audio hardware unless "pc audio" is actually
+        # selected -- see _load_output_devices.
         self.dev_label = tk.Label(master, text="Speakers to capture", bg=BG, fg=FG)
         self.dev_label.grid(row=3, column=0, sticky="w", padx=6, pady=4)
-        self._outputs = core.list_output_devices()   # [(name, is_default)]
-        out_names = [n for n, _d in self._outputs] or ["(none found)"]
-        self.dev_var = tk.StringVar()
+        self._outputs = None                        # None = not looked up yet
+        self.dev_var = tk.StringVar(value=init.get("output_device", ""))
         self.dev_combo = ttk.Combobox(master, textvariable=self.dev_var,
-                                      values=out_names, state="disabled", width=42)
+                                      values=["(select 'pc audio' to load)"],
+                                      state="disabled", width=42)
         self.dev_combo.grid(row=3, column=1, padx=6, pady=4)
-        if init.get("output_device") in out_names:        # prefill when editing
-            self.dev_var.set(init["output_device"])
-        else:
-            for n, is_def in self._outputs:
-                if is_def:
-                    self.dev_var.set(n)
-                    break
-            if not self.dev_var.get() and out_names and out_names[0] != "(none found)":
-                self.dev_var.set(out_names[0])
 
         # Application row: pick a running app that has audio. Refresh re-scans.
         self.app_label = tk.Label(master, text="Application (playing audio)",
@@ -467,12 +466,30 @@ class AddStreamDialog(simpledialog.Dialog):
         else:
             self.app_var.set(labels[0])
 
+    def _load_output_devices(self):
+        """Fetch the speaker list, once, only when 'pc audio' is chosen."""
+        if self._outputs is not None:
+            return
+        self._outputs = core.list_output_devices()
+        names = [n for n, _d in self._outputs] or ["(none found)"]
+        self.dev_combo.config(values=names)
+        if self.dev_var.get() in names:
+            return                                   # keep what we're editing
+        for n, is_def in self._outputs:
+            if is_def:
+                self.dev_var.set(n)
+                return
+        if names[0] != "(none found)":
+            self.dev_var.set(names[0])
+
     def _sync_state(self):
         """Enable only the fields relevant to the chosen source type."""
         src = self.source.get()
         is_url = src == "url"
         is_pc = src == "pc audio"
         is_app = src == "application"
+        if is_pc:
+            self._load_output_devices()
         self.url_entry.config(state="normal" if is_url else "disabled")
         self.url_label.config(fg=FG if is_url else MUTED)
         self.dev_combo.config(state="readonly" if is_pc else "disabled")
