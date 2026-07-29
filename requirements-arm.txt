@@ -1,0 +1,40 @@
+# Windows-on-ARM64 (native) requirements.
+#
+# The x64 build uses faster-whisper (ctranslate2) + CUDA — neither has an ARM64
+# wheel. On ARM the transcription engine is whisper.cpp via pywhispercpp, selected
+# automatically at runtime (see select_backend() in transcriber.py). Install these
+# into a NATIVE ARM64 Python venv (not an emulated x64 one). See BUILD_ARM.md.
+#
+# Excluded vs requirements.txt (unusable on ARM):
+#   ctranslate2, faster-whisper, nvidia-cublas-cu12, nvidia-cudnn-cu12,
+#   nvidia-cuda-nvrtc-cu12  (x64 + NVIDIA GPU only)
+#   proc-tap  -- per-app capture. NOTE: its wheel IS py3-none-any and installs on
+#     ARM, but the compiled `proctap._native` inside has no ARM64 build, so every
+#     capture raises. proctap_available() checks for _native, so the "application"
+#     source correctly stays hidden. Don't install it on ARM; it does nothing.
+
+# --- pure-python / native ARM64 wheels available on PyPI ---
+numpy==2.4.6
+onnxruntime>=1.27.0            # transcription filters / Piper (if built); win_arm64 wheel
+huggingface_hub>=1.17.0
+tokenizers>=0.23.1
+av>=17.0.1
+imageio-ffmpeg==0.6.0          # bundled ffmpeg is x64 (runs emulated); or use a system ffmpeg on PATH
+sounddevice>=0.5.5            # audio playback ("listen to feed") + TTS output; win_arm64 wheel
+soundcard>=0.4.6              # "pc audio" source: loopback-capture any output device; pure-python
+pillow>=12.3.0                # GUI logo/icons; win_arm64 wheel
+pycaw>=20251023               # enumerates apps with audio sessions; pure-python (comtypes)
+comtypes>=1.4.16             # classic SAPI5 TTS fallback (pure-python; Piper's espeak-ng has no ARM build)
+
+# WinRT/OneCore TTS backend -- sees EVERY installed Windows voice (classic SAPI5
+# only reads the legacy hive). All have native win_arm64 wheels.
+winrt-runtime>=3.2.1
+winrt-Windows.Media.SpeechSynthesis>=3.2.1
+winrt-Windows.Storage.Streams>=3.2.1
+winrt-Windows.Foundation>=3.2.1
+winrt-Windows.Foundation.Collections>=3.2.1
+
+# --- transcription engine (built from source; NO prebuilt ARM64 wheel) ---
+# Do NOT `pip install` this directly on ARM — it needs a clang toolchain and a
+# post-build rename. Use build_arm/build_pywhispercpp.bat instead.
+# pywhispercpp==1.5.0

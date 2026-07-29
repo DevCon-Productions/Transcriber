@@ -48,5 +48,41 @@ def run():
     print("HALLUCINATION TEST: PASS")
 
 
+def run_nonspeech():
+    """Whisper's bracketed non-speech annotations must never reach the
+    transcript. Cases taken from real KCLE logs after switching to small.en,
+    which emits far more of them than base.en did (8% of all lines)."""
+    import transcriber as core
+    r = {}
+    for junk in ("[buzzing]", "[Airplane engine]", "[unintelligible]",
+                 "(static)", "[BLANK_AUDIO]", "[unintelligible] [buzzing]",
+                 "  [ static ]  ", "♪♪"):
+        # ascii() so a non-ASCII case can't crash the console this prints to.
+        r[f"drops {ascii(junk)}"] = (core._strip_nonspeech(junk) == "")
+    # Stripping, not rejecting: a real transmission with an aside keeps its words.
+    r["keeps content after tag"] = (
+        core._strip_nonspeech("(static) Delta 510 cleared to land.")
+        == "Delta 510 cleared to land.")
+    r["keeps content before tag"] = (
+        core._strip_nonspeech("Southwest 4694, contact departure. [unintelligible]")
+        == "Southwest 4694, contact departure.")
+    r["keeps content around tag"] = (
+        core._strip_nonspeech("Delta 1320 [buzzing] runway 6 left")
+        == "Delta 1320 runway 6 left")
+    r["plain text untouched"] = (
+        core._strip_nonspeech("Cleveland Tower, Delta 1320, ILS 6L.")
+        == "Cleveland Tower, Delta 1320, ILS 6L.")
+    r["empty safe"] = (core._strip_nonspeech("") == ""
+                       and core._strip_nonspeech(None) == "")
+    print("NON-SPEECH RESULTS:")
+    ok = True
+    for k, v in r.items():
+        print(f"  {'ok ' if v else 'FAIL'} {k}")
+        ok = ok and v
+    assert ok, "non-speech filter test failed"
+    print("NON-SPEECH TEST: PASS")
+
+
 if __name__ == "__main__":
     run()
+    run_nonspeech()

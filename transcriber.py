@@ -22,13 +22,37 @@ import re
 import sys
 import glob
 import json
+import math
 import time
 import queue
 import base64
+import platform
 import threading
 import subprocess
 import collections
 import datetime as dt
+
+
+# --------------------------------------------------------------------------
+# Interpreter architecture.
+#
+# On Windows-on-ARM, platform.machine() is NOT a reliable signal for the running
+# interpreter: an EMULATED x64 Python reports 'ARM64' too (machine() reflects the
+# host, not the process). The real process architecture is in
+# PROCESSOR_ARCHITECTURE -- 'AMD64' for an emulated/native x64 process, 'ARM64'
+# only for a native ARM64 one. We key CUDA and backend selection off THIS, so an
+# x64 build running emulated on an ARM box still (correctly) uses the CUDA/
+# ctranslate2 path that its amd64 wheels support.
+# --------------------------------------------------------------------------
+def interpreter_is_arm64():
+    """True only if this Python process is a native ARM64 build (not emulated x64)."""
+    proc = os.environ.get("PROCESSOR_ARCHITECTURE", "").upper()
+    if proc in ("AMD64", "X86", "X64", "IA64"):
+        return False
+    if proc in ("ARM64", "AARCH64"):
+        return True
+    # Fallback (non-Windows / unusual): trust platform.machine().
+    return platform.machine().lower() in ("arm64", "aarch64")
 
 
 # --------------------------------------------------------------------------
@@ -53,6 +77,8 @@ def _nvidia_search_roots():
 
 
 def add_nvidia_dll_dirs():
+    if interpreter_is_arm64():
+        return                      # no CUDA on ARM; whisper.cpp uses CPU/NPU
     for site in _nvidia_search_roots():
         for bindir in glob.glob(os.path.join(site, "*", "bin")):
             try:
@@ -94,6 +120,9 @@ def ensure_cuda_libraries(status_cb=None):
             except Exception:
                 pass
 
+    if interpreter_is_arm64():
+        # No CUDA on Windows-on-ARM; the whisper.cpp backend runs on CPU/NPU.
+        return True, "CUDA not applicable on ARM (using CPU/NPU backend)."
     if cuda_libraries_present():
         return True, "CUDA libraries present."
 
@@ -143,12 +172,35 @@ def _find_python_for_pip():
 
 
 def find_ffmpeg():
-    # Prefer the ffmpeg bundled by the imageio-ffmpeg pip package (no PATH needed).
+    """Path to an ffmpeg binary, in preference order:
+    1. the one bundled by the imageio-ffmpeg pip package (x64 only -- that package
+       has no ARM64 wheel, so this simply misses on ARM),
+    2. an ffmpeg shipped with the app (bin/ next to it, or the user data dir) --
+       this is the ARM path; see BUILD_ARM.md for staging a native ARM64 build,
+    3. whatever is on PATH."""
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
-        return "ffmpeg"  # fall back to a system ffmpeg on PATH
+        pass
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for d in (os.path.join(HERE, "bin"), HERE, os.path.join(DATA_DIR, "bin")):
+        p = os.path.join(d, exe)
+        if os.path.isfile(p):
+            return p
+    return "ffmpeg"  # fall back to a system ffmpeg on PATH
+
+
+def ffmpeg_available(ffmpeg=None):
+    """True if the resolved ffmpeg can actually be executed. URL/stream feeds need
+    it -- without it every StreamWorker just loops on 'ffmpeg launch failed', so the
+    Engine warns once up front instead."""
+    try:
+        proc = subprocess.run([ffmpeg or find_ffmpeg(), "-version"],
+                              capture_output=True, timeout=10, **_no_window_kwargs())
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 
 import numpy as np
@@ -171,10 +223,16 @@ def _resource_dir():
 def _user_data_dir():
     """Per-user WRITABLE dir for config/credentials/logs. In a frozen install the
     app lives in Program Files (read-only), so writable state goes to AppData.
-    In dev, everything stays in the project folder for convenience."""
+    In dev, everything stays in the project folder for convenience.
+
+    The ARM64 build uses a DISTINCT dir (Transcriber-ARM64) so it never inherits an
+    x64 install's config/credentials on the same machine -- the x64 default is
+    large-v3/CUDA, which on ARM means a 3 GB download and a model that won't load.
+    Lets both architectures be installed side by side with independent state."""
     if getattr(sys, "frozen", False):
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        d = os.path.join(base, "Transcriber")
+        name = "Transcriber-ARM64" if interpreter_is_arm64() else "Transcriber"
+        d = os.path.join(base, name)
         os.makedirs(d, exist_ok=True)
         return d
     return os.path.dirname(os.path.abspath(__file__))
@@ -231,7 +289,14 @@ def _seed_from_example(target, example_name):
 
 def load_config(path=CONFIG_PATH):
     # First run of an installed build: seed config + credentials from examples.
-    _seed_from_example(CONFIG_PATH, "config.example.json")
+    # On native ARM64 prefer config.example.arm.json (small CPU model default) if
+    # the build bundled it -- the shared config.example.json defaults to large-v3
+    # on CUDA, which on ARM would mean a ~3 GB download and unusable CPU speed.
+    example = "config.example.json"
+    if interpreter_is_arm64() and os.path.exists(
+            os.path.join(HERE, "config.example.arm.json")):
+        example = "config.example.arm.json"
+    _seed_from_example(CONFIG_PATH, example)
     _seed_from_example(CREDENTIALS_PATH, "credentials.example.json")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -257,6 +322,1060 @@ def is_enabled(stream):
     if stream.get("type") == "pcaudio":
         return stream.get("output_device") is not None or stream.get("device") is not None
     return bool(stream.get("url"))
+
+
+# --------------------------------------------------------------------------
+# Feed-list export / import.
+#
+# The exported file holds ONLY feed entries -- never the engine settings around
+# them (model/device/compute_type/engine). That is deliberate: the x64 build
+# defaults to large-v3 on CUDA and the ARM64 build to a small whisper.cpp model,
+# and the two installs keep SEPARATE data dirs (see _user_data_dir). Carrying
+# engine keys across would hand an ARM machine a 3 GB CUDA model it can't run.
+# Feed entries themselves are plain data, so a list exported on either
+# architecture imports cleanly into the other.
+#
+# Two fields do NOT travel meaningfully and are dropped on export:
+#   pid        -- a process id; meaningless in another session, let alone another box
+#   disabled   -- "currently transcribing" is per-install state, not part of the feed
+# Two feed TYPES are machine-bound even though they survive the round trip:
+#   pcaudio    -- names a local output device that may not exist on the target
+#   app        -- per-app capture has no ARM64 build (proctap_available() is False)
+# import_feeds() reports both in `warnings` rather than silently dropping them.
+# --------------------------------------------------------------------------
+FEED_EXPORT_FORMAT = "transcriber-feeds"
+FEED_EXPORT_VERSION = 1
+
+# Per-feed keys that are portable between machines and architectures.
+FEED_PORTABLE_KEYS = ("name", "url", "type", "provider", "color", "location",
+                      "desc", "output_device", "app_name", "record",
+                      # What kind of radio this is, and any prompt tuning for it.
+                      # Both are preferences, not machine state, so they travel.
+                      "service", "initial_prompt",
+                      # Which display column the feed shares (e.g. "CLE ATC").
+                      "group")
+
+
+def _clean_feed(entry):
+    """Strip a feed entry down to its portable keys (see module notes above)."""
+    return {k: entry[k] for k in FEED_PORTABLE_KEYS
+            if k in entry and entry[k] not in (None, "")}
+
+
+def export_feeds(path, feeds, app_version=None):
+    """Write `feeds` (a list of feed dicts) to `path` as a portable JSON file.
+    Returns the number of feeds written."""
+    clean = [_clean_feed(e) for e in feeds if e.get("name")]
+    doc = {
+        "format": FEED_EXPORT_FORMAT,
+        "version": FEED_EXPORT_VERSION,
+        "exported": dt.datetime.now().isoformat(timespec="seconds"),
+        "app_version": app_version or "",
+        "feeds": clean,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    return len(clean)
+
+
+def import_feeds(path):
+    """Read a feed list from `path`. Returns (feeds, warnings).
+
+    Accepts, in order of preference:
+      - a file written by export_feeds()               {"format": ..., "feeds": [...]}
+      - a bare JSON array of feed dicts                [{...}, {...}]
+      - a whole config.json                            (uses feed_library + streams)
+    The last case means a user can point this at the other architecture's
+    config.json directly and still get their feeds. Raises ValueError if the file
+    parses but holds no recognisable feeds."""
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+
+    if isinstance(doc, list):
+        raw = doc
+    elif isinstance(doc, dict) and isinstance(doc.get("feeds"), list):
+        raw = doc["feeds"]
+    elif isinstance(doc, dict) and ("feed_library" in doc or "streams" in doc):
+        # A full config.json: library first, then any active streams not in it.
+        raw, seen = [], set()
+        for e in list(doc.get("feed_library") or []) + list(doc.get("streams") or []):
+            if isinstance(e, dict) and e.get("name") and e["name"] not in seen:
+                seen.add(e["name"])
+                raw.append(e)
+    else:
+        raise ValueError("Not a Transcriber feed list (no 'feeds' array found).")
+
+    feeds, warnings = [], []
+    for e in raw:
+        if not isinstance(e, dict) or not e.get("name"):
+            continue
+        entry = _clean_feed(e)
+        kind = entry.get("type")
+        if kind == "app":
+            # Per-app capture: the pid is gone (not exported) and on ARM64 the
+            # proctap native module doesn't exist at all.
+            if not proctap_available():
+                warnings.append(f"“{entry['name']}” captures an application — "
+                                "per-app capture isn't available on this build.")
+            else:
+                warnings.append(f"“{entry['name']}” captures an application — "
+                                "re-pick the running app before starting it.")
+        elif kind == "pcaudio":
+            dev = entry.get("output_device")
+            names = [n for n, _d in list_output_devices()]
+            if dev and names and dev not in names:
+                warnings.append(f"“{entry['name']}” captures speakers named "
+                                f"“{dev}”, which this machine doesn't have.")
+        feeds.append(entry)
+
+    if not feeds:
+        raise ValueError("No feeds found in that file.")
+    return feeds, warnings
+
+
+# --------------------------------------------------------------------------
+# Transcript -> PDF.
+#
+# Written by hand against the PDF 1.4 spec rather than pulling in reportlab:
+# the ARM64 build installs from a hand-curated wheel list (requirements-arm.txt)
+# and every added dependency is a wheel that might not exist for win_arm64. This
+# needs no dependency at all, so PDF export behaves identically on both builds.
+#
+# Scope matches the content: transcripts are plain text, so this emits the base-14
+# fonts (Courier body / Helvetica headings), which every reader has built in and
+# which need no font embedding.
+# --------------------------------------------------------------------------
+PDF_PAGE_W, PDF_PAGE_H = 612.0, 792.0        # US Letter, in points
+PDF_MARGIN = 54.0                            # 0.75"
+PDF_BODY_SIZE = 9.0
+PDF_LEADING = 11.5
+# Header block on page 1: feed name, then the span/line count, then a rule.
+PDF_TITLE_SIZE = 17.0
+PDF_SUBTITLE_SIZE = 9.5
+PDF_SUBTITLE_GAP = 17.0       # title baseline -> subtitle baseline
+PDF_RULE_GAP = 11.0           # subtitle baseline -> rule
+PDF_HEADER_H = 58.0           # total height reserved before the body starts
+# Courier is metrically fixed: every glyph is exactly 0.6 em wide.
+PDF_COURIER_WIDTH = 0.6
+
+
+def _pdf_escape(text):
+    """Encode a string for a PDF literal. PDF's base-14 fonts use WinAnsi, so
+    anything outside latin-1 (a stray smart quote from the transcriber) becomes
+    '?' rather than corrupting the stream."""
+    out = []
+    for ch in text:
+        if ch in "()\\":
+            out.append("\\" + ch)
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            try:
+                b = ch.encode("cp1252")
+            except (UnicodeEncodeError, LookupError):
+                out.append("?")
+                continue
+            out.append("".join(f"\\{c:03o}" for c in b))
+    return "".join(out)
+
+
+def _pdf_wrap(text, max_chars):
+    """Word-wrap to `max_chars`, breaking any single word longer than a line.
+    Always returns at least one (possibly empty) line."""
+    if max_chars < 8:
+        max_chars = 8
+    lines, cur = [], ""
+    for word in text.split():
+        while len(word) > max_chars:            # unbreakable run (URL, long id)
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:max_chars])
+            word = word[max_chars:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= max_chars:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines
+
+
+def write_transcript_pdf(path, title, lines, subtitle=""):
+    """Render a transcript to a PDF at `path`.
+
+    title    -- feed name, set large + bold as the heading on page 1
+    lines    -- iterable of transcript strings, e.g. "[20:50:01] Copy that."
+    subtitle -- line under the title; callers pass the transmission span and
+                count (see transcript_span / format_transcript_span)
+
+    Returns the number of pages written."""
+    usable_w = PDF_PAGE_W - 2 * PDF_MARGIN
+    max_chars = int(usable_w / (PDF_BODY_SIZE * PDF_COURIER_WIDTH))
+
+    # Lay out: wrap every line, then fill pages. Continuation lines are indented
+    # to the width of a "[HH:MM:SS] " stamp so the timestamp column stays readable.
+    body = []
+    for raw in lines:
+        raw = raw.rstrip("\n")
+        wrapped = _pdf_wrap(raw, max_chars) if raw.strip() else [""]
+        body.append(wrapped[0])
+        body.extend(" " * 11 + w for w in wrapped[1:])
+
+    # Page 1 starts below the header block; later pages start at the margin.
+    first_top = PDF_PAGE_H - PDF_MARGIN - PDF_HEADER_H
+    rest_top = PDF_PAGE_H - PDF_MARGIN
+    bottom = PDF_MARGIN + 16                      # room for the page footer
+    first_rows = max(1, int((first_top - bottom) / PDF_LEADING))
+    rest_rows = max(1, int((rest_top - bottom) / PDF_LEADING))
+
+    pages, i = [], 0
+    if not body:
+        body = ["(no transcript lines)"]
+    while i < len(body):
+        rows = first_rows if not pages else rest_rows
+        pages.append(body[i:i + rows])
+        i += rows
+    total = len(pages)
+
+    def content_stream(idx, rows):
+        parts = []
+        y = rest_top
+        if idx == 0:
+            # Header block: feed name large + bold, then the span/count beneath
+            # it, then a rule. Sizes and offsets track PDF_TITLE_* so the body's
+            # first_top stays in step with whatever the header actually occupies.
+            y = PDF_PAGE_H - PDF_MARGIN - PDF_TITLE_SIZE
+            parts.append(f"BT /F2 {PDF_TITLE_SIZE} Tf 0 0 0 rg {PDF_MARGIN} "
+                         f"{y:.1f} Td ({_pdf_escape(title)}) Tj ET")
+            if subtitle:
+                y -= PDF_SUBTITLE_GAP
+                parts.append(f"BT /F2 {PDF_SUBTITLE_SIZE} Tf 0.30 0.30 0.30 rg "
+                             f"{PDF_MARGIN} {y:.1f} Td "
+                             f"({_pdf_escape(subtitle)}) Tj ET")
+            y -= PDF_RULE_GAP
+            parts.append(f"0.75 0.75 0.75 RG 0.7 w {PDF_MARGIN} {y:.1f} m "
+                         f"{PDF_PAGE_W - PDF_MARGIN} {y:.1f} l S")
+            y = first_top
+        parts.append("0 0 0 rg")
+        parts.append(f"BT /F1 {PDF_BODY_SIZE} Tf {PDF_LEADING} TL "
+                     f"{PDF_MARGIN} {y:.1f} Td")
+        for row in rows:
+            parts.append(f"({_pdf_escape(row)}) Tj T*")
+        parts.append("ET")
+        foot = f"Page {idx + 1} of {total}"
+        parts.append(f"BT /F1 8 Tf 0.45 0.45 0.45 rg "
+                     f"{PDF_PAGE_W - PDF_MARGIN - len(foot) * 8 * PDF_COURIER_WIDTH:.1f} "
+                     f"{PDF_MARGIN - 2:.1f} Td ({_pdf_escape(foot)}) Tj ET")
+        return "\n".join(parts).encode("latin-1", "replace")
+
+    # --- assemble the file: 1 catalog + 1 pages node + 2 fonts + 2 objs/page ---
+    objs = {}                                    # number -> bytes (object body)
+    n_catalog, n_pages, n_f1, n_f2 = 1, 2, 3, 4
+    first_page_obj = 5
+    page_nums = [first_page_obj + 2 * i for i in range(total)]
+
+    objs[n_catalog] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join(f"{n} 0 R" for n in page_nums)
+    objs[n_pages] = (f"<< /Type /Pages /Count {total} /Kids [{kids}] >>"
+                     ).encode("latin-1")
+    objs[n_f1] = (b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier "
+                  b"/Encoding /WinAnsiEncoding >>")
+    objs[n_f2] = (b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+                  b"/Encoding /WinAnsiEncoding >>")
+    for idx, rows in enumerate(pages):
+        pnum = page_nums[idx]
+        cnum = pnum + 1
+        data = content_stream(idx, rows)
+        objs[pnum] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_W:g} {PDF_PAGE_H:g}] "
+            f"/Resources << /Font << /F1 {n_f1} 0 R /F2 {n_f2} 0 R >> >> "
+            f"/Contents {cnum} 0 R >>").encode("latin-1")
+        objs[cnum] = (f"<< /Length {len(data)} >>\nstream\n".encode("latin-1")
+                      + data + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += f"{num} 0 obj\n".encode("latin-1") + objs[num] + b"\nendobj\n"
+    xref_at = len(out)
+    count = max(objs) + 1
+    out += f"xref\n0 {count}\n".encode("latin-1")
+    out += b"0000000000 65535 f \n"
+    for num in range(1, count):
+        out += f"{offsets.get(num, 0):010d} 00000 n \n".encode("latin-1")
+    out += (f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n"
+            f"{xref_at}\n%%EOF\n").encode("latin-1")
+
+    with open(path, "wb") as f:
+        f.write(bytes(out))
+    return total
+
+
+def log_files_for(stream_name, log_dir=LOG_DIR):
+    """Every saved log file for a feed, oldest first: [(YYYYMMDD, path), ...]."""
+    pattern = os.path.join(log_dir, f"{safe_filename(stream_name)}-*.log")
+    out = []
+    for p in glob.glob(pattern):
+        day = os.path.splitext(os.path.basename(p))[0].rsplit("-", 1)[-1]
+        if len(day) == 8 and day.isdigit():
+            out.append((day, p))
+    return sorted(out)
+
+
+_LOG_LINE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\]\s(.*)$")
+
+
+def parse_log_line(line):
+    """Split a saved log line back into (ts, text), or None if it isn't one.
+    Logs are written as "[HH:MM:SS] text" by Output.line."""
+    m = _LOG_LINE.match(line.rstrip("\n"))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def read_log_lines(paths):
+    """Read transcript lines from log files, in the order given. Unreadable files
+    are skipped -- a partial export beats no export."""
+    lines = []
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines.extend(ln.rstrip("\n") for ln in f)
+        except OSError:
+            continue
+    return lines
+
+
+def day_summaries(stream_name, clips=None, log_dir=LOG_DIR):
+    """What's reviewable for a feed, newest day first:
+        [{"day", "lines", "clips", "path"}, ...]
+
+    Powers the "open a past day" picker, which has to tell the user two separate
+    things: a day can have a transcript but no audio left, because clips are
+    purged on a shorter schedule than logs (clips.retention_days vs
+    log_retention_days). `clips` is an optional ClipStore used to count surviving
+    audio; without one the clips counts are 0."""
+    out = []
+    for day, path in log_files_for(stream_name, log_dir=log_dir):
+        entries = read_log_entries([(day, path)])
+        n_clips = 0
+        if clips is not None:
+            cmap = clips.clip_map(day)
+            used = {}
+            for _d, ts, _text in entries:
+                ids = cmap.get((stream_name, ts), ())
+                i = used.get(ts, 0)
+                used[ts] = i + 1
+                if i < len(ids):
+                    n_clips += 1
+        out.append({"day": day, "lines": len(entries), "clips": n_clips,
+                    "path": path})
+    out.sort(key=lambda r: r["day"], reverse=True)      # newest first
+    return out
+
+
+def load_day(stream_name, day, clips=None, log_dir=LOG_DIR):
+    """One day's transcript for a feed as [(ts, text, clip_id_or_None)].
+
+    The same second can hold several transmissions, each with its own clip, so
+    ids are taken from clip_map in order rather than by lookup -- see
+    ClipStore.clip_map. Returns [] if that day has no log."""
+    paths = [(d, p) for d, p in log_files_for(stream_name, log_dir=log_dir)
+             if d == day]
+    if not paths:
+        return []
+    entries = read_log_entries(paths)
+    cmap = clips.clip_map(day) if clips is not None else {}
+    used, out = {}, []
+    for _d, ts, text in entries:
+        ids = cmap.get((stream_name, ts), ())
+        i = used.get(ts, 0)
+        used[ts] = i + 1
+        out.append((ts, text, ids[i] if i < len(ids) else None))
+    return out
+
+
+def read_log_entries(day_paths):
+    """Like read_log_lines, but keeps each line's DAY: [(day, ts, text), ...].
+
+    Log files only record the time of day; the date lives in the filename. A PDF
+    header that reports the first and last transmission needs both, so callers
+    that care about the span read entries instead of bare lines.
+    Unparseable lines (a torn write, a stray blank) are skipped."""
+    entries = []
+    for day, path in day_paths:
+        for raw in read_log_lines([path]):
+            got = parse_log_line(raw)
+            if got:
+                entries.append((day, got[0], got[1]))
+    return entries
+
+
+def transcript_span(entries):
+    """(first, last) as 'YYYY-MM-DD HH:MM:SS' over [(day, ts, ...)] entries, or
+    (None, None) if there are none. Sorted here rather than trusting input order,
+    so a caller that concatenates days out of order still gets a true span."""
+    stamps = sorted(f"{day[:4]}-{day[4:6]}-{day[6:8]} {ts}"
+                    for day, ts, *_ in entries if len(day) == 8)
+    return (stamps[0], stamps[-1]) if stamps else (None, None)
+
+
+def format_transcript_span(first, last):
+    """Human-readable span for a transcript header. Collapses the date when the
+    whole transcript is from one day, which is the common case:
+
+        2026-07-28  ·  10:38:24 - 11:05:02
+        2026-07-12 08:00:01  -  2026-07-19 23:59:12
+    """
+    if not first and not last:
+        return ""
+    if not last or first == last:
+        return first or last
+    d1, t1 = first.split(" ")
+    d2, t2 = last.split(" ")
+    if d1 == d2:
+        return f"{d1}  ·  {t1} – {t2}"
+    return f"{first}  –  {last}"
+
+
+# --------------------------------------------------------------------------
+# Clip recording: keep the audio behind each transcript line.
+#
+# The gate already does the hard part. Gate.push() emits ONE completed segment
+# per transmission and that same array is what gets transcribed, so a line and
+# its audio are 1:1 -- there is nothing to record continuously and slice up
+# later. A clip is just that array written out (preroll_sec included, so it
+# doesn't sound chopped).
+#
+# Storage is the real constraint: 16 kHz mono s16 is 32 KB/s, so a busy feed at
+# ~30% duty cycle (~7h of actual transmissions) is ~800 MB/day as WAV. Clips are
+# therefore encoded to Opus through the ffmpeg that already decodes the streams
+# (no new dependency on either architecture), which measures ~7x smaller on
+# scanner-length segments -- call it ~100 MB/day for a busy feed. If ffmpeg can't
+# encode Opus we fall back to WAV via the stdlib and say so once.
+#
+# Writing happens on a worker thread: encoding on the transcribe thread would
+# add latency to every line.
+# --------------------------------------------------------------------------
+CLIP_DIR = os.path.join(DATA_DIR, "clips")
+CLIP_QUEUE_MAX = 200          # bounded: never let a stalled disk eat memory
+CLIP_CAP_CHECK_EVERY = 100    # writes between size-cap sweeps while running
+CLIP_DEFAULTS = {"enabled": False, "retention_days": 7, "bitrate": "24k",
+                 "max_gb": 0}          # 0 = no size cap, days only
+
+
+def clip_settings(cfg):
+    """Merge the config's 'clips' block over the defaults."""
+    s = dict(CLIP_DEFAULTS)
+    s.update(cfg.get("clips") or {})
+    return s
+
+
+def decode_audio_file(path, ffmpeg=None):
+    """Decode an audio FILE to raw 16 kHz mono s16 bytes. b"" on any failure."""
+    cmd = [ffmpeg or find_ffmpeg(), "-nostdin", "-loglevel", "error", "-i", path,
+           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30,
+                              **_no_window_kwargs())
+        return proc.stdout if proc.returncode == 0 else b""
+    except Exception:
+        return b""
+
+
+def decode_audio_bytes(data, ffmpeg=None):
+    """Same, but for audio already in memory -- lets a clip inside a transcript
+    bundle play without ever being written to disk."""
+    if not data:
+        return b""
+    cmd = [ffmpeg or find_ffmpeg(), "-nostdin", "-loglevel", "error",
+           "-i", "pipe:0", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+           "pipe:1"]
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=30,
+                              **_no_window_kwargs())
+        return proc.stdout if proc.returncode == 0 else b""
+    except Exception:
+        return b""
+
+
+def _f32_to_s16_bytes(audio):
+    """Gate segments are float32 in [-1, 1]; clips are int16 PCM."""
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+class ClipStore:
+    """Saves and reloads the audio behind transcript lines.
+
+    save() is called from the transcribe thread and returns a clip id
+    immediately; the encode happens on this object's writer thread. The id is
+    minted up front so the transcript line can carry it before the file exists.
+    """
+
+    def __init__(self, cfg, out=None, clip_dir=CLIP_DIR, ffmpeg=None):
+        s = clip_settings(cfg)
+        self.enabled = bool(s["enabled"])
+        self.retention_days = s["retention_days"]
+        self.max_gb = s.get("max_gb", 0)
+        self.bitrate = s["bitrate"]
+        self.dir = clip_dir
+        self.out = out
+        self.ffmpeg = ffmpeg or find_ffmpeg()
+        self._q = queue.Queue(maxsize=CLIP_QUEUE_MAX)
+        self._thread = None
+        self._stop = threading.Event()
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+        self._opus = None           # None = not probed yet, then True/False
+        self._warned = False
+        self.dropped = 0            # clips lost to a full queue (writer too slow)
+        self._since_cap_check = 0   # writes since the last size-cap sweep
+
+    # -- lifecycle ---------------------------------------------------------
+    def start(self):
+        if self._thread is not None:
+            return
+        os.makedirs(self.dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="clipwriter")
+        self._thread.start()
+
+    def stop(self, timeout=5.0):
+        """Stop the writer, giving queued clips a chance to land."""
+        self._stop.set()
+        t = self._thread
+        self._thread = None
+        if t:
+            t.join(timeout=timeout)
+
+    # -- writing -----------------------------------------------------------
+    def new_id(self, feed, when=None):
+        when = when or dt.datetime.now()
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
+        return (f"{safe_filename(feed)}-{when.strftime('%Y%m%d-%H%M%S')}"
+                f"-{seq:05d}")
+
+    def save(self, feed, audio, text="", when=None):
+        """Queue `audio` (float32 gate segment) for writing. Returns the clip id,
+        or None if recording is off or the queue is saturated."""
+        if not self.enabled or self._thread is None:
+            return None
+        when = when or dt.datetime.now()
+        clip_id = self.new_id(feed, when)
+        item = {
+            "id": clip_id, "feed": feed, "day": when.strftime("%Y%m%d"),
+            "ts": when.strftime("%H:%M:%S"), "text": text,
+            "dur": round(len(audio) / float(SAMPLE_RATE), 2),
+        }
+        try:
+            self._q.put_nowait((item, _f32_to_s16_bytes(audio)))
+        except queue.Full:
+            # Better to lose a clip than to stall transcription behind the disk.
+            self.dropped += 1
+            return None
+        return clip_id
+
+    def _run(self):
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                item, pcm = self._q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                self._write(item, pcm)
+            except Exception as e:
+                self._warn(f"clip write failed: {e}")
+            finally:
+                self._q.task_done()
+
+    def _write(self, item, pcm):
+        os.makedirs(self.dir, exist_ok=True)
+        if self._opus is None:
+            self._opus = self._probe_opus()
+            if not self._opus:
+                self._warn("ffmpeg has no Opus encoder -- saving clips as WAV "
+                           "(much larger; consider a shorter clip retention).")
+        path = os.path.join(self.dir, item["id"] +
+                            (".opus" if self._opus else ".wav"))
+        if self._opus:
+            self._encode_opus(pcm, path)
+        else:
+            self._write_wav(pcm, path)
+        item["file"] = os.path.basename(path)
+        item["bytes"] = os.path.getsize(path)
+        with open(self._index_path(item["day"]), "a", encoding="utf-8") as f:
+            f.write(json.dumps(item) + "\n")
+
+        # Hold the size cap while running, not only at startup: a session left up
+        # for days would otherwise sail past it. Checked periodically rather than
+        # per clip -- it's a directory scan, and a hundred clips is a few MB of
+        # overshoot at most.
+        self._since_cap_check += 1
+        if self.max_gb and self._since_cap_check >= CLIP_CAP_CHECK_EVERY:
+            self._since_cap_check = 0
+            evicted = purge_clips_over_size(float(self.max_gb) * (1 << 30),
+                                            self.dir)
+            if evicted and self.out:
+                self.out.status(f"Clip storage reached {self.max_gb:g} GB — "
+                                f"removed the {len(evicted)} oldest clip(s).")
+
+    def _encode_opus(self, pcm, path):
+        cmd = [self.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+               "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+               "-c:a", "libopus", "-b:a", self.bitrate, "-application", "voip",
+               path]
+        proc = subprocess.run(cmd, input=pcm, capture_output=True,
+                              **_no_window_kwargs())
+        if proc.returncode != 0 or not os.path.exists(path):
+            raise RuntimeError((proc.stderr or b"").decode("utf-8", "replace")[-200:]
+                               or "ffmpeg failed")
+
+    @staticmethod
+    def _write_wav(pcm, path):
+        import wave
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm)
+
+    def _probe_opus(self):
+        """Does this ffmpeg build have libopus? Probed once, then cached."""
+        try:
+            proc = subprocess.run([self.ffmpeg, "-hide_banner", "-encoders"],
+                                  capture_output=True, timeout=15,
+                                  **_no_window_kwargs())
+            return b"libopus" in (proc.stdout or b"")
+        except Exception:
+            return False
+
+    def _warn(self, msg):
+        if self.out and not self._warned:
+            self._warned = True
+            self.out.status(msg)
+
+    # -- reading -----------------------------------------------------------
+    def _index_path(self, day):
+        return os.path.join(self.dir, f"index-{day}.jsonl")
+
+    def path_for(self, clip_id):
+        """Where a clip landed, or None if it isn't on disk (yet)."""
+        for ext in (".opus", ".wav"):
+            p = os.path.join(self.dir, clip_id + ext)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def load_pcm(self, clip_id):
+        """Decode a clip back to raw 16 kHz mono s16 bytes for playback.
+        Returns b"" if the clip is missing or undecodable."""
+        path = self.path_for(clip_id)
+        if not path:
+            return b""
+        if path.endswith(".wav"):
+            import wave
+            try:
+                with wave.open(path, "rb") as w:
+                    return w.readframes(w.getnframes())
+            except Exception:
+                return b""
+        return decode_audio_file(path, self.ffmpeg)
+
+    def index_for_day(self, day):
+        """Every clip record saved on `day` (YYYYMMDD), oldest first."""
+        p = self._index_path(day)
+        if not os.path.isfile(p):
+            return []
+        rows = []
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue        # a torn last line after a hard kill
+        return rows
+
+    def find_clip(self, feed, ts, day=None):
+        """The clip id for a feed's line at timestamp `ts` (HH:MM:SS), or None.
+        Used to re-attach audio to lines restored from disk logs."""
+        day = day or dt.datetime.now().strftime("%Y%m%d")
+        for row in self.index_for_day(day):
+            if row.get("feed") == feed and row.get("ts") == ts:
+                return row.get("id")
+        return None
+
+    def clip_info(self, clip_id):
+        """The index record for one clip, or None. The day is embedded in the id
+        ({feed}-YYYYMMDD-HHMMSS-NNNNN), so this reads just that day's index."""
+        parts = clip_id.rsplit("-", 3)
+        if len(parts) < 4:
+            return None
+        for row in self.index_for_day(parts[-3]):
+            if row.get("id") == clip_id:
+                return row
+        return None
+
+    def clip_map(self, day=None):
+        """{(feed, ts): [clip_id, ...]} for a whole day, read once. Restoring a
+        scrollback means thousands of lookups; find_clip() per line would rescan
+        the index every time.
+
+        The value is a LIST because timestamps are only second-resolution: a busy
+        feed can log several transmissions within one second, and each has its own
+        clip. Both the log and the index are chronological, so a caller walking
+        the log can take ids from each list in order and keep lines matched to the
+        right audio. Collapsing to one id per second would attach the same clip to
+        every line in it."""
+        out = {}
+        for r in self.index_for_day(day or dt.datetime.now().strftime("%Y%m%d")):
+            if r.get("feed") and r.get("ts") and r.get("id"):
+                out.setdefault((r["feed"], r["ts"]), []).append(r["id"])
+        return out
+
+
+# --------------------------------------------------------------------------
+# Transcript bundles: a transcript plus the audio behind it, in one file.
+#
+# The point is to outlive purge_old_clips -- to keep an incident, or hand it to
+# someone else, after the 7-day clip retention has taken the originals. That
+# inverts the usual safety property, so it's deliberate and opt-in only.
+#
+# The container is a plain ZIP with a distinct extension. A private binary format
+# would be readable only by this app, which is a poor bet for something whose
+# whole purpose is archival: rename a .tscript to .zip and any tool gets the
+# transcript as JSON and the audio as ordinary .opus files. Using zipfile also
+# keeps this dependency-free on both architectures.
+#
+#   manifest.json    format/version/app, feed, day, span, counts
+#   transcript.json  [{"ts", "text", "clip"}, ...] in order
+#   clips/<id>.opus  only the clips the lines reference
+#
+# Clips are read straight out of the archive and decoded in memory (see
+# TranscriptBundle.load_pcm) rather than extracted: these are voice recordings,
+# and scattering copies through temp folders to play them would undo the care
+# taken everywhere else.
+# --------------------------------------------------------------------------
+TRANSCRIPT_FORMAT = "transcriber-transcript"
+TRANSCRIPT_VERSION = 1
+TRANSCRIPT_EXT = ".tscript"
+
+
+def write_transcript_bundle(path, feed, rows, store, app_version="", day=None):
+    """Write a .tscript bundle.
+
+    rows  -- [(ts, text, clip_id_or_None)], the shape load_day returns
+    store -- ClipStore (or TranscriptBundle) supplying the audio
+
+    Lines whose clip has already been purged are still written; they simply
+    carry no audio, exactly as they appear in the app. Returns
+    {"lines": n, "clips": n, "missing": [ids], "bytes": size}."""
+    import zipfile
+
+    entries, missing, added = [], [], {}
+    for ts, text, clip_id in rows:
+        rec = {"ts": ts, "text": text}
+        if clip_id:
+            src = store.path_for(clip_id) if hasattr(store, "path_for") else None
+            data = None
+            if src and os.path.isfile(src):
+                ext = os.path.splitext(src)[1]
+                with open(src, "rb") as f:
+                    data = f.read()
+            elif hasattr(store, "clip_bytes"):        # re-bundling a bundle
+                data, ext = store.clip_bytes(clip_id)
+            if data:
+                added[clip_id] = (f"clips/{clip_id}{ext}", data)
+                rec["clip"] = clip_id
+            else:
+                missing.append(clip_id)
+        entries.append(rec)
+
+    stamps = [r["ts"] for r in entries if r.get("ts")]
+    manifest = {
+        "format": TRANSCRIPT_FORMAT,
+        "version": TRANSCRIPT_VERSION,
+        "app_version": app_version,
+        "created": dt.datetime.now().isoformat(timespec="seconds"),
+        "feed": feed,
+        "day": day or "",
+        "lines": len(entries),
+        "clips": len(added),
+        "first": stamps[0] if stamps else "",
+        "last": stamps[-1] if stamps else "",
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        # The transcript compresses well; the clips are already Opus, so storing
+        # them uncompressed saves time and gains nothing to deflate.
+        z.writestr("transcript.json", json.dumps(entries, indent=2))
+        for name, data in added.values():
+            z.writestr(zipfile.ZipInfo(name), data,
+                       compress_type=zipfile.ZIP_STORED)
+    return {"lines": len(entries), "clips": len(added), "missing": missing,
+            "bytes": os.path.getsize(path)}
+
+
+class TranscriptBundle:
+    """A .tscript opened for review. Exposes the same (ts, text, clip_id) rows
+    the live views use, and decodes clips from inside the archive.
+
+    Use as a context manager, or call close(). Raises ValueError if the file
+    isn't a readable bundle."""
+
+    def __init__(self, path, ffmpeg=None):
+        import zipfile
+        self.path = path
+        self.ffmpeg = ffmpeg or find_ffmpeg()
+        try:
+            self._zip = zipfile.ZipFile(path, "r")
+        except Exception as e:
+            raise ValueError(f"Not a readable transcript file: {e}")
+        try:
+            self.manifest = json.loads(self._zip.read("manifest.json"))
+            entries = json.loads(self._zip.read("transcript.json"))
+        except KeyError:
+            self._zip.close()
+            raise ValueError("That file isn't a Transcriber transcript "
+                             "(no manifest inside).")
+        except Exception as e:
+            self._zip.close()
+            raise ValueError(f"That transcript file is damaged: {e}")
+        if self.manifest.get("format") != TRANSCRIPT_FORMAT:
+            self._zip.close()
+            raise ValueError("That file isn't a Transcriber transcript.")
+        if self.manifest.get("version", 0) > TRANSCRIPT_VERSION:
+            self._zip.close()
+            raise ValueError(
+                f"That transcript was written by a newer version of "
+                f"Transcriber (format {self.manifest['version']}). Update the "
+                f"app to open it.")
+
+        # Map clip id -> member name from what's actually in the archive, rather
+        # than trusting ids from the JSON to build paths.
+        self._members = {}
+        for name in self._zip.namelist():
+            if name.startswith("clips/") and "/" not in name[len("clips/"):]:
+                base = os.path.basename(name)
+                self._members[os.path.splitext(base)[0]] = name
+
+        self.rows = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            cid = e.get("clip")
+            self.rows.append((e.get("ts", ""), e.get("text", ""),
+                              cid if cid in self._members else None))
+
+    # -- context manager ---------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._zip.close()
+        except Exception:
+            pass
+
+    # -- what the viewer needs --------------------------------------------
+    @property
+    def feed(self):
+        return self.manifest.get("feed", "(unknown feed)")
+
+    @property
+    def day(self):
+        return self.manifest.get("day", "")
+
+    def clip_bytes(self, clip_id):
+        """(raw encoded bytes, extension) for a clip, or (None, "")."""
+        name = self._members.get(clip_id)
+        if not name:
+            return None, ""
+        try:
+            return self._zip.read(name), os.path.splitext(name)[1]
+        except Exception:
+            return None, ""
+
+    def load_pcm(self, clip_id):
+        """Decode a clip to raw PCM without extracting it. Same contract as
+        ClipStore.load_pcm, so the player and MP3 export take either source."""
+        data, ext = self.clip_bytes(clip_id)
+        if not data:
+            return b""
+        if ext == ".wav":
+            import io
+            import wave
+            try:
+                with wave.open(io.BytesIO(data), "rb") as w:
+                    return w.readframes(w.getnframes())
+            except Exception:
+                return b""
+        return decode_audio_bytes(data, self.ffmpeg)
+
+    def clip_info(self, clip_id):
+        """Minimal record for a clip, so MP3 export can name its output."""
+        for ts, text, cid in self.rows:
+            if cid == clip_id:
+                return {"id": clip_id, "feed": self.feed, "ts": ts,
+                        "text": text, "day": self.day}
+        return None
+
+
+MP3_DEFAULT_BITRATE = "64k"     # mono 16 kHz speech; plenty, and small
+MP3_GAP_MS = 300                # silence between joined transmissions
+
+
+def export_clips_mp3(clip_ids, out_path, store, gap_ms=MP3_GAP_MS,
+                     bitrate=MP3_DEFAULT_BITRATE, title=None):
+    """Decode the given clips, join them in order, and write one MP3.
+
+    Joining happens as raw PCM rather than by concatenating encoded files: the
+    clips are Opus and stitching compressed frames would need matching encoder
+    state. Decoding to s16 and re-encoding once is simpler and lossless-enough
+    for speech at these rates. A short silence separates transmissions so a
+    combined file doesn't run together.
+
+    Returns {"clips": n_written, "missing": [ids], "seconds": float}. Raises
+    RuntimeError if nothing could be decoded or ffmpeg fails."""
+    gap = b"\x00\x00" * int(SAMPLE_RATE * max(0, gap_ms) / 1000)
+    chunks, missing = [], []
+    for cid in clip_ids:
+        pcm = store.load_pcm(cid)
+        if not pcm:
+            missing.append(cid)
+            continue
+        if chunks:
+            chunks.append(gap)
+        chunks.append(pcm)
+    if not chunks:
+        raise RuntimeError("None of the selected clips could be read "
+                           "(they may have been purged).")
+    audio = b"".join(chunks)
+
+    cmd = [store.ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+           "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+           "-c:a", "libmp3lame", "-b:a", bitrate]
+    if title:
+        cmd += ["-metadata", f"title={title}"]
+    cmd += [out_path]
+    proc = subprocess.run(cmd, input=audio, capture_output=True,
+                          **_no_window_kwargs())
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        err = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        raise RuntimeError(err or "ffmpeg failed to write the MP3.")
+    n = len(clip_ids) - len(missing)
+    return {"clips": n, "missing": missing,
+            "seconds": round(len(audio) / 2.0 / SAMPLE_RATE, 2)}
+
+
+def purge_old_clips(retention_days, clip_dir=CLIP_DIR):
+    """Delete clips and index files older than retention_days. Same contract as
+    purge_old_logs -- clips are voice recordings, so bounding them matters more,
+    not less. retention_days <= 0 disables purging. Returns deleted paths."""
+    if not retention_days or retention_days <= 0:
+        return []
+    if not os.path.isdir(clip_dir):
+        return []
+    cutoff = time.time() - retention_days * 86400
+    deleted = []
+    for pattern in ("*.opus", "*.wav", "index-*.jsonl"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    deleted.append(path)
+            except OSError:
+                pass
+    return deleted
+
+
+def clips_disk_usage(clip_dir=CLIP_DIR):
+    """(clip count, total bytes) currently on disk."""
+    n = total = 0
+    for pattern in ("*.opus", "*.wav"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                total += os.path.getsize(path)
+                n += 1
+            except OSError:
+                pass
+    return n, total
+
+
+def logs_disk_usage(log_dir=LOG_DIR):
+    """(file count, total bytes) of saved transcripts. Text is tiny next to the
+    audio -- showing both side by side is what makes the separate policies
+    obviously right rather than fussy."""
+    n = total = 0
+    for path in glob.glob(os.path.join(log_dir, "*.log")):
+        try:
+            total += os.path.getsize(path)
+            n += 1
+        except OSError:
+            pass
+    return n, total
+
+
+def purge_clips_over_size(max_bytes, clip_dir=CLIP_DIR):
+    """Delete the OLDEST clips until the folder fits inside max_bytes.
+
+    A day limit alone can't bound the disk: a quiet week and a busy one differ by
+    an order of magnitude at the same retention. This is the setting that
+    actually caps it. max_bytes <= 0 disables. Returns deleted paths.
+
+    Index files are left alone -- they're tiny, and the day-based purge removes
+    them. A clip missing from disk with an index entry still present is already
+    handled everywhere (the marker just doesn't render)."""
+    if not max_bytes or max_bytes <= 0:
+        return []
+    if not os.path.isdir(clip_dir):
+        return []
+    files = []
+    for pattern in ("*.opus", "*.wav"):
+        for path in glob.glob(os.path.join(clip_dir, pattern)):
+            try:
+                files.append((os.path.getmtime(path), os.path.getsize(path), path))
+            except OSError:
+                pass
+    total = sum(f[1] for f in files)
+    if total <= max_bytes:
+        return []
+    deleted = []
+    for _mtime, size, path in sorted(files):        # oldest first
+        if total <= max_bytes:
+            break
+        try:
+            os.remove(path)
+            total -= size
+            deleted.append(path)
+        except OSError:
+            pass
+    return deleted
+
+
+def apply_clip_retention(settings, clip_dir=CLIP_DIR):
+    """Run both clip policies: age first, then the size cap on what's left.
+
+    Order matters -- expiring by age first means the size cap only has to evict
+    clips that are still within their retention window, so it takes the fewest
+    files it can. Returns (aged_out, over_size)."""
+    aged = purge_old_clips(settings.get("retention_days"), clip_dir)
+    cap_gb = settings.get("max_gb") or 0
+    over = purge_clips_over_size(float(cap_gb) * (1 << 30), clip_dir) \
+        if cap_gb else []
+    return aged, over
 
 
 # --------------------------------------------------------------------------
@@ -338,17 +1457,302 @@ def keyword_matches(text, keywords):
     return False
 
 
-def extract_callsign(text, extra_prefixes=None):
+# --------------------------------------------------------------------------
+# Aviation call signs -> "DELTA 510", "SPEEDBIRD 117", "N65JC".
+#
+# Same precision-first stance as the police extractor, but a different shape:
+# aircraft identify by AIRLINE TELEPHONY NAME + flight number, or by registration
+# ("November six five Juliet Charlie"). The police extractor catches Delta only
+# because "delta" happens to be in the NATO alphabet it uses for unit prefixes --
+# United, Speedbird and the rest get nothing -- so aviation needs its own pass.
+#
+# The telephony table does double duty: it also yields the airline code used to
+# build a FlightRadar24 link for the line.
+# --------------------------------------------------------------------------
+AIRLINE_TELEPHONY = {
+    # US majors / regionals
+    "delta": "DL", "united": "UA", "american": "AA", "southwest": "WN",
+    "jetblue": "B6", "alaska": "AS", "spirit": "NK", "frontier": "F9",
+    "allegiant": "G4", "hawaiian": "HA", "sun country": "SY",
+    "envoy": "MQ", "republic": "YX", "endeavor": "9E", "skywest": "OO",
+    "piedmont": "PT", "cactus": "AA", "brickyard": "YX",
+    # Cargo
+    "fedex": "FX", "ups": "5X", "giant": "5Y", "polar": "PO",
+    # International
+    "speedbird": "BA", "lufthansa": "LH", "air france": "AF", "klm": "KL",
+    "shamrock": "EI", "virgin": "VS", "emirates": "EK", "qatari": "QR",
+    "cathay": "CX", "japan air": "JL", "all nippon": "NH", "korean air": "KE",
+    "singapore": "SQ", "qantas": "QF", "air canada": "AC", "westjet": "WS",
+    "aeromexico": "AM", "volaris": "Y4", "iberia": "IB", "alitalia": "AZ",
+    "swiss": "LX", "austrian": "OS", "scandinavian": "SK", "finnair": "AY",
+    "turkish": "TK", "el al": "LY", "avianca": "AV", "copa": "CM",
+    "tam": "JJ", "azul": "AD",
+}
+# Whisper splits compound telephony names unpredictably: real logs show one
+# aircraft as "So 46-94", "South 46-94" and "South West 46, 94" within a minute.
+# Allow a space wherever the canonical name has none, so "South West" still
+# resolves to Southwest -- otherwise a line that transcribed perfectly well
+# yields no call sign and no FlightRadar24 link.
+# Compound names may arrive split ("South West") or joined ("Southwest"), and
+# names that really contain a space may arrive joined. Accept optional
+# whitespace between the parts of every compound name, in both directions.
+_COMPOUND_PARTS = {
+    "southwest": ("south", "west"), "jetblue": ("jet", "blue"),
+    "westjet": ("west", "jet"), "skywest": ("sky", "west"),
+    "speedbird": ("speed", "bird"), "aeromexico": ("aero", "mexico"),
+    "fedex": ("fed", "ex"), "finnair": ("finn", "air"),
+    "brickyard": ("brick", "yard"), "air france": ("air", "france"),
+    "all nippon": ("all", "nippon"), "japan air": ("japan", "air"),
+    "korean air": ("korean", "air"), "sun country": ("sun", "country"),
+    "air canada": ("air", "canada"), "el al": ("el", "al"),
+}
+
+
+def _telephony_pattern(name):
+    parts = _COMPOUND_PARTS.get(name, (name,))
+    return r"\s*".join(re.escape(p) for p in parts)
+
+
+# Lookup by the name with all spacing removed, so however Whisper spelled it we
+# land on the canonical entry: "south west" and "southwest" -> "southwest";
+# "airfrance" and "air france" -> "air france".
+_TELEPHONY_BY_KEY = {re.sub(r"\s+", "", k): k for k in AIRLINE_TELEPHONY}
+
+_AIRLINE_RE = "|".join(_telephony_pattern(k) for k in
+                       sorted(AIRLINE_TELEPHONY, key=len, reverse=True))
+
+# NATO letters, for decoding a spoken registration into an N-number.
+_NATO_LETTERS = {
+    "alpha": "A", "alfa": "A", "bravo": "B", "charlie": "C", "delta": "D",
+    "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H", "india": "I",
+    "juliet": "J", "juliett": "J", "julia": "J", "kilo": "K", "lima": "L",
+    "mike": "M", "november": "N", "oscar": "O", "papa": "P", "quebec": "Q",
+    "romeo": "R", "sierra": "S", "tango": "T", "uniform": "U", "victor": "V",
+    "whiskey": "W", "whisky": "W", "xray": "X", "x-ray": "X", "yankee": "Y",
+    "zulu": "Z",
+}
+_NATO_RE = "|".join(sorted(_NATO_LETTERS, key=len, reverse=True))
+
+# "Delta 510", "Delta 5-10" (Whisper often hyphenates spoken digits),
+# "Speedbird 117 heavy", "United 1685".
+_AIR_FLIGHT = re.compile(
+    r"\b(" + _AIRLINE_RE + r")\s+"
+    r"((?:\d[\d\s,-]{0,8}\d|\d))"
+    r"(?:\s+(?:heavy|super))?\b", re.I)
+
+
+def _flight_number(raw):
+    """Join a spoken flight number into digits.
+
+    Whisper punctuates these freely -- "4694", "46-94", "46, 94" are all the same
+    aircraft. Commas are accepted, but only between groups of 2+ digits: without
+    that guard "Delta 510, 2 miles out" would read as flight 5102. Anything after
+    a suspect group is dropped rather than the whole match rejected."""
+    groups = [g for g in re.split(r",", raw) if g.strip()]
+    digits = ""
+    for i, g in enumerate(groups):
+        d = re.sub(r"\D", "", g)
+        if not d:
+            break
+        if i and len(d) < 2:        # a lone digit after a comma isn't part of it
+            break
+        # Flight numbers are at most 4 digits. Stop before overflowing rather
+        # than building a too-long number, which would fail validation and throw
+        # away a call sign we had: "Delta 510, 20 miles out" is flight 510.
+        if len(digits) + len(d) > 4:
+            break
+        digits += d
+    return digits
+
+# "November 65 Juliet Charlie" -> N65JC. US registrations start with November;
+# requiring it keeps this from firing on stray phonetics mid-sentence.
+_AIR_TAIL = re.compile(
+    r"\bnovember\s+((?:(?:\d[\d\s-]{0,6}\d|\d)|(?:" + _NATO_RE + r"))"
+    r"(?:[\s,-]+(?:(?:\d[\d\s-]{0,6}\d|\d)|(?:" + _NATO_RE + r"))){0,4})\b",
+    re.I)
+
+
+def _digits_only(s):
+    return re.sub(r"\D", "", s)
+
+
+def extract_aircraft(text):
+    """Aircraft mentioned in `text`, in order, as (span, identifier, label).
+
+    span       the text that was matched, for linking it in place
+    identifier what FlightRadar24 wants: airline code + flight number ("DL510")
+               or a registration ("N65JC")
+    label      the canonical display name ("DELTA 510")
+
+    The label is rebuilt from the parts rather than taken from the text, because
+    it's also the grouping key for unit colouring and click-to-filter. Whisper
+    hyphenates spoken digits unpredictably ("Delta 5-10" one line, "Delta 510"
+    the next) and controllers append a weight class ("heavy", "super") that isn't
+    part of the identity -- left raw, one aircraft would scatter across several
+    labels. Precision over recall, as elsewhere: an unknown telephony word yields
+    nothing rather than a guess."""
+    if not text:
+        return []
+    out, taken = [], []
+
+    def _overlaps(a, b):
+        return any(not (b <= s or a >= e) for s, e in taken)
+
+    for m in _AIR_FLIGHT.finditer(text):
+        num = _flight_number(m.group(2))
+        if not 1 <= len(num) <= 4:
+            continue
+        # However it was spelled, resolve to the canonical telephony name so the
+        # label groups: "South West 46, 94" and "Southwest 4694" are one aircraft.
+        word = _TELEPHONY_BY_KEY.get(re.sub(r"\s+", "", m.group(1).lower()))
+        if not word:
+            continue
+        out.append((m.start(), m.group(0).strip(), f"{AIRLINE_TELEPHONY[word]}{num}",
+                    f"{word.upper()} {num}"))
+        taken.append((m.start(), m.end()))
+
+    for m in _AIR_TAIL.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        ident = "N"
+        for tok in re.split(r"[\s,-]+", m.group(1)):
+            t = tok.lower()
+            if t in _NATO_LETTERS:
+                ident += _NATO_LETTERS[t]
+            elif t.isdigit():
+                ident += t
+        # Validate against how US registrations are actually formed, or garbled
+        # phonetics become dead FlightRadar24 links. A real line, "November 0,
+        # Fox Try Yankee Cross", yielded "N0" and linked to /aircraft/n0:
+        # "Fox Try" isn't Foxtrot so nothing more was decoded, and a one-digit
+        # tail number was accepted. Rules: 2-5 characters after the N, and the
+        # first is a digit 1-9 (the FAA never issues a leading zero).
+        body = ident[1:]
+        if (2 <= len(body) <= 5 and body[0].isdigit() and body[0] != "0"):
+            out.append((m.start(), m.group(0).strip(), ident, ident))
+
+    out.sort()
+    return [(span, ident, label) for _pos, span, ident, label in out]
+
+
+def aircraft_url(identifier):
+    """FlightRadar24 page for an aircraft identifier. A registration (N-number)
+    resolves to the airframe; anything else is treated as a flight number.
+
+    This only builds a URL for the user's browser -- no API, no scraping."""
+    ident = (identifier or "").strip().lower()
+    if not ident:
+        return ""
+    base = "https://www.flightradar24.com/data"
+    if re.fullmatch(r"n[0-9][0-9a-z]*", ident):
+        return f"{base}/aircraft/{ident}"
+    return f"{base}/flights/{ident}"
+
+
+# --------------------------------------------------------------------------
+# Service profiles: what KIND of radio a feed carries.
+#
+# Three things in this pipeline are domain-specific, not one: the Whisper prompt,
+# which call-sign shape to look for, and whether "3658 East 149th" should become
+# a map link. Police and Fire/EMS differ only in the prompt -- the call-sign
+# extractor already handles both at once (52 police phonetics, 16 fire/EMS
+# designators, overlapping on "adam" alone), and shared PD+Fire dispatch channels
+# are common, so splitting the extractor would only lose units. ATC is the type
+# that genuinely changes behaviour.
+#
+# A feed with NO service set keeps the historical behaviour exactly: the global
+# initial_prompt, emergency call signs, address links on. Nothing migrates.
+# --------------------------------------------------------------------------
+_POLICE_PROMPT = (
+    "The following is police radio dispatch. Common terms: dispatch, copy, "
+    "en route, on scene, clear, 10-4, code three, signal, suspect, vehicle, "
+    "plate, registration, subject, complainant, requesting backup, be advised, "
+    "negative, affirmative, over."
+)
+_FIRE_PROMPT = (
+    "The following is fire and EMS radio dispatch. Common terms: engine, ladder, "
+    "truck, medic, ambulance, rescue, squad, battalion, chief, box alarm, "
+    "working fire, mutual aid, patient, transport, priority one, on scene, "
+    "staging, all clear, copy, be advised, en route."
+)
+_ATC_PROMPT = (
+    "The following is air traffic control radio between controllers and pilots. "
+    "Common phraseology: cleared for takeoff, cleared to land, line up and wait, "
+    "hold short, taxi via, runway, wind check, contact departure, contact ground, "
+    "climb and maintain, descend and maintain, turn left heading, turn right "
+    "heading, squawk, ident, traffic in sight, go around, heavy, roger, wilco, "
+    "affirm, negative, approved, request, ramp, gate, tower, approach, "
+    "left, right, center. "
+    # Airline telephony names, spelled the way they should come out. Whisper
+    # otherwise produces "So 46-94" / "South 46-94" for Southwest, and the call
+    # sign is lost. Seeded from real transcripts, not guessed.
+    "Airlines: Southwest, Delta, United, American, JetBlue, Spirit, Frontier, "
+    "Alaska, Republic, Envoy, Endeavor, SkyWest, FedEx, UPS."
+)
+
+SERVICE_PRESETS = {
+    "police": {"label": "Police", "prompt": _POLICE_PROMPT,
+               "callsigns": "emergency", "address_links": True,
+               "aircraft_links": False},
+    "fire": {"label": "Fire / EMS", "prompt": _FIRE_PROMPT,
+             "callsigns": "emergency", "address_links": True,
+             "aircraft_links": False},
+    "atc": {"label": "Air traffic control", "prompt": _ATC_PROMPT,
+            "callsigns": "aviation", "address_links": False,
+            "aircraft_links": True},
+    "general": {"label": "General", "prompt": "",
+                "callsigns": None, "address_links": False,
+                "aircraft_links": False},
+}
+
+# What a feed with no service set does -- i.e. every feed that existed before
+# service profiles were added.
+SERVICE_DEFAULT = {"label": "Police / Fire-EMS (default)", "prompt": None,
+                   "callsigns": "emergency", "address_links": True,
+                   "aircraft_links": False}
+
+
+def service_profile(stream, cfg=None):
+    """Resolve how a feed should be transcribed and rendered.
+
+    Returns a dict with: service, label, prompt, callsigns, address_links,
+    aircraft_links. The prompt resolves per-feed override -> service preset ->
+    the global initial_prompt, so a feed can always be tuned without touching
+    the others."""
+    stream = stream or {}
+    name = (stream.get("service") or "").lower() or None
+    preset = SERVICE_PRESETS.get(name, SERVICE_DEFAULT)
+    prompt = stream.get("initial_prompt")          # per-feed override
+    if not prompt:
+        prompt = preset["prompt"]
+    if prompt is None:                             # default profile: use global
+        prompt = (cfg or {}).get("initial_prompt") or ""
+    out = dict(preset)
+    out["service"] = name
+    out["prompt"] = prompt
+    return out
+
+
+def extract_callsign(text, extra_prefixes=None, style="emergency"):
     """
     Return a normalized unit call sign found in `text` (e.g. "ADAM 33",
     "ENGINE 14") or None. High precision: rejects spelled-out plates and street
     addresses. `extra_prefixes` (iterable of lowercase words) extends the set of
     recognized unit prefixes for local department lingo.
 
+    `style` selects the domain: "emergency" (police/fire units, the default) or
+    "aviation" (airline flights and registrations). A feed's service profile
+    picks this -- see SERVICE_PRESETS.
+
     NOTE: this identifies the FIRST unit MENTIONED in a transmission, which is a
     heuristic for who is involved -- not a guaranteed acoustic speaker ID.
     """
     if not text:
+        return None
+    if style == "aviation":
+        found = extract_aircraft(text)
+        return found[0][2] if found else None
+    if style in (None, "none"):
         return None
     prefixes = set(PHONETIC_WORDS) | set(DESIGNATOR_WORDS)
     if extra_prefixes:
@@ -418,11 +1822,17 @@ _NAME_NT = r"(?!(?i:" + _STREET_TYPE_RE + r")\b)" + _NAME
 
 # 1) Numbered street address: "3658 East 149th Street", "162 America Boulevard",
 #    "66745 Schubert Drive". Number + 1-3 name words + optional street type.
+#
+# NOT compiled with re.I. _NAME requires a capitalised word, and a blanket
+# re.I silently defeated that -- every lowercase word became a candidate street
+# name, so "Engine 14 show me en route" parsed as 14 + "show me en" + the street
+# type "route" and put a Google Maps link on it. ("en route" is about as common
+# as radio traffic gets.) Only the direction and street-type alternations are
+# case-insensitive, matching how _ADDR_NAMED already does it.
 _ADDR_NUMBERED = re.compile(
     r"\b(\d{2,6})\s+"
-    r"((?:" + _DIRS + r"\s+)?" + _NAME_NT + r"(?:\s+" + _NAME_NT + r"){0,2})"
-    r"(?:\s+(" + _STREET_TYPE_RE + r"))?\b",
-    re.I)
+    r"((?:(?i:" + _DIRS + r")\s+)?" + _NAME_NT + r"(?:\s+" + _NAME_NT + r"){0,2})"
+    r"(?:\s+((?i:" + _STREET_TYPE_RE + r")))?\b")
 
 # 2) Named street with an explicit type: "American Boulevard", "Schubert Drive",
 #    "Detroit Road". Name(s) immediately followed by a street type word.
@@ -544,12 +1954,21 @@ def purge_old_logs(retention_days, log_dir=LOG_DIR):
 
 
 # --------------------------------------------------------------------------
-# Update check: compare installed faster-whisper / ctranslate2 against the
+# Update check: compare the installed transcription-engine packages against the
 # latest on PyPI. Pure stdlib (urllib), short timeout, fails silently offline.
 # Reports only -- it never installs anything (updating is a deliberate, manual
 # `pip install -U ...` step, to avoid re-triggering the Python-version wheel trap).
+# Which packages matter depends on the engine: the ct2 ones aren't even installed
+# on ARM, where whisper.cpp/pywhispercpp is what's actually running.
 # --------------------------------------------------------------------------
-UPDATE_PACKAGES = ["faster-whisper", "ctranslate2"]
+UPDATE_PACKAGES = ["faster-whisper", "ctranslate2"]      # ct2 / x64
+UPDATE_PACKAGES_WHISPERCPP = ["pywhispercpp"]            # whisper.cpp / ARM
+
+
+def update_packages(cfg=None):
+    """The packages worth version-checking for the active engine."""
+    return (list(UPDATE_PACKAGES_WHISPERCPP)
+            if select_backend(cfg or {}) == "whispercpp" else list(UPDATE_PACKAGES))
 
 
 def installed_version(pkg):
@@ -595,12 +2014,15 @@ def _pypi_latest(pkg, timeout=4.0):
         return None
 
 
-def check_for_updates(packages=UPDATE_PACKAGES, timeout=4.0):
+def check_for_updates(packages=None, timeout=4.0, cfg=None):
     """
     Return a list of dicts, one per package:
       {"package", "installed", "latest", "update_available"}
     'latest' is None if PyPI couldn't be reached (offline / blocked).
+    `packages` defaults to the active engine's packages (see update_packages).
     """
+    if packages is None:
+        packages = update_packages(cfg)
     results = []
     for pkg in packages:
         cur = installed_version(pkg)
@@ -623,29 +2045,16 @@ def check_for_updates(packages=UPDATE_PACKAGES, timeout=4.0):
 APP_REPO = "DevCon-Productions/Transcriber"
 
 
-def interpreter_is_arm64():
-    """True if this build is native ARM64 (so it should fetch the ARM64
-    installer). Keys off the interpreter's OWN architecture, not the host's:
-    an emulated x64 process on an ARM host must report False so it upgrades with
-    the x64 installer. NOTE: platform.machine() can misreport under emulation on
-    Windows, so we use the build/wheel platform tag and PROCESSOR_ARCHITECTURE
-    (which reflect the process arch)."""
-    import sysconfig
-    plat = (sysconfig.get_platform() or "").lower()   # e.g. win-arm64 / win-amd64
-    if "arm64" in plat or "aarch64" in plat:
-        return True
-    if "amd64" in plat or "x86_64" in plat or "win32" in plat:
-        return False
-    arch = (os.environ.get("PROCESSOR_ARCHITECTURE") or "").upper()
-    return "ARM64" in arch
-
-
 def _pick_installer_asset(assets):
-    """Select the release .exe matching THIS build's architecture. Returns None
-    if no matching-arch installer is present, so we report 'no update' rather
-    than cross-installing the wrong architecture. Shared logic with the ARM
-    build: each release carries both Transcriber-Setup-<v>.exe (x64) and
-    Transcriber-ARM64-Setup-<v>.exe (arm64)."""
+    """Choose the installer asset (.exe) matching THIS build's architecture.
+
+    Releases carry both x64 (`Transcriber-Setup-<v>.exe`) and ARM64
+    (`Transcriber-ARM64-Setup-<v>.exe`) installers. This is the ARM build, so it
+    must pick the arm64-named asset and NEVER fall back to the x64 one (installing
+    the wrong architecture). If no arm64 installer is on the release yet, return
+    None -> the updater simply reports no update rather than downloading x64.
+    (The x64 build makes the mirror choice: the .exe whose name does NOT contain
+    'arm64'.)"""
     want_arm = interpreter_is_arm64()
     for a in assets:
         name = str(a.get("name", "")).lower()
@@ -834,27 +2243,33 @@ def enable_windows_ansi():
 class Output:
     def __init__(self, on_line=None, on_status=None, console=True, file_logging=True):
         self._lock = threading.Lock()
-        self.on_line = on_line          # callback(stream_name, color, text, ts)
+        # callback(stream_name, color, text, ts, clip_id); clip_id is None unless
+        # this feed is recording and the clip was queued successfully.
+        self.on_line = on_line
         self.on_status = on_status      # callback(msg)
         self.console = console
         self.file_logging = file_logging
         if self.file_logging:
             os.makedirs(LOG_DIR, exist_ok=True)
 
-    def line(self, stream_name, color, text):
-        ts = dt.datetime.now().strftime("%H:%M:%S")
+    def line(self, stream_name, color, text, clip_id=None, when=None):
+        # `when` lets the caller pin the line and its saved clip to the SAME
+        # instant -- otherwise the two can straddle a second boundary and the
+        # clip index no longer matches the timestamp written to the log.
+        when = when or dt.datetime.now()
+        ts = when.strftime("%H:%M:%S")
         with self._lock:
             if self.console:
                 code = ANSI_COLORS.get(color, "97")
                 print(f"\033[{code}m[{ts}] {stream_name:<10}\033[0m {text}", flush=True)
             if self.file_logging:
-                day = dt.datetime.now().strftime("%Y%m%d")
+                day = when.strftime("%Y%m%d")
                 path = os.path.join(LOG_DIR, f"{safe_filename(stream_name)}-{day}.log")
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(f"[{ts}] {text}\n")
         if self.on_line:
             try:
-                self.on_line(stream_name, color, text, ts)
+                self.on_line(stream_name, color, text, ts, clip_id)
             except Exception:
                 pass
 
@@ -875,6 +2290,10 @@ class Output:
 # Workers always feed their decoded PCM here tagged with their stream name; the
 # player only emits audio for the currently-selected source (listen one-at-a-
 # time). sounddevice is imported lazily so the headless CLI never depends on it.
+#
+# A saved clip (play_clip) takes priority over the live feed rather than mixing
+# with it: two radio voices at once is unlistenable, and the point of clicking a
+# line is to hear THAT transmission. Live audio resumes when the clip ends.
 # --------------------------------------------------------------------------
 class AudioPlayer:
     def __init__(self):
@@ -883,6 +2302,7 @@ class AudioPlayer:
         self._stream = None
         self._sd = None
         self._buf = bytearray()
+        self._clip = bytearray()        # one-shot clip, drained before _buf
         self._ok = self._init_device()
 
     def _init_device(self):
@@ -905,9 +2325,14 @@ class AudioPlayer:
     def _callback(self, outdata, frames, time_info, status):
         need = frames * 2  # int16 mono -> 2 bytes/frame
         with self._lock:
-            have = min(need, len(self._buf))
-            outdata[:have] = bytes(self._buf[:have])
-            del self._buf[:have]
+            src = self._clip if self._clip else self._buf
+            have = min(need, len(src))
+            outdata[:have] = bytes(src[:have])
+            del src[:have]
+            # While a clip plays, live audio is discarded rather than queued --
+            # otherwise the feed would blast a backlog the moment the clip ends.
+            if self._clip:
+                self._buf.clear()
         if have < need:
             outdata[have:] = b"\x00" * (need - have)
 
@@ -921,11 +2346,30 @@ class AudioPlayer:
         with self._lock:
             return self._source
 
+    def play_clip(self, pcm_bytes):
+        """Play a saved clip once, over the top of whatever is live. Replaces any
+        clip already playing (clicking a second line interrupts the first)."""
+        if not self._ok or not pcm_bytes:
+            return False
+        with self._lock:
+            self._clip = bytearray(pcm_bytes)
+            self._buf.clear()
+        return True
+
+    def stop_clip(self):
+        """Cut a clip short and hand the speakers back to the live feed."""
+        with self._lock:
+            self._clip.clear()
+
+    def clip_playing(self):
+        with self._lock:
+            return bool(self._clip)
+
     def feed(self, name, pcm_bytes):
         if not self._ok:
             return
         with self._lock:
-            if name != self._source:
+            if name != self._source or self._clip:
                 return
             # Guard against unbounded growth if the device stalls (~2s cap).
             if len(self._buf) > SAMPLE_RATE * 2 * 2:
@@ -942,14 +2386,22 @@ class AudioPlayer:
 
 
 # --------------------------------------------------------------------------
-# Text-to-speech: reads selected transcript lines aloud in a clear neural voice
-# (Piper). A background thread pulls text off a queue and synthesizes+plays it
-# one utterance at a time so nothing overlaps. Lazy-loads Piper so the app runs
-# fine without TTS. Speaks via sounddevice (separate stream from AudioPlayer).
+# Text-to-speech: reads selected transcript lines aloud. A background thread
+# pulls text off a queue and synthesizes+plays it one utterance at a time so
+# nothing overlaps. Two engines (Piper neural voices, or Windows SAPI5 which is
+# native on ARM64); selected at runtime. Lazy so the app runs fine without TTS.
+# Speaks via sounddevice (separate stream from AudioPlayer).
 # --------------------------------------------------------------------------
-def list_tts_voices():
-    """Return [(voice_id, path)] of downloaded Piper voices (*.onnx) in the voice
-    dir. voice_id is the filename stem (e.g. 'en_US-lessac-medium')."""
+# Two synthesis engines, chosen at runtime:
+#   * Piper (neural, .onnx voices) -- default on x64; needs a compiled espeak-ng
+#     phonemizer that has NO Windows-ARM64 build.
+#   * Windows SAPI5 (via comtypes) -- native everywhere on Windows incl. ARM64,
+#     no compilation; uses the OS voices (e.g. Microsoft David / Zira).
+# The app calls list_tts_voices()/tts_available() (engine-aware) and TTSPlayer;
+# the synth backend is created ON the TTS thread (SAPI is COM -> single-threaded).
+def _piper_voices():
+    """[(voice_id, path)] of downloaded Piper voices (*.onnx). voice_id is the
+    filename stem (e.g. 'en_US-lessac-medium')."""
     out = []
     if os.path.isdir(TTS_VOICE_DIR):
         for p in sorted(glob.glob(os.path.join(TTS_VOICE_DIR, "*.onnx"))):
@@ -957,12 +2409,226 @@ def list_tts_voices():
     return out
 
 
-def tts_available():
+def _piper_usable():
+    """True only if Piper can actually synthesize here: importable, a voice
+    present, AND its compiled espeak-ng phonemizer available (absent on ARM64)."""
     try:
         import piper  # noqa: F401
-        return len(list_tts_voices()) > 0
     except Exception:
         return False
+    if not _piper_voices():
+        return False
+    import importlib.util
+    return (importlib.util.find_spec("piper.espeakbridge") is not None
+            or importlib.util.find_spec("piper_phonemize") is not None)
+
+
+def _sapi_voices():
+    """[(name, name)] of installed Windows SAPI5 voices (empty off-Windows / on
+    failure). Creates a transient COM object; released immediately."""
+    try:
+        import comtypes.client
+        toks = comtypes.client.CreateObject("SAPI.SpVoice").GetVoices()
+        return [(toks.Item(i).GetDescription(), toks.Item(i).GetDescription())
+                for i in range(toks.Count)]
+    except Exception:
+        return []
+
+
+def _sapi_usable():
+    return len(_sapi_voices()) > 0
+
+
+def _winrt_voices():
+    """[(name, name)] of ALL installed Windows voices via WinRT/OneCore. This is a
+    superset of classic SAPI5, which only reads the legacy registry hive -- e.g.
+    'Microsoft Mark' is present here but invisible to SAPI."""
+    try:
+        from winrt.windows.media.speechsynthesis import SpeechSynthesizer
+        return [(v.display_name, v.display_name)
+                for v in SpeechSynthesizer.all_voices]
+    except Exception:
+        return []
+
+
+def _winrt_usable():
+    return len(_winrt_voices()) > 0
+
+
+def select_tts_engine(cfg_tts=None):
+    """'piper', 'winrt' or 'sapi'. Explicit tts['engine'] wins; 'auto' (default)
+    prefers Piper where it can synthesize, then WinRT/OneCore (sees every installed
+    Windows voice), then classic SAPI5 as a last resort."""
+    pref = str((cfg_tts or {}).get("engine", "auto")).strip().lower()
+    if pref in ("piper", "winrt", "sapi"):
+        return pref
+    if _piper_usable():
+        return "piper"
+    if _winrt_usable():
+        return "winrt"
+    if _sapi_usable():
+        return "sapi"
+    return "piper"
+
+
+def available_tts_engines():
+    """TTS engine ids that can actually speak on this system, best-first
+    (piper, winrt, sapi). Used by the GUI to offer only working engines."""
+    out = []
+    if _piper_usable():
+        out.append("piper")
+    if _winrt_usable():
+        out.append("winrt")
+    if _sapi_usable():
+        out.append("sapi")
+    return out
+
+
+def list_tts_voices(engine=None, cfg_tts=None):
+    """Voices for the selected engine as [(voice_id, detail)]. Piper -> (stem,
+    path); WinRT/SAPI -> (display name, display name)."""
+    engine = engine or select_tts_engine(cfg_tts)
+    if engine == "winrt":
+        return _winrt_voices()
+    if engine == "sapi":
+        return _sapi_voices()
+    return _piper_voices()
+
+
+def tts_available(cfg_tts=None):
+    """True if the selected TTS engine can actually speak on this system."""
+    engine = select_tts_engine(cfg_tts)
+    if engine == "winrt":
+        return _winrt_usable()
+    if engine == "sapi":
+        return _sapi_usable()
+    return _piper_usable()
+
+
+def _match_voice_name(voice_id, names):
+    """Best match for a saved voice id among `names`, or None. Exact, then case-
+    insensitive, then a loose prefix match so a voice saved under one engine still
+    resolves under another (SAPI's 'Microsoft Zira Desktop - English (United
+    States)' -> WinRT's 'Microsoft Zira')."""
+    if not voice_id or not names:
+        return None
+    if voice_id in names:
+        return voice_id
+    low = voice_id.strip().lower()
+    for n in names:
+        if n.strip().lower() == low:
+            return n
+    for n in names:                     # engine naming differs -> prefix match
+        nl = n.strip().lower()
+        if low.startswith(nl) or nl.startswith(low):
+            return n
+    return None
+
+
+# -- synth backends: built and used on the TTS thread; expose synthesize(text)
+#    -> int16 mono np.ndarray and a `sample_rate` / `voice_id`. -----------------
+class _PiperSynth:
+    engine = "piper"
+
+    def __init__(self, voice_id):
+        from piper import PiperVoice
+        voices = dict(_piper_voices())
+        if not voices:
+            raise RuntimeError("no Piper voice models in tts_voices/")
+        self.voice_id = voice_id if voice_id in voices else next(iter(voices))
+        self._voice = PiperVoice.load(voices[self.voice_id])
+        self.sample_rate = self._voice.config.sample_rate
+
+    def synthesize(self, text):
+        chunks = [np.frombuffer(c.audio_int16_bytes, dtype=np.int16)
+                  for c in self._voice.synthesize(text)]
+        return np.concatenate(chunks) if chunks else np.zeros(0, np.int16)
+
+
+class _SapiSynth:
+    engine = "sapi"
+    sample_rate = 16000                       # SAFT16kHz16BitMono -> matches pipeline
+
+    def __init__(self, voice_id):
+        import comtypes.client
+        self._ct = comtypes.client
+        self._voice = comtypes.client.CreateObject("SAPI.SpVoice")
+        from comtypes.gen import SpeechLib     # generated by the CreateObject above
+        self._fmt_type = SpeechLib.SAFT16kHz16BitMono
+        toks = self._voice.GetVoices()
+        if toks.Count == 0:
+            raise RuntimeError("no Windows SAPI voices installed")
+        want = _match_voice_name(
+            voice_id, [toks.Item(i).GetDescription() for i in range(toks.Count)])
+        chosen = toks.Item(0)                 # default if the saved voice is gone
+        for i in range(toks.Count):
+            if toks.Item(i).GetDescription() == want:
+                chosen = toks.Item(i)
+                break
+        self._voice.Voice = chosen
+        self.voice_id = chosen.GetDescription()
+
+    def synthesize(self, text):
+        stream = self._ct.CreateObject("SAPI.SpMemoryStream")
+        fmt = self._ct.CreateObject("SAPI.SpAudioFormat")
+        fmt.Type = self._fmt_type
+        stream.Format = fmt
+        self._voice.AudioOutputStream = stream
+        self._voice.Speak(text, 0)            # 0 = SVSFDefault (synchronous)
+        return np.frombuffer(bytes(stream.GetData()), dtype=np.int16)
+
+
+class _WinrtSynth:
+    """Windows OneCore speech via WinRT. Sees EVERY installed Windows voice (classic
+    SAPI5 only reads the legacy hive) and needs no registry mirroring -- so voices
+    added via Settings > Time & language > Speech show up here. Synthesizes to a WAV
+    stream and returns its PCM."""
+    engine = "winrt"
+
+    def __init__(self, voice_id):
+        from winrt.windows.media.speechsynthesis import SpeechSynthesizer
+        voices = SpeechSynthesizer.all_voices
+        if len(voices) == 0:
+            raise RuntimeError("no Windows (WinRT) voices installed")
+        self._synth = SpeechSynthesizer()
+        want = _match_voice_name(voice_id, [v.display_name for v in voices])
+        for v in voices:                      # keep the default voice if no match
+            if v.display_name == want:
+                self._synth.voice = v
+                break
+        self.voice_id = self._synth.voice.display_name
+        self.sample_rate = 16000              # refreshed from each WAV header
+
+    async def _to_wav(self, text):
+        from winrt.windows.storage.streams import DataReader
+        stream = await self._synth.synthesize_text_to_stream_async(text)
+        size = stream.size
+        reader = DataReader(stream.get_input_stream_at(0))
+        await reader.load_async(size)
+        buf = bytearray(size)
+        reader.read_bytes(buf)                # fills the caller's buffer
+        return bytes(buf)
+
+    def synthesize(self, text):
+        import asyncio
+        import io
+        import wave
+        with wave.open(io.BytesIO(asyncio.run(self._to_wav(text))), "rb") as w:
+            self.sample_rate = w.getframerate()
+            channels = w.getnchannels()
+            frames = w.readframes(w.getnframes())
+        audio = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:                      # downmix to mono
+            audio = audio.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        return audio
+
+
+def _make_tts_synth(engine, voice_id):
+    if engine == "winrt":
+        return _WinrtSynth(voice_id)
+    if engine == "sapi":
+        return _SapiSynth(voice_id)
+    return _PiperSynth(voice_id)
 
 
 class TTSPlayer(threading.Thread):
@@ -971,45 +2637,36 @@ class TTSPlayer(threading.Thread):
     Optional on_start(text)/on_end(text) callbacks fire around each utterance
     (used by the GUI to highlight the line currently being read)."""
     def __init__(self, voice_id=None, max_queue=6, out=None,
-                 on_start=None, on_end=None):
+                 on_start=None, on_end=None, engine=None):
         self.on_start = on_start
         self.on_end = on_end
         super().__init__(daemon=True, name="tts")
         self.q = queue.Queue(maxsize=max_queue)
         self.stop_evt = threading.Event()
         self.out = out
-        self._voice = None
+        self._engine = engine or select_tts_engine()
         self._voice_id = voice_id
+        self._synth = None                       # built on the TTS thread in run()
         self._sr = 22050
-        self._ok = self._load_voice(voice_id)
+        self._ok = tts_available({"engine": self._engine})
         self._muted = False
-
-    def _load_voice(self, voice_id):
-        try:
-            from piper import PiperVoice
-        except Exception as e:
-            if self.out:
-                self.out.status(f"TTS unavailable (piper not installed): {e}")
-            return False
-        voices = list_tts_voices()
-        if not voices:
-            if self.out:
-                self.out.status("TTS: no voice models in tts_voices/.")
-            return False
-        path = dict(voices).get(voice_id) or voices[0][1]
-        self._voice_id = voice_id or voices[0][0]
-        try:
-            self._voice = PiperVoice.load(path)
-            self._sr = self._voice.config.sample_rate
-            return True
-        except Exception as e:
-            if self.out:
-                self.out.status(f"TTS: failed to load voice: {e}")
-            return False
+        self._speaking = False          # an utterance is actually sounding
+        self._cancel = False            # one-shot: stop the current utterance
 
     @property
     def available(self):
         return self._ok
+
+    def busy(self):
+        """True while anything is queued or sounding. Lets a caller step through
+        lines one at a time (read-along) instead of dumping them all at once."""
+        return self._speaking or not self.q.empty()
+
+    def cancel(self):
+        """Stop the current utterance and drop the backlog, without muting --
+        pause/stop for read-along, which must be able to resume."""
+        self._drain()
+        self._cancel = True
 
     def set_muted(self, muted):
         self._muted = bool(muted)
@@ -1034,42 +2691,55 @@ class TTSPlayer(threading.Thread):
             pass
 
     def run(self):
-        import numpy as _np
         try:
             import sounddevice as sd
-        except Exception:
+        except Exception as e:
+            self._ok = False
+            if self.out:
+                self.out.status(f"TTS unavailable (no audio output): {e}")
+            return
+        # Build the synth engine ON this thread (required for SAPI/COM).
+        try:
+            self._synth = _make_tts_synth(self._engine, self._voice_id)
+            self._voice_id = self._synth.voice_id
+            self._sr = self._synth.sample_rate
+        except Exception as e:
+            self._ok = False
+            if self.out:
+                self.out.status(f"TTS: failed to load voice: {e}")
             return
         while not self.stop_evt.is_set():
             try:
                 text = self.q.get(timeout=0.3)
             except queue.Empty:
                 continue
-            if self._muted or not self._voice:
+            if self._muted:
                 continue
             try:
-                chunks = [
-                    _np.frombuffer(c.audio_int16_bytes, dtype=_np.int16)
-                    for c in self._voice.synthesize(text)
-                ]
-                if not chunks:
+                audio = self._synth.synthesize(text)
+                if audio is None or len(audio) == 0:
                     continue
-                audio = _np.concatenate(chunks)
+                # Re-read the rate: some backends (WinRT) learn it per utterance.
+                self._sr = getattr(self._synth, "sample_rate", self._sr)
                 if self.on_start:
                     try:
                         self.on_start(text)
                     except Exception:
                         pass
+                self._cancel = False        # only cancels from here on
+                self._speaking = True
                 sd.play(audio, self._sr)
-                # Wait for playback, but bail out promptly on stop/mute.
+                # Wait for playback, but bail out promptly on stop/mute/cancel.
                 while sd.get_stream().active and not self.stop_evt.is_set() \
-                        and not self._muted:
+                        and not self._muted and not self._cancel:
                     time.sleep(0.05)
-                if self._muted or self.stop_evt.is_set():
+                if self._muted or self.stop_evt.is_set() or self._cancel:
                     sd.stop()
             except Exception as e:
                 if self.out:
                     self.out.status(f"TTS error: {e}")
             finally:
+                self._speaking = False
                 if self.on_end:
                     try:
                         self.on_end(text)
@@ -1517,12 +3187,36 @@ def soundcard_available():
         return False
 
 
-def list_output_devices():
+_OUTPUT_DEVICES = None          # cached [(name, is_default)]; see warm_audio_devices
+
+
+def warm_audio_devices():
+    """Enumerate output devices ONCE, before any Tk window exists.
+
+    On Windows-on-ARM64, enumerating through soundcard AFTER Tk has started
+    corrupts the heap and kills the process (0xC0000374) -- Tk initialises OLE,
+    and soundcard's COM use conflicts when it initialises second. Doing it first
+    and serving a cache afterwards avoids the collision entirely. It's also just
+    faster: the add/edit dialog no longer re-queries WASAPI every time it opens.
+
+    Call this before creating the root window. Safe to call more than once."""
+    return list_output_devices(force=True)
+
+
+def list_output_devices(force=False):
     """Return [(name, is_default)] of output devices that can be loopback-captured
-    via soundcard. Empty if soundcard is unavailable. Names are de-duplicated."""
+    via soundcard. Empty if soundcard is unavailable. Names are de-duplicated.
+
+    Served from the cache once warmed (see warm_audio_devices) -- so a device
+    plugged in mid-session won't appear until restart, which is the price of not
+    crashing the app on ARM."""
+    global _OUTPUT_DEVICES
+    if _OUTPUT_DEVICES is not None and not force:
+        return list(_OUTPUT_DEVICES)
     try:
         import soundcard as sc
     except Exception:
+        _OUTPUT_DEVICES = []
         return []
     try:
         default_name = sc.default_speaker().name
@@ -1631,9 +3325,27 @@ class LoopbackWorker(threading.Thread):
 # tabs) can't be separated from each other.
 # --------------------------------------------------------------------------
 def proctap_available():
+    """True only if per-app capture can ACTUALLY run. proc-tap ships a pure-python
+    (py3-none-any) wheel whose compiled `_native` extension has no Windows-ARM64
+    build, so the package imports fine there while every capture raises. Require
+    the native extension too, otherwise the GUI would offer an 'application' source
+    that always fails.
+
+    This deliberately answers from DISK and never imports proctap. On ARM64,
+    importing it and then enumerating speakers through soundcard corrupts the
+    heap and kills the process (0xC0000374) -- and the two are probed together
+    all over: the add-feed dialog offers both sources, and importing a feed list
+    can carry both kinds. find_spec on a top-level name doesn't execute it;
+    find_spec("proctap._native") WOULD, because locating a submodule imports its
+    parent package. So we look for the .pyd beside __init__.py ourselves."""
     try:
-        import proctap  # noqa: F401
-        return True
+        import importlib.util
+        spec = importlib.util.find_spec("proctap")     # does not import it
+        if spec is None or not spec.origin:
+            return False
+        pkg_dir = os.path.dirname(spec.origin)
+        return any(f.startswith("_native") and f.endswith((".pyd", ".so"))
+                   for f in os.listdir(pkg_dir))
     except Exception:
         return False
 
@@ -1768,6 +3480,24 @@ _HALLUCINATION_PHRASES = {
 }
 
 
+# Whisper annotates non-speech in brackets -- "[unintelligible]", "[buzzing]",
+# "[Airplane engine]", "(static)", "♪♪". The bigger models do it far more than
+# the small ones: switching base.en -> small.en took these from occasional to
+# 8% of all lines on ATC feeds, each one also saving a clip nothing points at.
+_NONSPEECH_TAG = re.compile(r"[\[(][^\])]*[\])]|[♪`]+")
+
+
+def _strip_nonspeech(text):
+    """Remove non-speech annotations. Returns "" if that's all there was.
+
+    Strips rather than rejecting whole lines, so a real transmission that merely
+    contains an aside -- "(static) Delta 510 cleared to land" -- keeps its
+    content instead of being thrown away."""
+    if not text:
+        return ""
+    return " ".join(_NONSPEECH_TAG.sub(" ", text).split()).strip()
+
+
 def _is_hallucination(text, no_speech_prob):
     """True if `text` is just a known silence-hallucination phrase (optionally
     repeated) and the model wasn't confident this was speech."""
@@ -1805,10 +3535,208 @@ def _collapse_repeats(text):
 
 
 # --------------------------------------------------------------------------
-# Transcription worker: single shared GPU model serving all streams
+# Transcription backends.
+#
+# The rest of the app talks to ONE object with a faster-whisper-shaped
+# `.transcribe(audio, **kw) -> (segments, info)` API, where each segment exposes
+# `.text`, `.no_speech_prob`, and `.avg_logprob`. Two implementations:
+#   * faster-whisper / ctranslate2 -- default on x64 (GPU or CPU). Its
+#     WhisperModel already has exactly this shape, so it's used directly.
+#   * whisper.cpp via pywhispercpp  -- default on native ARM64, where ctranslate2
+#     has no wheel. Runs on CPU/NPU. `WhisperCppBackend` adapts it to the shape.
+# `Engine._make_whisper_model()` picks one; `Transcriber` and the anti-
+# hallucination filters are backend-agnostic because the shape is identical.
+# --------------------------------------------------------------------------
+def select_backend(cfg):
+    """'ct2' (faster-whisper) or 'whispercpp'. Explicit cfg['engine'] wins;
+    otherwise 'whispercpp' on a native-ARM64 interpreter (no ctranslate2 wheel),
+    'ct2' elsewhere. Keys off the real process arch, NOT platform.machine()
+    (see interpreter_is_arm64)."""
+    engine = str(cfg.get("engine") or "").strip().lower()
+    if engine in ("ct2", "ctranslate2", "faster-whisper", "faster_whisper"):
+        return "ct2"
+    if engine in ("whispercpp", "whisper.cpp", "whisper_cpp", "pywhispercpp"):
+        return "whispercpp"
+    return "whispercpp" if interpreter_is_arm64() else "ct2"
+
+
+# faster-whisper model id -> nearest whisper.cpp (GGML) model name. whisper.cpp
+# ships its own GGML files (see pywhispercpp AVAILABLE_MODELS); faster-whisper's
+# "distil-*" models have no GGML build, so they map to the closest standard one.
+_WHISPERCPP_MODEL_MAP = {
+    "large-v3": "large-v3", "large-v2": "large-v2", "large-v1": "large-v1",
+    "large-v3-turbo": "large-v3-turbo",
+    "medium": "medium", "medium.en": "medium.en",
+    "small": "small", "small.en": "small.en",
+    "base": "base", "base.en": "base.en",
+    "tiny": "tiny", "tiny.en": "tiny.en",
+    "distil-large-v3": "large-v3-turbo", "distil-large-v2": "large-v2",
+    "distil-medium.en": "medium.en", "distil-small.en": "small.en",
+}
+# CPU/NPU inference is far slower than the x64 GPU path, so ARM configs should
+# choose a small/quantized model; this is the fallback when a name can't be mapped.
+ARM_DEFAULT_MODEL = "small.en-q5_1"
+
+# Approximate GGML download sizes (MB), for a friendly first-run download status.
+# Rough figures -- only used to show "~N MB" while the model downloads.
+_WHISPERCPP_MODEL_MB = {
+    "tiny": 75, "tiny.en": 75, "tiny-q5_1": 31, "tiny.en-q5_1": 31,
+    "base": 148, "base.en": 148, "base-q5_1": 57, "base.en-q5_1": 57,
+    "small": 488, "small.en": 488, "small-q5_1": 181, "small.en-q5_1": 181,
+    "medium": 1530, "medium.en": 1530,
+    "large-v3": 3100, "large-v3-turbo": 1600, "large-v2": 3100,
+}
+
+
+def whispercpp_model_name(name):
+    """Resolve an app model id to a valid whisper.cpp GGML model name."""
+    try:
+        from pywhispercpp import constants as _c
+        avail = set(getattr(_c, "AVAILABLE_MODELS", []))
+    except Exception:
+        avail = set()
+    if not avail:                       # can't validate -> best-effort passthrough
+        return _WHISPERCPP_MODEL_MAP.get(name, name)
+    if name in avail:
+        return name
+    mapped = _WHISPERCPP_MODEL_MAP.get(name)
+    if mapped in avail:
+        return mapped
+    return ARM_DEFAULT_MODEL if ARM_DEFAULT_MODEL in avail else "small.en"
+
+
+class _WCSegment:
+    """A faster-whisper-shaped segment (only the fields Transcriber reads)."""
+    __slots__ = ("text", "no_speech_prob", "avg_logprob")
+
+    def __init__(self, text, no_speech_prob, avg_logprob):
+        self.text = text
+        self.no_speech_prob = no_speech_prob
+        self.avg_logprob = avg_logprob
+
+
+def _map_whispercpp_segments(segs):
+    """Adapt pywhispercpp Segments -> faster-whisper-shaped segments.
+
+    pywhispercpp gives one confidence number per segment: `probability`, the
+    geometric mean of token probabilities in [0, 1] (NaN if not computed). Whisper
+    proper exposes two independent numbers the filters use -- avg_logprob and
+    no_speech_prob -- which whisper.cpp doesn't surface per segment. Synthesize
+    both from `probability` p:
+        avg_logprob    = log(p)   -> the min_avg_logprob gate drops low-confidence
+                                     garbage (p < e^-1 ~= 0.37 with the default).
+        no_speech_prob = 1 - p    -> keeps the phrase anti-hallucination filter
+                                     (needs no_speech_prob > 0.35) meaningful; only
+                                     marginally stricter than the logprob gate.
+    A NaN probability -> neutral scores that pass both gates, so nothing is dropped
+    merely for lacking a confidence number."""
+    out = []
+    for s in segs:
+        try:
+            p = float(getattr(s, "probability", float("nan")))
+        except (TypeError, ValueError):
+            p = float("nan")
+        if p != p:                      # NaN
+            no_speech, avg_logprob = 0.0, 0.0
+        else:
+            p = min(max(p, 0.0), 1.0)
+            no_speech = 1.0 - p
+            avg_logprob = math.log(p) if p > 0.0 else -10.0
+        out.append(_WCSegment(getattr(s, "text", ""), no_speech, avg_logprob))
+    return out
+
+
+class WhisperCppBackend:
+    """whisper.cpp (via pywhispercpp) with a faster-whisper-shaped transcribe().
+
+    Default backend on native Windows-on-ARM, where ctranslate2 (and thus
+    faster-whisper) has no wheel. Runs on CPU/NPU. GGML model files are downloaded
+    on first use into a writable models dir. `model=` lets tests inject a fake."""
+    def __init__(self, model_name, cfg, status_cb=None, model=None):
+        self.cfg = cfg
+        self._status = status_cb
+        self._n_threads = int(cfg.get("n_threads") or max(1, (os.cpu_count() or 4)))
+        self._lang = cfg.get("language", "en") or "en"
+        if model is not None:                 # injected (tests) -- skip real load
+            self._model = model
+            return
+        from pywhispercpp.model import Model
+        wname = whispercpp_model_name(model_name)
+        models_dir = cfg.get("whispercpp_models_dir") or os.path.join(
+            DATA_DIR, "whispercpp_models")
+        os.makedirs(models_dir, exist_ok=True)
+
+        # First use downloads the GGML model (up to hundreds of MB) into models_dir.
+        # In a packaged app there's no console, and Model() blocks with no visible
+        # feedback -- so it just looks frozen / "not transcribing". Report progress
+        # to the GUI status line: pywhispercpp writes the file as it downloads, so a
+        # watcher thread reports how many MB have landed while Model() fetches it.
+        model_file = os.path.join(models_dir, f"ggml-{wname}.bin")
+        downloading = not os.path.exists(model_file)
+        watch_stop = threading.Event()
+        if downloading and status_cb:
+            approx = _WHISPERCPP_MODEL_MB.get(wname)
+            status_cb(f"First run: downloading the '{wname}' speech model"
+                      + (f" (~{approx} MB)" if approx else "")
+                      + " — one time. Transcription starts when it finishes…")
+
+            def _watch():
+                while not watch_stop.wait(2.0):
+                    try:
+                        mb = os.path.getsize(model_file) / (1 << 20)
+                    except OSError:
+                        mb = 0
+                    status_cb(f"Downloading '{wname}' model… {mb:.0f}"
+                              + (f" / ~{approx} MB" if approx else " MB"))
+            threading.Thread(target=_watch, daemon=True, name="wcpp-dl").start()
+        elif status_cb:
+            status_cb(f"Loading whisper.cpp model '{wname}' "
+                      f"({self._n_threads} threads)...")
+
+        try:
+            self._model = Model(
+                model=wname, models_dir=models_dir,
+                redirect_whispercpp_logs_to=False,
+                n_threads=self._n_threads, print_progress=False,
+                print_realtime=False,
+            )
+        finally:
+            watch_stop.set()
+        if downloading and status_cb:
+            status_cb(f"Model '{wname}' downloaded ({self._n_threads} threads).")
+
+    def transcribe(self, audio, language=None, initial_prompt=None,
+                   no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                   compression_ratio_threshold=2.4, **_ignored):
+        """Mirror faster-whisper's WhisperModel.transcribe signature + return
+        shape. Unmapped kwargs (beam_size, vad_filter, temperature,
+        condition_on_previous_text, no_repeat_ngram_size, ...) are accepted and
+        ignored -- whisper.cpp handles the equivalents internally or upstream."""
+        a = np.ascontiguousarray(audio, dtype=np.float32)
+        segs = self._model.transcribe(
+            a,
+            language=language or self._lang,
+            initial_prompt=initial_prompt or "",
+            no_context=True,                    # == condition_on_previous_text=False
+            translate=False,
+            print_progress=False,
+            single_segment=False,
+            no_speech_thold=float(no_speech_threshold),
+            logprob_thold=float(log_prob_threshold),
+            entropy_thold=float(compression_ratio_threshold),
+            temperature=0.0,
+            extract_probability=True,
+        )
+        info = {"language": language or self._lang, "backend": "whispercpp"}
+        return _map_whispercpp_segments(segs), info
+
+
+# --------------------------------------------------------------------------
+# Transcription worker: single shared model serving all streams
 # --------------------------------------------------------------------------
 class Transcriber(threading.Thread):
-    def __init__(self, model, cfg, jobq, out, stop_evt):
+    def __init__(self, model, cfg, jobq, out, stop_evt, clips=None,
+                 should_record=None, prompt_for=None):
         super().__init__(daemon=True, name="transcriber")
         self.model = model
         self.cfg = cfg
@@ -1818,6 +3746,13 @@ class Transcriber(threading.Thread):
         self.max_no_speech = cfg.get("filters", {}).get("max_no_speech_prob", 0.6)
         self.min_logprob = cfg.get("filters", {}).get("min_avg_logprob", -1.0)
         self.tts_hook = None    # optional callable(stream_name, text) for TTS
+        self.clips = clips              # ClipStore, or None when not recording
+        # callable(stream_name) -> bool; per-feed opt-in for clip recording.
+        self.should_record = should_record or (lambda _name: False)
+        # callable(stream_name) -> str; the Whisper prompt for THIS feed, so an
+        # ATC feed isn't decoded with police vocabulary. Falls back to the global.
+        self.prompt_for = prompt_for or (
+            lambda _name: cfg.get("initial_prompt") or None)
 
     def run(self):
         while not self.stop_evt.is_set():
@@ -1839,7 +3774,7 @@ class Transcriber(threading.Thread):
             beam_size=self.cfg.get("beam_size", 5),
             vad_filter=True,
             condition_on_previous_text=False,   # transmissions are independent
-            initial_prompt=self.cfg.get("initial_prompt") or None,
+            initial_prompt=self.prompt_for(name) or None,
             no_speech_threshold=0.6,
             temperature=[0.0, 0.2, 0.4],
             # Anti-hallucination: drop repetition loops + low-confidence/garbage
@@ -1855,11 +3790,19 @@ class Transcriber(threading.Thread):
             if getattr(s, "avg_logprob", 0.0) < self.min_logprob:
                 continue
             txt = s.text.strip()
+            txt = _strip_nonspeech(txt)
             if txt and not _is_hallucination(txt, getattr(s, "no_speech_prob", 0.0)):
                 parts.append(txt)
         text = _collapse_repeats(" ".join(parts).strip())
         if text:
-            self.out.line(name, color, text)
+            # Save the clip only once we know the segment produced real text:
+            # hallucination-filtered transmissions would otherwise leave audio
+            # on disk that no line ever points at.
+            when = dt.datetime.now()
+            clip_id = None
+            if self.clips is not None and self.should_record(name):
+                clip_id = self.clips.save(name, audio, text=text, when=when)
+            self.out.line(name, color, text, clip_id=clip_id, when=when)
             if self.tts_hook:
                 try:
                     self.tts_hook(name, text)
@@ -1889,10 +3832,20 @@ class Engine:
         self.player = AudioPlayer() if enable_audio else None
         self.auth_header = self._build_auth()
 
+        # Clip recording: which feeds save their audio (per-feed opt-in), plus
+        # the store that writes/reads them. Populated by start_streams/add_stream
+        # from each stream dict's "record" flag.
+        self.clips = ClipStore(cfg, out=self.out, ffmpeg=self.ffmpeg)
+        self.recording_feeds = set()
+        # The stream dict per running feed, so per-feed settings (service
+        # profile, prompt override) are resolvable by name at transcribe time.
+        self.stream_meta = {}
+
         # Text-to-speech state (lazy: player created only when first enabled).
         tts = cfg.get("tts", {})
         self.tts = None
         self.tts_enabled = bool(tts.get("enabled", False))
+        self.tts_engine = tts.get("engine", "auto")     # 'auto'|'piper'|'sapi'
         self.tts_voice = tts.get("voice")               # None -> first available
         self.tts_feeds = set(tts.get("feeds", []))      # stream names to speak
         self.tts_keywords = [k.lower() for k in tts.get("keywords", [])]
@@ -1906,6 +3859,16 @@ class Engine:
             deleted = purge_old_logs(days)
             if deleted:
                 self.out.status(f"Purged {len(deleted)} log file(s) older than {days} day(s).")
+        # Same for clips -- voice recordings, so bounding them matters more.
+        aged, over = apply_clip_retention(
+            {"retention_days": self.clips.retention_days,
+             "max_gb": self.clips.max_gb}, self.clips.dir)
+        if aged:
+            self.out.status(f"Purged {len(aged)} clip file(s) older than "
+                            f"{self.clips.retention_days:g} day(s).")
+        if over:
+            self.out.status(f"Purged {len(over)} more clip file(s) to stay "
+                            f"under {self.clips.max_gb:g} GB.")
 
     # -- auth ---------------------------------------------------------------
     def _build_auth(self):
@@ -1936,60 +3899,180 @@ class Engine:
 
     # -- lifecycle ----------------------------------------------------------
     def _make_whisper_model(self, model_name):
-        """Create a WhisperModel, handling first-run CUDA setup for GPU mode:
-        (1) download the CUDA runtime if the slim installer left it out,
-        (2) register the DLL directories, (3) lazily import + construct."""
-        device = self.cfg.get("device", "cuda")
-        if device == "cuda":
-            ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
-            if not ok:
-                self.out.status(msg + " Falling back to CPU (slower).")
-                device = "cpu"
-        add_nvidia_dll_dirs()
+        """Build the transcription backend for `model_name`. On native ARM64 (or
+        when cfg['engine'] selects it) this is the whisper.cpp backend; otherwise
+        faster-whisper / ctranslate2. The device is resolved from cfg['device']
+        ('auto'|'cuda'/'gpu'|'cpu'): GPU mode does first-run CUDA setup and, if the
+        GPU can't actually be constructed, falls back to CPU rather than hard-
+        failing (ctranslate2's only GPU backend is CUDA/NVIDIA -- a CPU-only or
+        Intel Arc machine has no usable GPU here)."""
+        if select_backend(self.cfg) == "whispercpp":
+            return WhisperCppBackend(model_name, self.cfg, status_cb=self.out.status)
+
+        # -- faster-whisper / ctranslate2 (x64; NVIDIA GPU or CPU) --
         # Allow tests / callers to inject a WhisperModel via module attribute;
         # otherwise import faster-whisper lazily (after CUDA is ready).
         WM = globals().get("WhisperModel")
         if WM is None:
             from faster_whisper import WhisperModel as WM
-        compute = self.cfg.get("compute_type", "float16") if device == "cuda" else "int8"
-        return WM(model_name, device=device, compute_type=compute)
+
+        device = str(self.cfg.get("device", "cuda")).strip().lower()
+        want_gpu = device in ("", "auto", "cuda", "gpu")   # 'cpu' -> straight to CPU
+
+        if want_gpu:
+            ok, msg = ensure_cuda_libraries(status_cb=self.out.status)
+            if not ok:
+                self.out.status(msg + " Falling back to CPU (slower).")
+                want_gpu = False
+        add_nvidia_dll_dirs()
+
+        if want_gpu:
+            compute = self.cfg.get("compute_type", "float16")
+            try:
+                return WM(model_name, device="cuda", compute_type=compute)
+            except Exception as e:
+                # No usable CUDA device (CPU-only or Intel Arc machine, etc.).
+                # Use CPU instead of crashing at load. Set "device": "cpu" in
+                # config to skip this probe entirely.
+                self.out.status(
+                    f"GPU unavailable ({e}); using CPU (slower). "
+                    "Tip: pick a smaller model (e.g. base.en) for good CPU speed."
+                )
+        return WM(model_name, device="cpu", compute_type="int8")
 
     def load_model(self):
-        self.out.status(
-            f"Loading Whisper '{self.cfg.get('model','large-v3')}' on "
-            f"{self.cfg.get('device','cuda')}/{self.cfg.get('compute_type','float16')} ..."
-        )
+        if select_backend(self.cfg) == "whispercpp":
+            self.out.status(
+                f"Loading Whisper '{self.cfg.get('model','large-v3')}' via "
+                f"whisper.cpp (CPU/NPU) ..."
+            )
+        else:
+            self.out.status(
+                f"Loading Whisper '{self.cfg.get('model','large-v3')}' on "
+                f"{self.cfg.get('device','cuda')}/{self.cfg.get('compute_type','float16')} ..."
+            )
         t0 = time.time()
         self.model = self._make_whisper_model(self.cfg.get("model", "large-v3"))
         self.out.status(f"Model ready in {time.time()-t0:.1f}s.")
+        self.clips.start()
         self.transcriber = Transcriber(self.model, self.cfg, self.jobq,
-                                       self.out, self.stop_evt)
+                                       self.out, self.stop_evt,
+                                       clips=self.clips,
+                                       should_record=self.is_recording,
+                                       prompt_for=self.prompt_for)
         self.transcriber.tts_hook = self._maybe_speak
         self.transcriber.start()
         if self.tts_enabled:
             self._ensure_tts()
 
+    # -- service profiles ---------------------------------------------------
+    def profile_for(self, name):
+        """The resolved service profile for a running feed (falls back to the
+        default profile for feeds we have no dict for, e.g. after a restart)."""
+        return service_profile(self.stream_meta.get(name, {}), self.cfg)
+
+    def prompt_for(self, name):
+        """The Whisper prompt for this feed: per-feed override, else its service
+        preset, else the global initial_prompt."""
+        return self.profile_for(name)["prompt"]
+
+    # -- clip recording -----------------------------------------------------
+    def is_recording(self, name):
+        """True if this feed saves the audio behind each of its lines. Requires
+        both the global switch and the feed's own opt-in."""
+        return self.clips.enabled and name in self.recording_feeds
+
+    def set_recording(self, name, on):
+        """Turn clip recording on/off for one feed (takes effect immediately --
+        the next transmission is saved or not, no restart)."""
+        if on:
+            self.recording_feeds.add(name)
+        else:
+            self.recording_feeds.discard(name)
+
+    def set_clips_enabled(self, on):
+        """Global switch. Off means no feed records, whatever its own flag."""
+        self.clips.enabled = bool(on)
+        if on:
+            self.clips.start()
+
+    def play_clip(self, clip_id, source=None):
+        """Play a saved clip through the speakers. Returns True if audio started.
+        Decoding runs on a worker thread so a click never blocks the UI.
+        `source` overrides where the audio comes from -- anything with a
+        load_pcm(), which is how an opened transcript bundle plays its own
+        clips instead of the live store's."""
+        if not (self.player and self.player.available and clip_id):
+            return False
+        store = source if source is not None else self.clips
+        def _go():
+            pcm = store.load_pcm(clip_id)
+            if pcm:
+                self.player.play_clip(pcm)
+            else:
+                self.out.status("That clip is no longer on disk.")
+        threading.Thread(target=_go, daemon=True, name="clipplay").start()
+        return True
+
+    def stop_clip(self):
+        if self.player:
+            self.player.stop_clip()
+
+    def clip_playing(self):
+        """True while a saved clip is still sounding. Play-through polls this to
+        know when to advance to the next line."""
+        return bool(self.player and self.player.clip_playing())
+
+    # -- read-along (playing a saved transcript through) ---------------------
+    def speak_now(self, text):
+        """Speak one line immediately, bypassing the feed/keyword rules that
+        govern live TTS. Returns False if no voice is available."""
+        if not self._ensure_tts():
+            return False
+        self.tts.say(text)
+        return True
+
+    def tts_busy(self):
+        return bool(self.tts and self.tts.busy())
+
+    def cancel_speech(self):
+        """Stop the current utterance and drop the backlog (pause/stop)."""
+        if self.tts:
+            self.tts.cancel()
+
     # -- text-to-speech -----------------------------------------------------
     def _ensure_tts(self):
         """Create/start the TTS player if not running, or recreate it if the
-        chosen voice changed. Returns True if a working player is available."""
+        chosen voice or engine changed. Returns True if a working player is
+        available."""
+        engine = select_tts_engine({"engine": self.tts_engine})
         need_new = (self.tts is None or
-                    (self.tts_voice and self.tts._voice_id != self.tts_voice))
+                    (self.tts_voice and self.tts._voice_id != self.tts_voice) or
+                    self.tts._engine != engine)
         if need_new:
             if self.tts is not None:
                 self.tts.close()
             self.tts = TTSPlayer(voice_id=self.tts_voice, out=self.out,
-                                 on_start=self.tts_on_start, on_end=self.tts_on_end)
+                                 on_start=self.tts_on_start, on_end=self.tts_on_end,
+                                 engine=engine)
             if self.tts.available:
                 self.tts.start()
-                self.out.status(f"TTS ready (voice '{self.tts._voice_id}').")
+                self.out.status(f"TTS ready ({engine}).")
             else:
-                self.out.status("TTS could not start (no voice / piper).")
+                self.out.status("TTS could not start (no voice / engine unavailable).")
         return bool(self.tts and self.tts.available)
 
     def set_tts_voice(self, voice_id):
         """Change the TTS voice (recreates the player on next _ensure_tts)."""
         self.tts_voice = voice_id
+
+    def set_tts_engine(self, engine):
+        """Change the TTS engine ('auto'|'piper'|'winrt'|'sapi'). If TTS is on,
+        recreate the player so it takes effect (_ensure_tts recreates when the
+        resolved engine changes)."""
+        self.tts_engine = engine or "auto"
+        if self.tts_enabled:
+            self._ensure_tts()
 
     def _maybe_speak(self, name, text):
         """Decide whether this transcript line should be read aloud, and queue it."""
@@ -2027,15 +4110,18 @@ class Engine:
         if self._ensure_tts():
             self.tts.say(text)
 
-    def set_model(self, model_name, on_done=None):
+    def set_model(self, model_name, on_done=None, force=False):
         """
         Swap the Whisper model at runtime WITHOUT stopping the streams. Loads the
         new model (blocking -- call this from a background thread), then atomically
         hot-swaps the reference the transcriber reads. on_done(ok, message) is
         invoked when finished. Safe because the worker reads self.model once per
         transmission, so the reference swap takes effect on its next job.
+
+        `force=True` reloads even when the model name is unchanged (used by
+        set_device, which reloads the current model on a new device).
         """
-        if model_name == self.cfg.get("model"):
+        if model_name == self.cfg.get("model") and not force:
             if on_done:
                 on_done(True, f"Already using '{model_name}'.")
             return
@@ -2060,7 +4146,25 @@ class Engine:
         if on_done:
             on_done(True, msg)
 
+    def set_device(self, device, on_done=None):
+        """Change the compute device ('auto'|'cuda'/'gpu'|'cpu') and reload the
+        current model live so it takes effect. No-op on the whisper.cpp backend
+        (always CPU/NPU -- it ignores the device). Call from a background thread."""
+        self.cfg["device"] = device
+        if select_backend(self.cfg) == "whispercpp":
+            if on_done:
+                on_done(True, "Device is fixed to CPU/NPU on the whisper.cpp backend.")
+            return
+        self.set_model(self.cfg.get("model", "large-v3"), on_done=on_done, force=True)
+
     def start_streams(self, streams):
+        # URL feeds are decoded by ffmpeg. If it's missing, say so ONCE here rather
+        # than letting every worker loop on "ffmpeg launch failed / reconnecting".
+        if any(s.get("type") not in ("pcaudio", "app") for s in streams
+               if is_enabled(s)) and not ffmpeg_available(self.ffmpeg):
+            self.out.status(
+                "WARNING: ffmpeg not found -- URL/stream feeds cannot be decoded. "
+                "Put ffmpeg.exe in the app's bin/ folder or install it on PATH.")
         for s in streams:
             if is_enabled(s):
                 self.add_stream(s)
@@ -2070,6 +4174,9 @@ class Engine:
         """Start a worker for a stream. Type 'pcaudio' captures a PC input
         device; anything else is a URL/feed via ffmpeg. Returns True if started."""
         name = stream["name"]
+        # Clip recording is per-feed opt-in, carried on the stream dict.
+        self.set_recording(name, stream.get("record", False))
+        self.stream_meta[name] = dict(stream)     # for prompt_for / profile
         with self._lock:
             if name in self.workers:
                 self.out.status(f"[{name}] already running.")
@@ -2097,6 +4204,8 @@ class Engine:
     def remove_stream(self, name):
         with self._lock:
             w = self.workers.pop(name, None)
+        self.recording_feeds.discard(name)
+        self.stream_meta.pop(name, None)
         if w:
             w.stop()
             if self.player and self.player.get_source() == name:
@@ -2144,6 +4253,9 @@ class Engine:
 
     def shutdown(self):
         self.stop_evt.set()
+        # Stop the clip writer FIRST: it drains what's queued, so clips from the
+        # last few seconds still land instead of dying with the process.
+        self.clips.stop()
         if self.player:
             self.player.close()
         if self.tts:

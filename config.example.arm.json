@@ -1,7 +1,6 @@
 {
-  "model": "large-v3",
-  "device": "cuda",
-  "compute_type": "float16",
+  "model": "base.en",
+  "engine": "whispercpp",
   "language": "en",
   "beam_size": 5,
   "log_retention_days": 14,

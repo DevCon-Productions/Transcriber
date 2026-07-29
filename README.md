@@ -10,12 +10,31 @@ Everything runs locally on your machine. No audio leaves your computer.
 
 ## Requirements
 
-- **Windows 10/11, 64-bit (x64).** Not compatible with ARM devices (Windows on
-  ARM, Apple Silicon Macs) — those lack an NVIDIA GPU.
-- **An NVIDIA GPU with CUDA support.** The app transcribes on the GPU; it will
-  not run acceptably without one.
-- **Internet on first launch** — it downloads the CUDA runtime (~1 GB) and the
-  Whisper speech model (~3 GB) once, then runs fully offline.
+**Windows 10/11, 64-bit.** Both x64 and ARM64 are supported — the app picks its
+transcription engine to match:
+
+| | **x64 (recommended)** | **Windows on ARM (Snapdragon)** |
+|---|---|---|
+| Engine | faster-whisper (ctranslate2) | whisper.cpp (pywhispercpp) |
+| Compute | NVIDIA GPU (CUDA), or CPU | CPU |
+| Model | large-v3 works well on GPU | use a small one (`base.en` / `small.en`) |
+| Setup | `gui.bat` | build from source — see **[BUILD_ARM.md](BUILD_ARM.md)** |
+
+- **An NVIDIA GPU with CUDA support** is recommended on x64 — large-v3 across
+  several feeds needs one. Without a GPU the app now falls back to the CPU
+  automatically (pick **Device: CPU** and a smaller model in the toolbar); note
+  large-v3 on CPU runs at roughly real time or slower, so choose `base.en`/`small.en`.
+- **ARM64 has no CUDA** (there's no NVIDIA GPU); it runs whisper.cpp on the CPU,
+  which is comfortably faster than real time with a small English model.
+- **Internet on first launch** — it downloads the speech model once (and, on x64
+  GPU, the CUDA runtime ~1 GB), then runs fully offline.
+
+Text-to-speech works on both: neural **Piper** voices where available, otherwise
+the built-in **Windows voices** (WinRT/OneCore, or SAPI5).
+
+> ARM caveat: per-app ("application") audio capture is unavailable — `proc-tap`'s
+> native component has no ARM64 build. URL feeds, PC-audio loopback and Stereo Mix
+> all work.
 
 ## GUI (recommended)
 
@@ -198,9 +217,41 @@ dropdown. The `-E` flag avoids this machine's PYTHONPATH trap — see below.
 - `vad.silence_hangover_sec` — silence gap that ends a transmission.
 - `filters.max_no_speech_prob` / `min_avg_logprob` — drop low-confidence/garbage
   output (helps suppress Whisper "hallucinations" on static).
-- `log_retention_days` — on startup, delete log files older than this many days
-  (default 14). Set to `0` to keep logs forever. Because logs contain sensitive
-  PII, this keeps the on-disk footprint bounded automatically.
+- `log_retention_days` — delete log files older than this many days (default 14).
+  `0` keeps them forever.
+- `clips.enabled` / `clips.retention_days` / `clips.max_gb` / `clips.bitrate` —
+  audio clip recording (off by default). See "Retention" and "Clip recording".
+
+### Retention
+
+**Streams → Retention…** sets how long saved data is kept. Transcripts and clips
+are configured separately, because their sizes aren't comparable — a day of text
+is kilobytes, a day of audio is tens of megabytes. One shared number would either
+throw away cheap transcripts early or keep expensive audio far too long.
+
+| | Setting | Default |
+|---|---|---|
+| Transcripts (text) | `log_retention_days` | 14 days |
+| Audio clips | `clips.retention_days` | 7 days |
+| Audio clips | `clips.max_gb` — optional size cap | off |
+
+`0` days means "keep forever" for either.
+
+The **size cap** is the setting that actually bounds the disk. Days alone can't:
+a busy week and a quiet one differ by an order of magnitude at the same
+retention. When the clips folder exceeds the cap, the **oldest clips are deleted
+first** until it fits.
+
+Age is applied before the cap, so the cap only ever has to evict clips that are
+still inside their retention window. Day-based purging runs at startup; the size
+cap is *also* enforced while the app runs, so a session left up for days can't
+sail past it.
+
+**Apply and purge now** in the dialog runs both policies immediately against the
+values on screen, so you can see the effect before committing.
+
+Saved `.tscript` files are never touched by any of this — deleting those is
+always your call.
 
 The GUI keeps recent transcript lines in memory and **replays them** when you
 toggle a feed or switch views, so the visible scrollback no longer resets.
@@ -256,6 +307,7 @@ Cleveland feeds **plus anything you add**). Per row:
 - **Edit** — fix a typo, rename, change color, or update a changed URL. If the
   feed is currently active, it restarts live with the new settings.
 - **Delete** — permanently forget the feed.
+- **PDF** — save that feed's transcript as a PDF (see below).
 - **+ Add new feed** — add a brand-new feed (URL or feed id). It's saved to the
   library but does **not** start transcribing until you click its **Add**.
 - **Reorder** — drag the **⠿** handle on the left of a row up or down to change
@@ -263,6 +315,277 @@ Cleveland feeds **plus anything you add**). Per row:
 
 The built-in Cleveland feeds are: Cleveland West, Cleveland Citywide (covers east
 side), Cleveland Fire/EMS, Westlake/WestCom, and East Cleveland.
+
+### Column groups — several feeds in one sector
+
+A busy airport is split across separate LiveATC feeds — Tower, Ground, Approach,
+Clearance — and each is silent much of the time. Four near-empty columns read
+worse than one populated column, so **Feeds → Edit → Column group** puts feeds
+together. Pick an existing group or "New group…".
+
+```
+┌── CLE ATC  (3) ─────────────┐   ┌── Cleveland West ───┐
+│ [10:38] CLE Tower   Delta…  │   │ [10:38] Adam 33…    │
+│ [10:39] CLE Ground  Taxi…   │   │ [10:39] …           │
+│ [10:41] CLE Appr    Descend…│   │                     │
+└─────────────────────────────┘   └─────────────────────┘
+```
+
+Each line is labelled with its channel, in that feed's own colour, so Tower and
+Ground stay distinguishable. Feeds without a group keep their own column exactly
+as before, and don't waste width on a label.
+
+**Grouping is display only.** Every feed keeps its own worker, log, clips, PDF
+export and past-day review, so you can still export just Tower. Dragging a shared
+column moves all its members together. Selecting rows in a shared column picks up
+lines from every channel in it, which is usually what you want for an MP3 or a
+transcript file of an incident.
+
+It does **not** reduce CPU: five feeds means five ffmpeg processes and five gates
+whether they share a column or not. The saving is that silent channels cost
+decoding but almost no transcription — the gate only emits when someone talks.
+
+### Feed service — police, fire/EMS, ATC, general
+
+Each feed can say what kind of radio it carries, in **Feeds → Edit → Service**.
+It isn't cosmetic: three parts of the pipeline are domain-specific, and a service
+sets all three together.
+
+| Service | Whisper prompt | Call signs | Links |
+|---|---|---|---|
+| *(blank)* | the global `initial_prompt` | police + fire | addresses |
+| **Police** | police wording | police + fire | addresses |
+| **Fire / EMS** | fire/EMS wording | police + fire | addresses |
+| **Air traffic control** | aviation phraseology | airline + tail numbers | **aircraft → FlightRadar24** |
+| **General** | none | off | none |
+
+**Police and Fire/EMS differ only in the prompt.** The call-sign extractor already
+handles both at once, and shared PD+Fire dispatch channels are common — three of
+the five stock Cleveland feeds are joint — so splitting it would only lose units
+on the feeds that need them most. Pick whichever wording fits the traffic better.
+
+**Air traffic control is the one that changes behaviour**, and it matters:
+
+- The police prompt actively damages ATC audio — it turned *"hold short of
+  runway"* into *"whole sort of runway"* and invented text that was never said.
+- Aircraft identify as `Delta 510` / `Speedbird 117 heavy` / `November 65 Juliet
+  Charlie`, which the police extractor can't see (it caught `Delta` only because
+  "delta" is in its NATO prefix list, and missed United and Speedbird entirely).
+- Address detection is switched **off**, because `November 65 Juliet Charlie` was
+  otherwise detected as the street address *"65 Juliet Charlie"*.
+
+**Prompt override.** The box under Service tunes one feed without touching the
+rest: empty uses the service preset, and a feed with no service falls back to the
+global `initial_prompt`. Resolution is *override → preset → global*, so existing
+feeds behave exactly as they always did until you choose otherwise.
+
+Both `service` and any override travel with an exported feed list.
+
+#### Aircraft → FlightRadar24
+
+On an ATC feed, recognised aircraft become green links: flights open
+`flightradar24.com/data/flights/dl510`, registrations open
+`…/data/aircraft/n65jc`. This only builds a URL for your browser — no API, no
+scraping. A link can miss if FR24 isn't tracking that flight right now, the same
+way a map link can miss on a garbled street name.
+
+Labels are canonicalised before use: Whisper hyphenates spoken digits
+unpredictably (`Delta 5-10` on one line, `Delta 510` the next) and controllers
+append a weight class, so `DELTA 510` is derived from the parts. Without that,
+one aircraft would scatter across several "units" and click-to-filter wouldn't
+group it.
+
+### Exporting / importing the feed list
+
+**Export list…** (Feeds window, or Streams → Export feed list…) writes your whole
+library to a small JSON file. **Import list…** reads one back and merges it in.
+
+- Imported feeds are **saved only** — nothing starts transcribing until you click
+  **Add** on the row.
+- On a name collision you pick once for the whole import: **skip** (keep yours),
+  **replace** (take theirs), or **keep both** (imports as `Name (2)`).
+- Import also accepts a raw `config.json` from another install, so you don't have
+  to export first if you already have one in hand.
+
+**x64 ↔ ARM64:** the file carries feeds only — never `model` / `device` /
+`compute_type` / `engine` — so a list moves cleanly between the two builds. That
+matters because the two installs keep **separate** data directories
+(`%APPDATA%\Transcriber` vs `%APPDATA%\Transcriber-ARM64`) and have very
+different engine defaults (large-v3 on CUDA vs. a small whisper.cpp model);
+carrying engine settings across would hand an ARM machine a model it can't run.
+
+URL feeds are fully portable. Two feed types are bound to the machine that
+created them and are reported as warnings after import rather than silently
+dropped:
+
+| Feed type | Travels? | Why |
+|---|---|---|
+| URL / Broadcastify | Yes | Just a URL |
+| `pc audio` | Needs re-pointing | Names a specific output device on the old PC |
+| `application` | No on ARM64 | Per-app capture has no ARM64 build; the pid is session-only |
+
+### Clip recording — click a line, hear it again
+
+Transcriber can keep the audio behind every transcript line. Lines with a saved
+recording get a violet **🔊**; click it to hear that exact transmission.
+
+No continuous recording is involved. The voice gate already splits each feed into
+one segment per transmission, and that same segment is what gets transcribed — so
+a line and its audio are 1:1 by construction, including the `preroll_sec` lead-in
+so clips don't sound chopped.
+
+Two switches, both **off** by default:
+
+1. **Streams → Audio recording…** — the master switch, retention in days, what's
+   on disk now, open-folder, and delete-all.
+2. **Feeds → Edit → "Save audio for each line"** — per-feed opt-in.
+
+Playback takes over the speakers briefly; the live feed you were listening to
+resumes when the clip ends, and clicking another 🔊 interrupts the first.
+
+| | Size |
+|---|---|
+| Raw 16 kHz mono WAV | ~32 KB/s → **~800 MB/day** for a busy feed |
+| Opus (what's used) | ~7× smaller → **~100 MB/day** |
+
+Encoding goes through the ffmpeg that already decodes the streams, so there's no
+new dependency on either build. If that ffmpeg has no `libopus`, clips fall back
+to WAV and the status line says so once — shorten the retention if that happens.
+
+Clips are voice recordings of live radio. They stay on your PC, are purged on the
+same kind of schedule as the logs (`clips.retention_days`), and can be wiped from
+the recording dialog at any time.
+
+#### Exporting clips as an MP3
+
+Click a line to select that whole row, drag up or down to take more, then
+**right-click → Export selected audio as MP3…** (or Streams → the same). Every
+selected line that has a 🔊 is decoded, joined in transcript order with a short
+silence between transmissions, and written as a single MP3. Selecting one line
+exports just that one.
+
+Selection is by whole rows, never part of one — a transmission either goes in the
+MP3 or it doesn't. Shift-click extends to the clicked row, dragging past the top
+or bottom edge scrolls, and the right-click menu has **Select all** plus a count
+of how many clips your selection covers before you commit.
+
+Joining happens as raw PCM, not by concatenating the Opus files — stitching
+compressed frames would need matching encoder state. Clips decode, join, then
+re-encode once at 64 kbps mono, which is ample for 16 kHz speech. Lines without
+audio are skipped silently; clips already purged are reported in the status bar
+rather than failing the export.
+
+Encoding runs on a worker thread, so a long selection never freezes the window.
+
+#### Transcript files (`.tscript`) — text and audio in one file
+
+A transcript file keeps the lines **and the audio behind them** together, so an
+incident can be archived or handed to someone else. Unlike the live logs and
+clips, it isn't touched by any retention setting.
+
+- **Save selected as transcript file…** — right-click a row selection.
+- **Streams → Save whole day as transcript file…** — pick a feed and day.
+- **Streams → Open transcript file…** — opens it for review, exactly like a past
+  day: the text, with 🔊 on every line whose audio came along.
+
+It's an ordinary **ZIP with a different extension** — deliberately, not a private
+format. Rename it `.zip` and anything can read it:
+
+```
+manifest.json     format/version, feed, day, span, counts
+transcript.json   [{"ts", "text", "clip"}, ...]
+clips/*.opus      only the clips those lines reference
+```
+
+That matters for something meant to be an archive: the text is JSON and the audio
+is ordinary Opus, so it stays readable even without Transcriber. `zipfile` is
+stdlib, so this adds no dependency on either build.
+
+Clips are decoded **from inside the archive** rather than extracted, so opening
+one doesn't scatter copies of voice recordings through temp folders. Lines whose
+clip was already purged are still saved — they just carry no audio, and the
+status bar says how many.
+
+> **These files deliberately outlive `clips.retention_days`.** That's the point
+> of having them, but it does mean `purge_old_clips` can't reach inside one. They
+> contain PII and recorded voices: keep them somewhere you'd be comfortable
+> keeping the logs, and delete them yourself when done.
+
+#### Playing a transcript through
+
+Any transcript you're reviewing — an opened `.tscript` or a past day — gets a
+transport bar with **two** ways to play it:
+
+| | What it plays | Works on |
+|---|---|---|
+| **▶ Play audio** | the recorded radio audio, clip after clip | lines that still have a 🔊 |
+| **🗣 Read aloud** | the voice reading the transcribed text | every line |
+
+Both step one line at a time, highlighting the current line and scrolling to keep
+it in view. **⏸ Pause** holds your place, **⏹ Stop** rewinds to the top.
+
+The distinction matters more than it first looks: **Play audio** skips lines whose
+clips have been purged, while **Read aloud** works on any transcript at all —
+including an old day whose audio is long gone.
+
+Select a line before pressing play to start from there rather than the beginning.
+
+#### Reviewing an earlier day
+
+The live window restores **today's** lines on launch. To go further back, use
+**Streams → Open a past day…**: pick a feed, then a day. The list is newest-first
+and shows what each day holds:
+
+```
+2026-07-28   103 lines  🔊 103
+2026-07-19   182 lines
+2026-07-15   285 lines
+```
+
+The 🔊 count is audio still on disk. Days without it kept their transcript but
+their clips have been purged — `clips.retention_days` (7) is shorter than
+`log_retention_days` (14), so the older stretch is text-only by design.
+
+Opening a day takes over the window with a read-only transcript of it, marked
+with 🔊 wherever the audio survived, and an amber banner naming the day. Feeds
+keep transcribing and recording the whole time — new lines are held in memory
+and appear when you click **Back to live**.
+
+```jsonc
+"clips": {
+  "enabled": true,        // master switch
+  "retention_days": 7,    // 0 = keep forever
+  "bitrate": "24k"        // Opus target
+}
+```
+
+### Saving a transcript as PDF
+
+Streams → **Save transcript as PDF…**, or the **PDF** button on a feed row. Choose
+the feed, then what to include:
+
+- **This session** — what's currently on screen for that feed.
+- **Saved logs** — one day, several (Ctrl/Shift-click), or all of them if you
+  select none. Only days still on disk appear (see `log_retention_days`).
+
+Page 1 opens with the feed name in large bold type, and under it the span of the
+export — the date and time of the **first and last transmission it contains**,
+not the day you picked:
+
+```
+Westlake/WestCom
+2026-07-28  ·  10:38:24 – 11:05:02  ·  116 transmissions
+────────────────────────────────────────────────────────
+[10:38:24] Medics 7-2 in route 10-37.
+```
+
+An export spanning several days dates both ends
+(`2026-07-12 08:00:01 – 2026-07-19 23:59:12`). Log files only record the time of
+day, so the date comes from the filename.
+
+Output is a timestamped, wrapped, page-numbered PDF. The writer is plain stdlib —
+no reportlab — so it behaves identically on the x64 and ARM64 builds and adds
+nothing to either installer.
 
 ## How it works
 

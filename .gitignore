@@ -9,6 +9,7 @@ config.json
 
 # === Environment / caches ===
 .venv/
+.venv-arm64/
 __pycache__/
 *.pyc
 *.pyo
@@ -18,9 +19,21 @@ dist/
 
 # === Output ===
 logs/
+# Recorded audio behind transcript lines. Voice recordings of live radio --
+# treat like logs, only more so. Never commit.
+clips/
+# Saved transcript bundles: the same audio plus its transcript, in one file, and
+# they deliberately outlive the clip retention. Same rule.
+*.tscript
 
 # === TTS voice models (large; downloaded on demand) ===
 tts_voices/
+
+# === whisper.cpp GGML models (ARM backend; downloaded on demand) ===
+whispercpp_models/
+
+# === Bundled ffmpeg (large binary; staged per-platform, see BUILD_ARM.md) ===
+bin/
 
 # === Windows / scratch ===
 .wheeltest/

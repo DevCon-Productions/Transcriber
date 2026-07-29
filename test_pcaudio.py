@@ -96,6 +96,9 @@ def run():
     eng.ffmpeg = ""; eng.vad_cfg = {}; eng.jobq = __import__("queue").Queue()
     eng.out = core.Output(console=False, file_logging=False)
     eng.auth_header = None; eng.player = None
+    # These are set by the real Engine.__init__; add_stream/set_recording touch
+    # them, and this test bypasses __init__ via __new__, so set them by hand.
+    eng.recording_feeds = set(); eng.stream_meta = {}
     st = {"name": "PC", "type": "pcaudio", "device": 5, "color": "white"}
     eng.change_device(st, 7)
     r["change_device_mutates"] = (st["device"] == 7)

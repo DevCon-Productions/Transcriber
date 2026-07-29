@@ -21,8 +21,9 @@ import os
 import queue
 import threading
 import collections
+import datetime as _dt
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 import tkinter.font as tkfont
 
 import transcriber as core
@@ -35,7 +36,7 @@ SPLASH_LOGO = os.path.join(HERE, "OfficialLogo.png")
 TASKBAR_ICON = os.path.join(HERE, "OfficialTaskbarIcon.png")
 DEVELOPER_PHOTO = os.path.join(HERE, "Developer.png")
 
-APP_VERSION = "1.4"
+APP_VERSION = "2.0"
 
 
 def load_scaled_image(path, max_w=None, max_h=None):
@@ -103,6 +104,12 @@ FG = "#e6e6e6"
 MUTED = "#9aa0a6"
 NO_UNIT_COLOR = FG          # white for lines with no detected speaker/call sign
 LINK_FG = "#6db3f2"         # blue for clickable address -> Google Maps links
+CLIP_FG = "#c2a3f0"         # violet for the 🔊 "play this line's audio" marker
+AIRCRAFT_FG = "#7fd1a8"     # green for aircraft -> FlightRadar24 links
+
+# Sentinels in the column-group picker (not group names).
+_GROUP_NONE = "(none — its own column)"
+_GROUP_NEW = "New group…"
 
 # Read-aloud keyword presets: each checkbox expands to several synonyms so you
 # catch variants without typing them all. Label -> list of match terms (lower).
@@ -175,7 +182,52 @@ class CheckBox(tk.Label):
 
 # Whisper models selectable in the GUI. Larger = more accurate; distil/turbo are
 # faster. Switching downloads the model once (cached) and hot-swaps live.
+# faster-whisper / x64 (GPU): the big models are practical.
 MODEL_CHOICES = ["large-v3", "large-v3-turbo", "distil-large-v3", "medium", "small"]
+# whisper.cpp / ARM: CPU-only, so offer the small English models that actually run
+# faster than real time there (roughly: tiny.en ~50x, base.en ~20x, small.en ~5x,
+# medium.en ~1-2x). Listed fastest -> most accurate. Anything in whisper.cpp's
+# catalog can still be set by hand in config.json.
+MODEL_CHOICES_WHISPERCPP = ["tiny.en", "base.en", "small.en-q5_1", "small.en",
+                            "medium.en"]
+
+
+# TTS engine picker (in the Read-aloud dialog). "Auto" lets the app choose
+# (piper -> winrt -> sapi); the rest force a specific engine. Only engines that
+# can actually speak on this machine are offered (see core.available_tts_engines).
+_TTS_ENGINE_LABELS = [("auto", "Auto (recommended)"),
+                      ("piper", "Piper (neural)"),
+                      ("winrt", "Windows — all voices"),
+                      ("sapi", "Windows SAPI5")]
+_TTS_ID_TO_LABEL = {eid: lab for eid, lab in _TTS_ENGINE_LABELS}
+_TTS_LABEL_TO_ID = {lab: eid for eid, lab in _TTS_ENGINE_LABELS}
+
+
+def tts_engine_choices():
+    """[(id, label)] to offer: Auto + whatever engines actually work here."""
+    ids = ["auto"] + core.available_tts_engines()
+    return [(eid, _TTS_ID_TO_LABEL[eid]) for eid in ids]
+
+
+def model_choices(cfg=None, current=None):
+    """Models to offer for the active engine. `current` (the configured model) is
+    always included, so whatever config.json is running stays re-selectable -- on
+    ARM the x64 list wouldn't contain it, which left no way back."""
+    if core.select_backend(cfg or {}) == "whispercpp":
+        choices = list(MODEL_CHOICES_WHISPERCPP)
+    else:
+        choices = list(MODEL_CHOICES)
+    if current and current not in choices:
+        choices.insert(0, current)
+    return choices
+
+# Compute device selectable in the GUI (faster-whisper / x64 path only). "Auto"
+# tries the GPU and falls back to CPU; "GPU" forces CUDA (NVIDIA); "CPU" runs on
+# the CPU. Irrelevant on the whisper.cpp/ARM backend (always CPU/NPU), so the
+# picker is hidden there.
+DEVICE_CHOICES = ["Auto", "GPU", "CPU"]
+_DEVICE_LABEL_TO_CFG = {"Auto": "auto", "GPU": "cuda", "CPU": "cpu"}
+_DEVICE_CFG_TO_LABEL = {"auto": "Auto", "cuda": "GPU", "gpu": "GPU", "cpu": "CPU"}
 
 # Built-in catalog of feeds verified working this session (Greater Cleveland).
 # Users pick from these in "Add from catalog..." instead of pasting URLs.
@@ -204,8 +256,9 @@ class AddStreamDialog(simpledialog.Dialog):
       - pc audio: capture an output device (all sound from those speakers)
       - application: capture ONE app's audio by process (per-app loopback).
     Pass `initial` (a stream dict) to prefill for editing."""
-    def __init__(self, parent, title="Add stream", initial=None):
+    def __init__(self, parent, title="Add stream", initial=None, groups=None):
         self._initial = initial or {}
+        self._groups = list(groups or [])
         super().__init__(parent, title=title)
 
     def body(self, master):
@@ -241,23 +294,22 @@ class AddStreamDialog(simpledialog.Dialog):
         self.url_entry.grid(row=2, column=1, padx=6, pady=4)
 
         # PC-audio device row: pick the OUTPUT device (speakers) to capture.
+        #
+        # The device list is NOT fetched here. Enumerating output devices goes
+        # through soundcard/WASAPI COM, which on Windows-on-ARM64 can corrupt the
+        # heap and kill the process outright (0xC0000374, no traceback -- the
+        # window simply disappears). Opening this dialog at all used to risk that,
+        # even to add a plain URL feed, which is the overwhelmingly common case.
+        # Now nothing touches audio hardware unless "pc audio" is actually
+        # selected -- see _load_output_devices.
         self.dev_label = tk.Label(master, text="Speakers to capture", bg=BG, fg=FG)
         self.dev_label.grid(row=3, column=0, sticky="w", padx=6, pady=4)
-        self._outputs = core.list_output_devices()   # [(name, is_default)]
-        out_names = [n for n, _d in self._outputs] or ["(none found)"]
-        self.dev_var = tk.StringVar()
+        self._outputs = None                        # None = not looked up yet
+        self.dev_var = tk.StringVar(value=init.get("output_device", ""))
         self.dev_combo = ttk.Combobox(master, textvariable=self.dev_var,
-                                      values=out_names, state="disabled", width=42)
+                                      values=["(select 'pc audio' to load)"],
+                                      state="disabled", width=42)
         self.dev_combo.grid(row=3, column=1, padx=6, pady=4)
-        if init.get("output_device") in out_names:        # prefill when editing
-            self.dev_var.set(init["output_device"])
-        else:
-            for n, is_def in self._outputs:
-                if is_def:
-                    self.dev_var.set(n)
-                    break
-            if not self.dev_var.get() and out_names and out_names[0] != "(none found)":
-                self.dev_var.set(out_names[0])
 
         # Application row: pick a running app that has audio. Refresh re-scans.
         self.app_label = tk.Label(master, text="Application (playing audio)",
@@ -289,9 +341,118 @@ class AddStreamDialog(simpledialog.Dialog):
         tk.Label(master, text="e.g. Cleveland, OH", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8)).grid(row=7, column=1, sticky="w", padx=6)
 
+        # Service: what kind of radio this feed carries. Drives the Whisper
+        # prompt, which call-sign shape to look for, and whether addresses or
+        # aircraft become links. Blank = the historical behaviour.
+        tk.Label(master, text="Service", bg=BG, fg=FG).grid(
+            row=10, column=0, sticky="w", padx=6, pady=(10, 2))
+        self._service_labels = {"(default — police / fire)": ""}
+        for key, preset in core.SERVICE_PRESETS.items():
+            self._service_labels[preset["label"]] = key
+        init_service = init.get("service", "")
+        shown = next((lab for lab, k in self._service_labels.items()
+                      if k == init_service), "(default — police / fire)")
+        self.service = tk.StringVar(value=shown)
+        ttk.Combobox(master, textvariable=self.service,
+                     values=list(self._service_labels), state="readonly",
+                     width=28).grid(row=10, column=1, sticky="w", padx=6,
+                                    pady=(10, 2))
+        self.service.trace_add("write", lambda *_: self._sync_prompt_hint())
+
+        tk.Label(master, text="Prompt override", bg=BG, fg=FG).grid(
+            row=11, column=0, sticky="nw", padx=6, pady=(6, 2))
+        self.prompt_box = tk.Text(master, height=3, width=44, wrap="word",
+                                  bg=BG2, fg=FG, insertbackground=FG,
+                                  relief="flat")
+        self.prompt_box.grid(row=11, column=1, sticky="w", padx=6, pady=(6, 2))
+        if init.get("initial_prompt"):
+            self.prompt_box.insert("1.0", init["initial_prompt"])
+        self.prompt_hint = tk.Label(master, text="", bg=BG, fg=MUTED,
+                                    font=("Segoe UI", 8), justify="left",
+                                    wraplength=300)
+        self.prompt_hint.grid(row=12, column=1, sticky="w", padx=6, pady=(0, 6))
+        self._sync_prompt_hint()
+
+        # Column group: several feeds can share one column (e.g. an airport's
+        # Tower / Ground / Approach), each line tagged with its channel.
+        tk.Label(master, text="Column group", bg=BG, fg=FG).grid(
+            row=13, column=0, sticky="w", padx=6, pady=(6, 2))
+        init_group = (init.get("group") or "").strip()
+        if init_group and init_group not in self._groups:
+            self._groups.append(init_group)
+        self.group = tk.StringVar(value=init_group or _GROUP_NONE)
+        self.group_combo = ttk.Combobox(
+            master, textvariable=self.group, state="readonly", width=28,
+            values=[_GROUP_NONE] + sorted(self._groups) + [_GROUP_NEW])
+        self.group_combo.grid(row=13, column=1, sticky="w", padx=6, pady=(6, 2))
+        self._group_guard = False
+        self.group.trace_add("write", lambda *_: self._on_group_pick())
+        tk.Label(master, text="Feeds sharing a group share one column, with "
+                 "each line labelled by feed.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=14, column=1, sticky="w", padx=6, pady=(0, 6))
+
+        # Clip recording: per-feed opt-in, off by default. Saves the audio behind
+        # each transcript line so you can click 🔊 and hear that transmission.
+        self.record = tk.BooleanVar(value=bool(init.get("record", False)))
+        tk.Checkbutton(master, text="Save audio for each line (click 🔊 to replay)",
+                       variable=self.record, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       anchor="w").grid(row=8, column=1, sticky="w", padx=4,
+                                        pady=(8, 0))
+        tk.Label(master, text="Roughly 100 MB per day for a busy feed. "
+                 "Old clips are deleted automatically.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=9, column=1, sticky="w", padx=6, pady=(0, 4))
+
         self.provider = tk.StringVar(value=init.get("provider", "broadcastify"))
         self._sync_state()
         return None
+
+    def _on_group_pick(self):
+        """Choosing 'New group…' asks for a name and selects it. Guarded, since
+        setting the variable from inside its own trace would re-enter."""
+        if self._group_guard or self.group.get() != _GROUP_NEW:
+            return
+        self._group_guard = True
+        try:
+            name = (simpledialog.askstring(
+                "New group", "Name for the new column group:",
+                parent=self) or "").strip()
+            if name:
+                if name not in self._groups:
+                    self._groups.append(name)
+                    self.group_combo.config(
+                        values=[_GROUP_NONE] + sorted(self._groups) + [_GROUP_NEW])
+                self.group.set(name)
+            else:
+                self.group.set(_GROUP_NONE)
+        finally:
+            self._group_guard = False
+
+    def _sync_prompt_hint(self):
+        """Say what the empty prompt box will fall back to for this service."""
+        key = self._service_labels.get(self.service.get(), "")
+        preset = core.SERVICE_PRESETS.get(key)
+        if preset is None:
+            note = ("Leave blank to use the global prompt from config.json "
+                    "(what every feed used before).")
+        elif preset["prompt"]:
+            note = f"Leave blank to use the {preset['label']} wording: " \
+                   f"“{preset['prompt'][:70]}…”"
+        else:
+            note = "Leave blank for no prompt at all."
+        extra = []
+        if preset is not None and not preset["address_links"]:
+            extra.append("no address links")
+        if preset is not None and preset["aircraft_links"]:
+            extra.append("aircraft link to FlightRadar24")
+        if extra:
+            note += "  (" + ", ".join(extra) + ")"
+        try:
+            self.prompt_hint.config(text=note)
+        except tk.TclError:
+            pass
 
     def _refresh_apps(self):
         self._apps = core.list_audio_apps()
@@ -305,12 +466,30 @@ class AddStreamDialog(simpledialog.Dialog):
         else:
             self.app_var.set(labels[0])
 
+    def _load_output_devices(self):
+        """Fetch the speaker list, once, only when 'pc audio' is chosen."""
+        if self._outputs is not None:
+            return
+        self._outputs = core.list_output_devices()
+        names = [n for n, _d in self._outputs] or ["(none found)"]
+        self.dev_combo.config(values=names)
+        if self.dev_var.get() in names:
+            return                                   # keep what we're editing
+        for n, is_def in self._outputs:
+            if is_def:
+                self.dev_var.set(n)
+                return
+        if names[0] != "(none found)":
+            self.dev_var.set(names[0])
+
     def _sync_state(self):
         """Enable only the fields relevant to the chosen source type."""
         src = self.source.get()
         is_url = src == "url"
         is_pc = src == "pc audio"
         is_app = src == "application"
+        if is_pc:
+            self._load_output_devices()
         self.url_entry.config(state="normal" if is_url else "disabled")
         self.url_label.config(fg=FG if is_url else MUTED)
         self.dev_combo.config(state="readonly" if is_pc else "disabled")
@@ -373,6 +552,18 @@ class AddStreamDialog(simpledialog.Dialog):
         loc = self.location.get().strip()
         if loc:
             self.result["location"] = loc
+        # Only written when set, so feeds that don't opt in stay clean in config.
+        if self.record.get():
+            self.result["record"] = True
+        svc = self._service_labels.get(self.service.get(), "")
+        if svc:
+            self.result["service"] = svc
+        override = self.prompt_box.get("1.0", "end").strip()
+        if override:
+            self.result["initial_prompt"] = override
+        grp = self.group.get()
+        if grp not in (_GROUP_NONE, _GROUP_NEW) and grp.strip():
+            self.result["group"] = grp.strip()
 
 
 class ChangeDeviceDialog(simpledialog.Dialog):
@@ -471,7 +662,7 @@ class CatalogDialog(tk.Toplevel):
         super().__init__(parent)
         self.app = app
         self.title("Feeds")
-        self.geometry("600x460")
+        self.geometry("680x460")
         self.configure(bg=BG)
         self.transient(parent)
 
@@ -486,6 +677,10 @@ class CatalogDialog(tk.Toplevel):
         btns = tk.Frame(self, bg=BG2)
         btns.pack(side="bottom", fill="x")
         tk.Button(btns, text="+ Add new feed", command=self._add_new,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
+        tk.Button(btns, text="Export list...", command=self._export_list,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
+        tk.Button(btns, text="Import list...", command=self._import_list,
                   bg=BG2, fg=FG, relief="flat").pack(side="left", padx=4, pady=6)
         tk.Button(btns, text="Close", command=self.destroy,
                   bg=BG2, fg=FG, relief="flat").pack(side="right", padx=4, pady=6)
@@ -528,6 +723,8 @@ class CatalogDialog(tk.Toplevel):
             tk.Button(row, text="Delete", command=lambda n=name: self._delete(n),
                       bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
             tk.Button(row, text="Edit", command=lambda n=name: self._edit(n),
+                      bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
+            tk.Button(row, text="PDF", command=lambda n=name: self._pdf(n),
                       bg=BG2, fg=FG, relief="flat").pack(side="right", padx=2)
             # Toggle action: active feeds get "Remove" (stop transcribing); the
             # rest get "Add" (start). Both keep the feed in the library.
@@ -597,7 +794,8 @@ class CatalogDialog(tk.Toplevel):
     def _add_new(self):
         # New feeds go to the LIBRARY ONLY -- they don't start transcribing until
         # the user clicks "Add" on the row.
-        dlg = AddStreamDialog(self, title="Add new feed")
+        dlg = AddStreamDialog(self, title="Add new feed",
+                              groups=self.app._known_groups())
         if dlg.result and self.app._do_add_to_library(dlg.result):
             self.app._set_status(f"Added '{dlg.result['name']}' to library.")
             self._render()
@@ -619,7 +817,8 @@ class CatalogDialog(tk.Toplevel):
         entry = self.app._lib_find(name)
         if not entry:
             return
-        dlg = AddStreamDialog(self, title=f"Edit '{name}'", initial=entry)
+        dlg = AddStreamDialog(self, title=f"Edit '{name}'", initial=entry,
+                              groups=self.app._known_groups())
         if dlg.result:
             self.app._do_edit(name, dlg.result)
             self._render()
@@ -630,6 +829,488 @@ class CatalogDialog(tk.Toplevel):
                                parent=self):
             self.app._lib_delete([name])
             self._render()
+
+    def _pdf(self, name):
+        """Row 'PDF': save this feed's transcript, feed pre-selected."""
+        self.app._export_pdf(name)
+
+    def _export_list(self):
+        self.app._export_feeds()
+
+    def _import_list(self):
+        self.app._import_feeds()
+        self._render()               # imported feeds appear as new rows
+
+
+def _fmt_day(day):
+    """'20260719' -> '2026-07-19'. Falls back to the raw string if it's odd."""
+    return f"{day[:4]}-{day[4:6]}-{day[6:8]}" if len(day) == 8 else day
+
+
+class ImportConflictDialog(simpledialog.Dialog):
+    """Asked only when an imported list names feeds already in the library.
+    result = 'skip' | 'replace' | 'rename' (or None if cancelled)."""
+    def __init__(self, parent, total, dupes):
+        self._total = total
+        self._dupes = dupes
+        super().__init__(parent, title="Feeds already in library")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        n = len(self._dupes)
+        tk.Label(master, text=f"{n} of {self._total} imported feed"
+                 f"{'s' if self._total != 1 else ''} already exist by name:",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold"), anchor="w",
+                 wraplength=380, justify="left").pack(anchor="w", padx=10, pady=(10, 4))
+        shown = ", ".join(self._dupes[:6]) + (" …" if n > 6 else "")
+        tk.Label(master, text=shown, bg=BG, fg=MUTED, wraplength=380,
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.mode = tk.StringVar(value="skip")
+        for val, lab in [
+                ("skip", "Skip them — keep what I already have"),
+                ("replace", "Replace them with the imported version"),
+                ("rename", "Keep both — import as “Name (2)”")]:
+            tk.Radiobutton(master, text=lab, variable=self.mode, value=val,
+                           bg=BG, fg=FG, selectcolor=BG2, activebackground=BG,
+                           activeforeground=FG, anchor="w").pack(
+                               anchor="w", padx=14, pady=1)
+        tk.Label(master, text="Feeds that aren't duplicates are imported either way.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(
+                     anchor="w", padx=10, pady=(8, 6))
+        return None
+
+    def apply(self):
+        self.result = self.mode.get()
+
+
+def _fmt_bytes(n):
+    """Human-readable size for the clips-on-disk readout."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+class RetentionDialog(simpledialog.Dialog):
+    """How long saved data is kept: transcripts and clip audio, separately.
+
+    They're separated because their sizes aren't comparable -- a day of text is
+    kilobytes, a day of audio is tens of megabytes -- so one shared number would
+    either throw away cheap transcripts early or keep expensive audio too long.
+    Clips also take an optional size cap, since days alone can't bound the disk:
+    a busy week and a quiet one differ by an order of magnitude at the same
+    retention. result = {"log_days", "clip_days", "max_gb"}."""
+    def __init__(self, parent, app):
+        self._app = app
+        super().__init__(parent, title="Retention")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        clips = core.clip_settings(self._app.cfg)
+
+        tk.Label(master, text="How long to keep saved data",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(10, 2))
+        tk.Label(master, text="Old files are deleted when the app starts, and "
+                 "the size cap is\nkept up to date while it runs.",
+                 bg=BG, fg=MUTED, justify="left").grid(
+                     row=1, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(0, 10))
+
+        # --- transcripts ---------------------------------------------------
+        tk.Label(master, text="Transcripts (text)", bg=BG, fg=FG,
+                 font=("Segoe UI", 9, "bold")).grid(row=2, column=0,
+                                                    columnspan=3, sticky="w",
+                                                    padx=10)
+        tk.Label(master, text="Keep for", bg=BG, fg=FG).grid(
+            row=3, column=0, sticky="w", padx=(24, 4), pady=3)
+        self.log_days = tk.StringVar(value=str(
+            self._app.cfg.get("log_retention_days", 14)))
+        tk.Spinbox(master, from_=0, to=3650, width=6,
+                   textvariable=self.log_days).grid(row=3, column=1, sticky="w")
+        tk.Label(master, text="days   (0 = forever)", bg=BG, fg=MUTED).grid(
+            row=3, column=2, sticky="w", padx=4)
+        ln, lb = core.logs_disk_usage()
+        tk.Label(master, text=f"On disk now: {ln} file(s), {_fmt_bytes(lb)}",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=4, column=0, columnspan=3, sticky="w",
+                     padx=24, pady=(0, 10))
+
+        # --- clips ----------------------------------------------------------
+        tk.Label(master, text="Audio clips", bg=BG, fg=FG,
+                 font=("Segoe UI", 9, "bold")).grid(row=5, column=0,
+                                                    columnspan=3, sticky="w",
+                                                    padx=10)
+        tk.Label(master, text="Keep for", bg=BG, fg=FG).grid(
+            row=6, column=0, sticky="w", padx=(24, 4), pady=3)
+        self.clip_days = tk.StringVar(value=str(clips["retention_days"]))
+        tk.Spinbox(master, from_=0, to=3650, width=6,
+                   textvariable=self.clip_days).grid(row=6, column=1, sticky="w")
+        tk.Label(master, text="days   (0 = forever)", bg=BG, fg=MUTED).grid(
+            row=6, column=2, sticky="w", padx=4)
+
+        cap = float(clips.get("max_gb") or 0)
+        self.cap_on = tk.BooleanVar(value=cap > 0)
+        tk.Checkbutton(master, text="Also cap total size at",
+                       variable=self.cap_on, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       command=self._sync_state).grid(
+                           row=7, column=0, sticky="w", padx=(20, 0), pady=3)
+        self.max_gb = tk.StringVar(value=f"{cap:g}" if cap else "2")
+        self.cap_entry = tk.Spinbox(master, from_=0.1, to=1000, increment=0.5,
+                                    width=6, textvariable=self.max_gb)
+        self.cap_entry.grid(row=7, column=1, sticky="w")
+        self.cap_unit = tk.Label(master, text="GB   (oldest deleted first)",
+                                 bg=BG, fg=MUTED)
+        self.cap_unit.grid(row=7, column=2, sticky="w", padx=4)
+        cn, cb = core.clips_disk_usage(self._app._clip_dir())
+        self.clip_usage = tk.Label(
+            master, text=f"On disk now: {cn} clip(s), {_fmt_bytes(cb)}",
+            bg=BG, fg=MUTED, font=("Segoe UI", 8))
+        self.clip_usage.grid(row=8, column=0, columnspan=3, sticky="w",
+                             padx=24, pady=(0, 6))
+
+        tk.Label(master, text="Transcript files you've saved (.tscript) are "
+                 "never touched by these.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=9, column=0, columnspan=3, sticky="w",
+                     padx=10, pady=(4, 6))
+        tk.Button(master, text="Apply and purge now", command=self._purge_now,
+                  bg=BG2, fg=FG, relief="flat").grid(
+                      row=10, column=0, columnspan=3, sticky="w",
+                      padx=10, pady=(0, 8))
+
+        self._sync_state()
+        return None
+
+    def _sync_state(self):
+        on = self.cap_on.get()
+        self.cap_entry.config(state="normal" if on else "disabled")
+        self.cap_unit.config(fg=MUTED if on else "#5b5f66")
+
+    def _values(self):
+        return (float(self.log_days.get()), float(self.clip_days.get()),
+                float(self.max_gb.get()) if self.cap_on.get() else 0.0)
+
+    def _purge_now(self):
+        """Apply what's on screen immediately, so the effect is visible before
+        committing to it."""
+        if not self.validate():
+            return
+        log_days, clip_days, max_gb = self._values()
+        gone_logs = core.purge_old_logs(log_days)
+        aged, over = core.apply_clip_retention(
+            {"retention_days": clip_days, "max_gb": max_gb},
+            self._app._clip_dir())
+        cn, cb = core.clips_disk_usage(self._app._clip_dir())
+        self.clip_usage.config(text=f"On disk now: {cn} clip(s), "
+                                    f"{_fmt_bytes(cb)}")
+        messagebox.showinfo(
+            "Retention",
+            f"Deleted {len(gone_logs)} transcript file(s) and "
+            f"{len(aged) + len(over)} clip(s)"
+            + (f" ({len(over)} to fit the size cap)." if over else "."),
+            parent=self)
+
+    def validate(self):
+        try:
+            log_days, clip_days, max_gb = self._values()
+        except ValueError:
+            messagebox.showwarning("Retention", "Those need to be numbers.",
+                                   parent=self)
+            return False
+        if log_days < 0 or clip_days < 0:
+            messagebox.showwarning("Retention", "Days can't be negative.",
+                                   parent=self)
+            return False
+        if self.cap_on.get() and max_gb <= 0:
+            messagebox.showwarning("Retention",
+                                   "A size cap has to be greater than zero "
+                                   "(untick it to disable).", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        log_days, clip_days, max_gb = self._values()
+        self.result = {"log_days": log_days, "clip_days": clip_days,
+                       "max_gb": max_gb}
+
+
+class ClipSettingsDialog(simpledialog.Dialog):
+    """Global controls for clip recording: the master switch, how long clips are
+    kept, and what's on disk now. Which FEEDS record is set per feed in Edit."""
+    def __init__(self, parent, app):
+        self._app = app
+        super().__init__(parent, title="Audio recording")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+        cfg = core.clip_settings(self._app.cfg)
+
+        tk.Label(master, text="Save the audio behind each transcript line",
+                 bg=BG, fg=FG, font=("Segoe UI", 10, "bold")).grid(
+                     row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2))
+        tk.Label(master, text="Lines with saved audio show a 🔊 you can click to "
+                 "hear that transmission.\nRecordings are voice audio — they're "
+                 "kept only on this PC and deleted on the schedule below.",
+                 bg=BG, fg=MUTED, justify="left").grid(
+                     row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8))
+
+        self.enabled = tk.BooleanVar(value=bool(cfg["enabled"]))
+        tk.Checkbutton(master, text="Enable clip recording",
+                       variable=self.enabled, bg=BG, fg=FG, selectcolor=BG2,
+                       activebackground=BG, activeforeground=FG,
+                       command=self._sync_state).grid(
+                           row=2, column=0, columnspan=2, sticky="w", padx=8)
+        tk.Label(master, text="Then turn it on per feed in Feeds → Edit.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=3, column=0, columnspan=2, sticky="w", padx=30, pady=(0, 8))
+
+        # Retention lives in its own dialog, alongside the transcript policy --
+        # keeping half of it here would mean two places to look.
+        cap = float(cfg.get("max_gb") or 0)
+        keep = ("kept forever" if not cfg["retention_days"]
+                else f"kept {cfg['retention_days']:g} day(s)")
+        if cap:
+            keep += f", capped at {cap:g} GB"
+        self.days_label = tk.Label(master, text=f"Clips are {keep}.",
+                                   bg=BG, fg=FG)
+        self.days_label.grid(row=4, column=0, columnspan=2, sticky="w",
+                             padx=10, pady=(4, 2))
+        tk.Button(master, text="Change retention…", command=self._open_retention,
+                  bg=BG2, fg=FG, relief="flat").grid(
+                      row=5, column=0, columnspan=2, sticky="w", padx=8,
+                      pady=(0, 6))
+
+        n, total = core.clips_disk_usage(self._app._clip_dir())
+        self.usage = tk.Label(master, text=f"On disk now: {n} clip(s), "
+                              f"{_fmt_bytes(total)}", bg=BG, fg=FG)
+        self.usage.grid(row=6, column=0, columnspan=2, sticky="w",
+                        padx=10, pady=(10, 2))
+        row = tk.Frame(master, bg=BG)
+        row.grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        tk.Button(row, text="Open folder", command=self._open_folder,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2)
+        tk.Button(row, text="Delete all clips", command=self._delete_all,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2)
+
+        self._sync_state()
+        return None
+
+    def _sync_state(self):
+        self.days_label.config(fg=FG if self.enabled.get() else MUTED)
+
+    def _open_retention(self):
+        """Hand off to the retention dialog, then re-read what it settled on."""
+        self._app._open_retention(parent=self)
+        cfg = core.clip_settings(self._app.cfg)
+        cap = float(cfg.get("max_gb") or 0)
+        keep = ("kept forever" if not cfg["retention_days"]
+                else f"kept {cfg['retention_days']:g} day(s)")
+        if cap:
+            keep += f", capped at {cap:g} GB"
+        self.days_label.config(text=f"Clips are {keep}.")
+
+    def _open_folder(self):
+        d = self._app._clip_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)                    # Windows-only, as is the app
+        except Exception as e:
+            messagebox.showerror("Open folder", str(e), parent=self)
+
+    def _delete_all(self):
+        n, total = core.clips_disk_usage(self._app._clip_dir())
+        if not n:
+            messagebox.showinfo("Delete clips", "No clips saved.", parent=self)
+            return
+        if not messagebox.askyesno("Delete clips",
+                                   f"Permanently delete all {n} saved clip(s) "
+                                   f"({_fmt_bytes(total)})?", parent=self):
+            return
+        # retention_days=-1 would be a no-op; purge everything by using a cutoff
+        # in the future instead.
+        removed = core.purge_old_clips(0.0000001, self._app._clip_dir())
+        self.usage.config(text=f"On disk now: 0 clip(s), 0 B")
+        messagebox.showinfo("Delete clips", f"Deleted {len(removed)} file(s).",
+                            parent=self)
+
+    def apply(self):
+        # Retention is owned by RetentionDialog now; this one only switches
+        # recording on and off.
+        self.result = {"enabled": bool(self.enabled.get())}
+
+
+class PastDayDialog(simpledialog.Dialog):
+    """Pick a feed and one of its saved days to review. Each day shows how many
+    lines it has and whether its audio is still on disk -- clips are purged on a
+    shorter schedule than logs, so an older day is often text-only.
+    result = (feed, 'YYYYMMDD')."""
+    def __init__(self, parent, app, names, title="Open a past day"):
+        self._app = app
+        self._names = names
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+
+        tk.Label(master, text="Feed", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w",
+                                                     padx=10, pady=(10, 2))
+        self.feed = tk.StringVar(value=self._names[0])
+        combo = ttk.Combobox(master, textvariable=self.feed, values=self._names,
+                             state="readonly", width=34)
+        combo.grid(row=0, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.feed.trace_add("write", lambda *_: self._refresh_days())
+
+        tk.Label(master, text="Day", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="nw",
+                                                     padx=10, pady=(8, 2))
+        wrap = tk.Frame(master, bg=BG)
+        wrap.grid(row=1, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.daylist = tk.Listbox(wrap, height=9, width=38, bg=BG2, fg=FG,
+                                  highlightthickness=0, activestyle="none",
+                                  exportselection=False)
+        self.daylist.pack(side="left")
+        sb = tk.Scrollbar(wrap, command=self.daylist.yview)
+        sb.pack(side="left", fill="y")
+        self.daylist.config(yscrollcommand=sb.set)
+        self.daylist.bind("<Double-Button-1>", lambda e: self.ok())
+
+        tk.Label(master, text="Newest first. 🔊 = audio still saved for that day; "
+                 "older days\nkeep their text after the clips are purged.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").grid(
+                     row=2, column=1, sticky="w", padx=10, pady=(0, 8))
+
+        self._refresh_days()
+        return combo
+
+    def _refresh_days(self):
+        self._days = core.day_summaries(self.feed.get(),
+                                        clips=self._app._clip_store(),
+                                        log_dir=core.LOG_DIR)
+        self.daylist.delete(0, "end")
+        for r in self._days:
+            mark = f"  🔊 {r['clips']}" if r["clips"] else ""
+            self.daylist.insert("end", f"{_fmt_day(r['day'])}   "
+                                       f"{r['lines']} lines{mark}")
+        if not self._days:
+            self.daylist.insert("end", "(no saved transcripts for this feed)")
+        else:
+            self.daylist.selection_set(0)
+
+    def validate(self):
+        if not self._days:
+            messagebox.showwarning("Open a past day",
+                                   "That feed has no saved transcripts.",
+                                   parent=self)
+            return False
+        if not self.daylist.curselection():
+            messagebox.showwarning("Open a past day", "Pick a day.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        self.result = (self.feed.get(),
+                       self._days[self.daylist.curselection()[0]]["day"])
+
+
+class PdfExportDialog(simpledialog.Dialog):
+    """Pick what goes into the PDF: which feed, and whether to use the current
+    on-screen session or saved daily logs. result = (feed, source, days)
+    where source is 'session' | 'logs' and days is a list of 'YYYYMMDD'."""
+    def __init__(self, parent, app, names, preselect=None):
+        self._app = app
+        self._names = names
+        self._preselect = preselect if preselect in names else names[0]
+        super().__init__(parent, title="Save transcript as PDF")
+
+    def body(self, master):
+        self.configure(bg=BG)
+        master.configure(bg=BG)
+
+        tk.Label(master, text="Feed", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w",
+                                                     padx=10, pady=(10, 2))
+        self.feed = tk.StringVar(value=self._preselect)
+        combo = ttk.Combobox(master, textvariable=self.feed, values=self._names,
+                             state="readonly", width=36)
+        combo.grid(row=0, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.feed.trace_add("write", lambda *_: self._refresh_days())
+
+        tk.Label(master, text="Include", bg=BG, fg=FG,
+                 font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky="nw",
+                                                     padx=10, pady=(10, 2))
+        box = tk.Frame(master, bg=BG)
+        box.grid(row=1, column=1, sticky="w", padx=10, pady=(10, 2))
+        self.source = tk.StringVar(value="logs")
+        for val, lab in [("session", "This session (what's on screen)"),
+                         ("logs", "Saved logs — pick days below")]:
+            tk.Radiobutton(box, text=lab, variable=self.source, value=val,
+                           bg=BG, fg=FG, selectcolor=BG2, activebackground=BG,
+                           activeforeground=FG, anchor="w",
+                           command=self._sync_state).pack(anchor="w")
+
+        self.days_label = tk.Label(master, text="Days", bg=BG, fg=FG,
+                                   font=("Segoe UI", 10, "bold"))
+        self.days_label.grid(row=2, column=0, sticky="nw", padx=10, pady=(8, 2))
+        listwrap = tk.Frame(master, bg=BG)
+        listwrap.grid(row=2, column=1, sticky="w", padx=10, pady=(8, 2))
+        self.daylist = tk.Listbox(listwrap, height=7, width=34,
+                                  selectmode="extended", bg=BG2, fg=FG,
+                                  highlightthickness=0, activestyle="none",
+                                  exportselection=False)
+        self.daylist.pack(side="left")
+        sb = tk.Scrollbar(listwrap, command=self.daylist.yview)
+        sb.pack(side="left", fill="y")
+        self.daylist.config(yscrollcommand=sb.set)
+        tk.Label(master, text="Ctrl/Shift-click for several days. "
+                 "Nothing selected = all of them.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(
+                     row=3, column=1, sticky="w", padx=10, pady=(0, 8))
+
+        self._refresh_days()
+        self._sync_state()
+        return combo
+
+    def _refresh_days(self):
+        self._days = [d for d, _p in core.log_files_for(self.feed.get())]
+        self.daylist.delete(0, "end")
+        for d in reversed(self._days):                 # newest first
+            self.daylist.insert("end", _fmt_day(d))
+        if not self._days:
+            self.daylist.insert("end", "(no saved logs for this feed)")
+            self.source.set("session")
+        self._sync_state()
+
+    def _sync_state(self):
+        on = self.source.get() == "logs" and bool(getattr(self, "_days", []))
+        self.daylist.config(state="normal" if on else "disabled")
+        self.days_label.config(fg=FG if on else MUTED)
+
+    def validate(self):
+        if self.source.get() == "logs" and not self._days:
+            messagebox.showwarning("No logs", "That feed has no saved logs. "
+                                   "Choose 'This session' instead.", parent=self)
+            return False
+        return True
+
+    def apply(self):
+        if self.source.get() == "session":
+            self.result = (self.feed.get(), "session", [])
+            return
+        # The listbox shows newest-first; hand back days oldest-first so the PDF
+        # reads chronologically.
+        sel = self.daylist.curselection()
+        shown = list(reversed(self._days))
+        days = [shown[i] for i in sel] if sel else list(self._days)
+        self.result = (self.feed.get(), "logs", sorted(days))
 
 
 class TTSDialog(tk.Toplevel):
@@ -646,8 +1327,9 @@ class TTSDialog(tk.Toplevel):
         self.transient(parent)
 
         if not core.tts_available():
-            tk.Label(self, text="Text-to-speech isn't available.\nNo Piper voice "
-                     "model found in tts_voices/.", bg=BG, fg=FG, justify="left",
+            tk.Label(self, text="Text-to-speech isn't available on this system.\n"
+                     "Install a Windows voice, or add a Piper .onnx voice to "
+                     "tts_voices/.", bg=BG, fg=FG, justify="left",
                      font=("Segoe UI", 10)).pack(padx=16, pady=20)
             tk.Button(self, text="Close", command=self.destroy, bg=BG2, fg=FG,
                       relief="flat").pack(pady=8)
@@ -689,13 +1371,26 @@ class TTSDialog(tk.Toplevel):
         tk.Label(row, text="  Read transcriptions aloud", bg=BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).pack(side="left")
 
+        # Engine picker (Auto + whichever engines work on this machine).
+        self._engine_choices = tts_engine_choices()
+        erow = tk.Frame(body, bg=BG); erow.pack(fill="x", pady=4, **pad)
+        tk.Label(erow, text="Engine:", bg=BG, fg=MUTED).pack(side="left")
+        cur_eng = str(self.cfg.get("engine", "auto")).lower()
+        self.engine_var = tk.StringVar(
+            value=_TTS_ID_TO_LABEL.get(cur_eng, "Auto (recommended)"))
+        ttk.Combobox(erow, textvariable=self.engine_var,
+                     values=[lab for _id, lab in self._engine_choices],
+                     state="readonly", width=28).pack(side="left", padx=6)
+        self.engine_var.trace_add("write", lambda *a: self._refresh_voice_list())
+
         # Voice picker.
         vrow = tk.Frame(body, bg=BG); vrow.pack(fill="x", pady=4, **pad)
         tk.Label(vrow, text="Voice:", bg=BG, fg=MUTED).pack(side="left")
-        voices = [v[0] for v in core.list_tts_voices()]
+        voices = [v[0] for v in core.list_tts_voices(engine=self._selected_engine())]
         self.voice_var = tk.StringVar(value=self.cfg.get("voice") or (voices[0] if voices else ""))
-        ttk.Combobox(vrow, textvariable=self.voice_var, values=voices,
-                     state="readonly", width=28).pack(side="left", padx=6)
+        self.voice_combo = ttk.Combobox(vrow, textvariable=self.voice_var,
+                                        values=voices, state="readonly", width=28)
+        self.voice_combo.pack(side="left", padx=6)
 
         # What to read: mode.
         tk.Label(body, text="What to read:", bg=BG, fg=MUTED).pack(pady=(10, 2), **pad)
@@ -758,6 +1453,19 @@ class TTSDialog(tk.Toplevel):
         for cb in self.preset_checks.values():
             cb.set(value)
 
+    def _selected_engine(self):
+        """The engine id chosen in the picker ('auto' -> resolved best engine)."""
+        eid = _TTS_LABEL_TO_ID.get(self.engine_var.get(), "auto")
+        return core.select_tts_engine({"engine": eid}) if eid == "auto" else eid
+
+    def _refresh_voice_list(self):
+        """Repopulate the Voice dropdown for the currently-selected engine, keeping
+        the current voice if that engine has it (else the first available)."""
+        voices = [v[0] for v in core.list_tts_voices(engine=self._selected_engine())]
+        self.voice_combo.config(values=voices)
+        keep = core._match_voice_name(self.voice_var.get(), voices)
+        self.voice_var.set(keep or (voices[0] if voices else ""))
+
     def _collect(self):
         # Checked active feeds + any saved selections for feeds not currently
         # active (so switching a feed off doesn't wipe its TTS selection).
@@ -767,6 +1475,7 @@ class TTSDialog(tk.Toplevel):
         extras = [k.strip() for k in self.kw_var.get().split(",") if k.strip()]
         return {
             "enabled": self.enabled.get(),
+            "engine": _TTS_LABEL_TO_ID.get(self.engine_var.get(), "auto"),
             "voice": self.voice_var.get() or None,
             "mode": self.mode.get(),
             "feeds": feeds,
@@ -815,7 +1524,130 @@ FEEDS  (toolbar "Feeds" button / Streams menu)
   • + Add new feed – save a new feed (Broadcastify feed id / URL, or a PC-audio
                      or application source). New feeds are saved but NOT started
                      until you click Add.
+  • PDF      – save that feed's transcript as a PDF (see SAVING below).
   • Drag the ⠿ handle to reorder feeds; the order is remembered.
+
+PUTTING SEVERAL FEEDS IN ONE COLUMN  (Feeds → Edit → Column group)
+  An airport is usually split across separate feeds (Tower, Ground, Approach),
+  each quiet much of the time. Give them the same group and they share one
+  column, with every line labelled by which channel it came from, in that
+  feed's colour. Feeds with no group keep their own column as before.
+  • Logs, clips, PDFs and past-day review stay per feed — you can still export
+    just Tower.
+  • Dragging a shared column moves all its feeds together.
+
+WHAT KIND OF RADIO A FEED CARRIES  (Feeds → Edit → Service)
+  Police / Fire-EMS / Air traffic control / General. This sets three things at
+  once: the vocabulary the speech model expects, which style of call sign to
+  look for, and whether addresses or aircraft become clickable.
+  • Police and Fire/EMS differ only in wording — the call-sign reader handles
+    both at the same time, which matters on shared PD+Fire channels.
+  • Air traffic control is the one that really changes: aircraft ("Delta 510",
+    "November 65 Juliet Charlie") are recognised and link to FlightRadar24, and
+    address links are turned off (a tail number was being read as a street).
+  • "Prompt override" tunes a single feed. Leave it blank to use the service's
+    own wording; a feed with no service keeps using the global prompt from
+    config.json, exactly as before.
+
+MOVING YOUR FEED LIST  (Feeds window, or Streams menu)
+  • Export list – writes every saved feed to a .json file you can back up or
+                  carry to another PC.
+  • Import list – reads one back in. Imported feeds are SAVED only; nothing
+                  starts transcribing until you click Add. If a name already
+                  exists you choose: skip it, replace it, or keep both.
+  The file holds feeds only — never your model/GPU settings — so a list exported
+  from the standard (x64) build imports into the ARM64 build and vice versa. Two
+  kinds of feed are tied to the machine they were made on: "pc audio" feeds name
+  a specific speaker device, and "application" feeds capture a running program
+  (not supported at all on ARM64). Those import fine but need re-pointing, and
+  the app tells you which ones after an import.
+  You can also point Import at another install's config.json directly.
+
+HEARING A LINE AGAIN — CLIP RECORDING  (Streams → Audio recording…)
+  Transcriber can keep the audio behind each transcript line. Lines that have a
+  recording show a violet 🔊 — click it to hear exactly that transmission.
+  • Turn it on in Streams → "Audio recording…", then switch it on per feed in
+    Feeds → Edit ("Save audio for each line"). Both are off until you say so.
+  • Clicking a line's 🔊 takes over the speakers for a moment; whatever you were
+    listening to live resumes when the clip finishes. Click another 🔊 to skip
+    straight to that one.
+  • Roughly 100 MB per day for a busy feed. How long they're kept is set in
+    Streams → "Retention…" (see below).
+  • "Audio recording…" also shows what's on disk, opens the clips folder, and
+    can delete every saved clip at once.
+
+HOW LONG THINGS ARE KEPT  (Streams → Retention…)
+  Transcripts and audio are set separately, because their sizes aren't
+  comparable — a day of text is kilobytes, a day of audio is tens of megabytes.
+  • Transcripts (text): 14 days by default.
+  • Audio clips: 7 days by default.
+  • Either can be set to 0 to keep forever.
+  • Clips can also have a SIZE CAP ("never use more than N GB"). This is the
+    setting that really bounds the disk — days alone can't, since a busy week
+    and a quiet one differ enormously at the same retention. When the folder
+    goes over, the OLDEST clips are deleted until it fits.
+  Old files are removed when the app starts, and the size cap is also kept up to
+  date while it runs. "Apply and purge now" does it immediately so you can see
+  the effect. Transcript files you've saved (.tscript) are never touched.
+  • These are voice recordings of live radio — they never leave your PC, but
+    treat the clips folder the way you'd treat the transcripts.
+
+SAVING CLIPS AS AN MP3  (right-click the transcript)
+  Click a line to select that whole row, drag up or down for more, then
+  right-click → "Export selected audio as MP3…". The selected lines' audio is
+  joined, in the order shown, into one MP3 with a short gap between
+  transmissions. One line exports just that clip.
+  • Selection works in whole rows only — never half a line. Shift-click extends
+    to the row you click, and dragging past the edge scrolls.
+  • Clicking a 🔊, an address link, or a unit label still does its own thing
+    rather than selecting.
+  • The menu tells you how many clips your selection covers before you save.
+  • "Select all" is on the same menu if you want the whole pane.
+  • Lines without a 🔊 are skipped; if a clip has already been deleted it's
+    noted in the status bar rather than failing the whole export.
+
+TRANSCRIPT FILES — TEXT + AUDIO IN ONE FILE  (.tscript)
+  Saves the lines AND the audio behind them together, so you can archive an
+  incident or hand it to someone else. Nothing purges these.
+  • Right-click a selection → "Save selected as transcript file…", or
+    Streams → "Save whole day as transcript file…".
+  • Streams → "Open transcript file…" opens it for review just like a past day,
+    with 🔊 on every line whose audio came along.
+  • It's really a ZIP: rename it to .zip and you'll find the transcript as JSON
+    and the clips as ordinary .opus files, readable without this app.
+  • Because they outlast the clip retention, these files keep recorded voices
+    and PII indefinitely. Store and delete them as deliberately as the logs.
+
+PLAYING A TRANSCRIPT THROUGH  (the bar above a reviewed transcript)
+  Whenever you're reviewing — an opened transcript file, or a past day — you can
+  play the whole thing, two different ways:
+  • "▶ Play audio"  – the recorded radio, transmission after transmission. Lines
+                      whose clips have been purged are skipped.
+  • "🗣 Read aloud"  – the voice reads the transcribed text. Works on every line,
+                      so an old day with no audio left can still be played.
+  The line being played is highlighted and scrolled into view.
+  • "⏸ Pause" keeps your place; "⏹ Stop" returns to the top.
+  • Select a line first to start from there instead of the beginning.
+
+GOING BACK A DAY  (Streams → Open a past day…)
+  The window restores today's lines when it opens. For anything earlier, pick a
+  feed and a day from the list — newest first, showing how many lines each day
+  has and how many still have audio (🔊).
+  • Days with no 🔊 kept their text but their clips have already been deleted:
+    audio is kept for fewer days than transcripts.
+  • The day opens read-only, with an amber banner naming it. Your feeds keep
+    transcribing and recording while you read; click "Back to live" and anything
+    that arrived meanwhile is there waiting.
+
+SAVING A TRANSCRIPT AS PDF  (Streams menu, or the PDF button on a feed row)
+  Pick a feed and what to include:
+  • This session – exactly what's on screen for that feed right now.
+  • Saved logs   – pick one day, several (Ctrl/Shift-click), or leave the day
+                   list alone to take all of them.
+  Page 1 is headed with the feed name in large bold type, and beneath it the
+  date and time of the first and last transmission in the export, plus how many
+  there are. The PDF is timestamped, wrapped, and page-numbered. Note that logs
+  are purged after the retention period, so old days may no longer be listed.
 
 VIEWS  (toolbar / View menu)
   • Sectors  – one scrolling column per feed, side by side. Drag a column's
@@ -1133,10 +1965,21 @@ class TranscriberGUI:
         self.events = queue.Queue()          # (kind, payload) from bg threads
         self.sector_panels = {}              # name -> ScrolledText (sectors view)
         self._update_dialog = None           # active AppUpdateDialog, if any
-        self.history = collections.deque(maxlen=HISTORY_MAX)  # (name,color,text,ts)
+        # (name, color, text, ts, unit, clip_id)
+        self.history = collections.deque(maxlen=HISTORY_MAX)
+        self._restored = (0, 0)          # (lines, of which had clips) on launch
+        self.past_day = None             # (feed, day) while reviewing a past day
+        self._past_rows = []             # that day's [(ts, text, clip_id)]
+        self._link_targets = {}          # "addr:N" -> (query, location)
+        self.bundle = None               # open TranscriptBundle, if any
+        self._bundle_name = ""           # its filename, for the banner
+        self._pb_widgets = None          # transport buttons while reviewing
+        self._pb_reset()                 # play-through state
         self.view_mode = tk.StringVar(value=self.cfg.get("view_mode", "sectors"))
         self.color_mode = tk.StringVar(value="stream")   # "stream" | "unit"
         self.model_var = tk.StringVar(value=self.cfg.get("model", "large-v3"))
+        self.device_var = tk.StringVar(value=_DEVICE_CFG_TO_LABEL.get(
+            str(self.cfg.get("device", "cuda")).lower(), "GPU"))
         self.listen_var = tk.StringVar(value="(none)")
         self.streams = list(self.cfg.get("streams", []))
         self.library = self._seed_library()   # persistent catalog of saved feeds
@@ -1155,6 +1998,9 @@ class TranscriberGUI:
         self._build_menu()
         self._build_toolbar()
         self._build_body()
+        # Seed the transcript from today's logs BEFORE the engine starts, so
+        # restored lines can't interleave with live ones arriving mid-restore.
+        self._restore_scrollback()
         self._set_status("Loading model...")
 
         # Keyboard shortcuts for font size (Ctrl +/-/0), like a browser.
@@ -1303,12 +2149,741 @@ class TranscriberGUI:
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
+    # ----- feed list export / import ---------------------------------------
+    def _export_feeds(self):
+        """Write the whole library to a portable .json the other install (or
+        another machine, or the other architecture) can import."""
+        if not self.library:
+            messagebox.showinfo("Export feeds", "The feed library is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Export feed list",
+            defaultextension=".json", initialfile="transcriber-feeds.json",
+            filetypes=[("Transcriber feed list", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            n = core.export_feeds(path, self.library, app_version=APP_VERSION)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+        self._set_status(f"Exported {n} feed{'s' if n != 1 else ''} to "
+                         f"{os.path.basename(path)}")
+
+    def _import_feeds(self):
+        """Read a feed list and merge it into the library. Imported feeds are
+        saved only -- nothing starts transcribing until the user clicks Add."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Import feed list",
+            filetypes=[("Transcriber feed list", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            feeds, warnings = core.import_feeds(path)
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
+            return
+
+        dupes = [f["name"] for f in feeds if self._lib_find(f["name"])]
+        mode = "add"
+        if dupes:
+            dlg = ImportConflictDialog(self.root, len(feeds), dupes)
+            if not dlg.result:
+                return
+            mode = dlg.result           # "skip" | "replace" | "rename"
+
+        added = replaced = skipped = 0
+        for entry in feeds:
+            if self._lib_find(entry["name"]):
+                if mode == "skip":
+                    skipped += 1
+                    continue
+                if mode == "replace":
+                    self._lib_upsert(entry)
+                    replaced += 1
+                    continue
+                entry = dict(entry)
+                entry["name"] = self._unique_lib_name(entry["name"])
+            self._lib_upsert(entry)
+            added += 1
+        self._save_cfg()
+
+        parts = []
+        if added:
+            parts.append(f"{added} added")
+        if replaced:
+            parts.append(f"{replaced} replaced")
+        if skipped:
+            parts.append(f"{skipped} skipped (already in library)")
+        summary = f"Imported from {os.path.basename(path)}: " + \
+                  (", ".join(parts) or "nothing to do") + "."
+        if warnings:
+            summary += "\n\nNote:\n  • " + "\n  • ".join(warnings)
+        messagebox.showinfo("Import feeds", summary, parent=self.root)
+        self._set_status(", ".join(parts) or "Nothing imported.")
+
+    def _unique_lib_name(self, name):
+        """'Cleveland West' -> 'Cleveland West (2)' when the name is taken."""
+        n = 2
+        while self._lib_find(f"{name} ({n})"):
+            n += 1
+        return f"{name} ({n})"
+
+    # ----- restoring today's transcript -------------------------------------
+    def _restore_scrollback(self):
+        """Seed the transcript with today's saved lines for each active feed, so
+        the window doesn't open empty after a restart -- and, where a clip was
+        recorded for a line, re-attach its 🔊 so audio from earlier today is
+        still one click away.
+
+        Bounded by `restore_lines` in config (per feed, newest kept); 0 disables.
+        Lines are interleaved by timestamp so the unified view reads in order."""
+        per_feed = self.cfg.get("restore_lines", 200)
+        if not per_feed or per_feed <= 0:
+            return
+        day = _dt.datetime.now().strftime("%Y%m%d")
+        try:
+            clip_map = core.ClipStore(self.cfg, clip_dir=self._clip_dir()).clip_map(day)
+        except Exception:
+            clip_map = {}
+
+        rows = []
+        for s in self._enabled_streams():
+            name = s["name"]
+            paths = [p for d, p in core.log_files_for(name) if d == day]
+            if not paths:
+                continue
+            parsed = []
+            for raw in core.read_log_lines(paths):
+                got = core.parse_log_line(raw)
+                if got:
+                    parsed.append(got)
+            # Several transmissions can share a second, each with its own clip.
+            # Both the log and the index are chronological, so walk the whole
+            # day's lines and take ids in order -- then keep only the tail we
+            # display, so the trim can't shift which clip a line gets.
+            used = {}
+            attached = []
+            for ts, text in parsed:
+                ids = clip_map.get((name, ts), ())
+                i = used.get(ts, 0)
+                used[ts] = i + 1
+                attached.append((ts, text, ids[i] if i < len(ids) else None))
+            for ts, text, clip_id in attached[-per_feed:]:
+                rows.append((ts, name, s.get("color", "white"), text, clip_id))
+        if not rows:
+            return
+
+        rows.sort(key=lambda r: r[0])           # chronological across feeds
+        for ts, name, color, text, clip_id in rows:
+            unit = core.extract_callsign(text, self.extra_prefixes)
+            self.history.append((name, color, text, ts, unit, clip_id))
+        self._replay_history()
+        n_clips = sum(1 for r in rows if r[4])
+        self._restored = (len(rows), n_clips)   # surfaced once the model is ready
+
+    # ----- exporting selected clips as MP3 ----------------------------------
+    def _transcript_widgets(self):
+        """Every transcript Text on screen right now, past view included."""
+        if self.past_day:
+            return [self.unified] if getattr(self, "unified", None) else []
+        return self._active_text_widgets()
+
+    @staticmethod
+    def _index_key(idx):
+        """'12.4' -> (12, 4), so selected clips come out in reading order."""
+        line, _, col = str(idx).partition(".")
+        try:
+            return (int(line), int(col))
+        except ValueError:
+            return (0, 0)
+
+    def _rendered_rows(self, widget):
+        """The rows currently drawn in `widget`, as (ts, text, clip_id, feed).
+
+        Rebuilt with the same filters _replay_history applies, so index N here is
+        the widget's line N+1 -- every transcript line renders as exactly one
+        logical line. That's what lets a row selection recover the text and
+        timestamps a clip id alone can't give."""
+        if self.past_day:
+            feed = self.past_day[0]
+            return [(ts, text, cid, feed) for ts, text, cid in self._past_rows]
+        if self.view_mode.get() == "unified":
+            return [(ts, text, cid, name)
+                    for name, _c, text, ts, unit, cid in self.history
+                    if self._passes_filter(unit)]
+        # A column can serve several feeds (a group), so collect every feed
+        # drawn into this widget rather than stopping at the first.
+        feeds = {n for n, w in self.sector_panels.items() if w is widget}
+        if feeds:
+            return [(ts, text, cid, n)
+                    for n, _c, text, ts, unit, cid in self.history
+                    if n in feeds and self._passes_filter(unit)]
+        return []
+
+    def _selected_rows(self):
+        """Full (ts, text, clip_id, feed) for the selected rows, in order."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if not sel:
+                continue
+            lo, hi = self._line_no(sel[0]), self._line_no(sel[1])
+            src = self._rendered_rows(w)
+            rows = [src[i - 1] for i in range(lo, hi + 1) if 0 < i <= len(src)]
+            if rows:
+                return rows
+        return []
+
+    def _selected_clip_ids(self):
+        """Clip ids whose 🔊 marker falls inside the current selection, in the
+        order they appear. Tk keeps `sel` per-widget, so this finds the one
+        widget holding a selection (sectors view has several)."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if not sel:
+                continue
+            start, end = sel[0], sel[1]
+            hits = []
+            for tag in w.tag_names():
+                if not tag.startswith("clip:"):
+                    continue
+                ranges = w.tag_ranges(tag)
+                for i in range(0, len(ranges), 2):
+                    a, b = ranges[i], ranges[i + 1]
+                    # Overlap, not containment: dragging across a line should
+                    # take its clip even if the 🔊 is only partly covered.
+                    if w.compare(a, "<", end) and w.compare(b, ">", start):
+                        hits.append((self._index_key(a), tag[len("clip:"):]))
+                        break
+            hits.sort()
+            seen, ids = set(), []
+            for _k, cid in hits:
+                if cid not in seen:
+                    seen.add(cid)
+                    ids.append(cid)
+            if ids:
+                return ids
+        return []
+
+    def _export_selected_mp3(self):
+        """Save the audio of the selected lines as one MP3, in transcript order."""
+        ids = self._selected_clip_ids()
+        if not ids:
+            messagebox.showinfo(
+                "Export audio",
+                "Select one or more transcript lines that have a 🔊 first, "
+                "then export.\n\nDrag across the lines you want; they're "
+                "combined into a single MP3 in the order shown.",
+                parent=self.root)
+            return
+
+        store = self._clip_store()
+        info = store.clip_info(ids[0]) or {}
+        feed = info.get("feed", "clips")
+        stamp = ids[0].rsplit("-", 3)
+        day_part = stamp[-3] if len(stamp) >= 4 else ""
+        default = (f"{core.safe_filename(feed)}-{day_part}"
+                   f"-{len(ids)}clip{'s' if len(ids) != 1 else ''}.mp3")
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title=f"Export {len(ids)} clip"
+                                    f"{'s' if len(ids) != 1 else ''} as MP3",
+            defaultextension=".mp3", initialfile=default,
+            filetypes=[("MP3 audio", "*.mp3"), ("All files", "*.*")])
+        if not path:
+            return
+
+        title = f"{feed} — {_fmt_day(day_part)}" if day_part else feed
+        self._set_status(f"Encoding {len(ids)} clip(s) to MP3…")
+
+        def _go():
+            try:
+                res = core.export_clips_mp3(ids, path, store, title=title)
+            except Exception as e:
+                self.events.put(("mp3_done", (False, str(e), None)))
+                return
+            self.events.put(("mp3_done", (True, os.path.basename(path), res)))
+
+        threading.Thread(target=_go, daemon=True, name="mp3export").start()
+
+    def _handle_mp3_done(self, ok, msg, res):
+        if not ok:
+            messagebox.showerror("Export audio", msg, parent=self.root)
+            self._set_status("MP3 export failed.")
+            return
+        note = (f"Saved {res['clips']} clip(s), {res['seconds']:.0f}s of audio "
+                f"to {msg}")
+        if res["missing"]:
+            note += f" ({len(res['missing'])} no longer on disk)"
+        self._set_status(note)
+
+    # ----- playing a saved transcript through --------------------------------
+    # Two ways to play a reviewed transcript: the recorded RADIO audio, or the
+    # model reading the TEXT aloud. They differ in more than the sound -- audio
+    # can only play lines that still have a clip, while read-along works on every
+    # line, including days whose clips were purged. Both step one line at a time,
+    # highlighting and scrolling to it, so you can follow along.
+    #
+    # Advancing is driven by polling rather than a completion callback: the clip
+    # player and the TTS queue are separate subsystems on separate threads, and
+    # one .after() loop asking "still busy?" keeps the sequencing in one place.
+    PB_POLL_MS = 150
+
+    def _pb_reset(self):
+        self._pb_mode = None            # None | "audio" | "tts"
+        self._pb_index = 0
+        self._pb_running = False
+
+    def _pb_rows(self):
+        return self._past_rows or []
+
+    def _pb_start(self, mode):
+        """Play from the first selected row, else resume where we left off."""
+        rows = self._pb_rows()
+        if not rows:
+            return
+        if not self.engine:
+            self._set_status("Engine isn't ready yet.")
+            return
+        if mode == "audio" and not self.engine.audio_available():
+            self._set_status("No audio device available for playback.")
+            return
+        # Switching mode mid-play shouldn't leave the old one sounding.
+        if self._pb_running and self._pb_mode != mode:
+            self._pb_silence()
+        sel = self._selected_row_index()
+        if sel is not None:
+            self._pb_index = sel
+        if self._pb_index >= len(rows):
+            self._pb_index = 0
+        self._pb_mode = mode
+        self._pb_running = True
+        self._pb_update_controls()
+        self._pb_play_current(first=True)
+
+    def _selected_row_index(self):
+        """Index of the first selected row in the review view, or None."""
+        for w in self._transcript_widgets():
+            try:
+                sel = w.tag_ranges("sel")
+            except tk.TclError:
+                continue
+            if sel:
+                i = self._line_no(sel[0]) - 1
+                if 0 <= i < len(self._pb_rows()):
+                    return i
+        return None
+
+    def _pb_silence(self):
+        """Stop whatever is currently sounding, without changing position."""
+        if not self.engine:
+            return
+        self.engine.stop_clip()
+        self.engine.cancel_speech()
+
+    def _pb_pause(self):
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_update_controls()
+        rows = self._pb_rows()
+        if rows:
+            self._set_status(f"Paused at line {min(self._pb_index + 1, len(rows))} "
+                             f"of {len(rows)}.")
+
+    def _pb_stop(self):
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_index = 0
+        self._pb_clear_highlight()
+        self._pb_update_controls()
+        self._set_status("Playback stopped.")
+
+    def _pb_play_current(self, first=False):
+        """Start the line at _pb_index, then poll until it finishes."""
+        rows = self._pb_rows()
+        if not self._pb_running:
+            return
+        if self._pb_index >= len(rows):
+            self._pb_running = False
+            self._pb_clear_highlight()
+            self._pb_update_controls()
+            self._set_status("Reached the end of the transcript.")
+            return
+
+        ts, text, clip_id = rows[self._pb_index][:3]
+        self._pb_highlight(self._pb_index)
+        self._pb_update_controls()
+
+        if self._pb_mode == "audio":
+            if not clip_id:
+                # No audio for this line -- don't stall on it.
+                self._pb_index += 1
+                self.root.after(10, self._pb_play_current)
+                return
+            self.engine.play_clip(clip_id, source=self.bundle)
+        else:
+            if not self.engine.speak_now(text):
+                self._pb_running = False
+                self._pb_update_controls()
+                self._set_status("No text-to-speech voice is available.")
+                return
+        # Give the subsystem a moment to report busy before polling, or the
+        # first tick can see "idle" and skip the whole line.
+        self.root.after(self.PB_POLL_MS * 2, self._pb_tick)
+
+    def _pb_tick(self):
+        if not self._pb_running:
+            return
+        busy = (self.engine.clip_playing() if self._pb_mode == "audio"
+                else self.engine.tts_busy())
+        if busy:
+            self.root.after(self.PB_POLL_MS, self._pb_tick)
+            return
+        self._pb_index += 1
+        self._pb_play_current()
+
+    def _pb_highlight(self, index):
+        """Mark the line being played and scroll it into view."""
+        for w in self._transcript_widgets():
+            try:
+                w.tag_remove("pbline", "1.0", "end")
+                w.tag_config("pbline", background=self._HL_SPEAKING)
+                line = index + 1
+                w.tag_add("pbline", f"{line}.0", f"{line}.0 lineend")
+                w.see(f"{line}.0")
+            except tk.TclError:
+                continue
+
+    def _pb_clear_highlight(self):
+        for w in self._transcript_widgets():
+            try:
+                w.tag_remove("pbline", "1.0", "end")
+            except tk.TclError:
+                continue
+
+    def _pb_update_controls(self):
+        """Reflect state on the transport buttons and the position readout."""
+        bar = getattr(self, "_pb_widgets", None)
+        if not bar:
+            return
+        rows = self._pb_rows()
+        try:
+            pos = min(self._pb_index + 1, len(rows)) if rows else 0
+            bar["pos"].config(text=f"{pos} / {len(rows)}")
+            playing = self._pb_running
+            bar["audio"].config(relief="sunken" if playing and
+                                self._pb_mode == "audio" else "flat")
+            bar["tts"].config(relief="sunken" if playing and
+                              self._pb_mode == "tts" else "flat")
+            bar["pause"].config(state="normal" if playing else "disabled")
+        except tk.TclError:
+            self._pb_widgets = None      # bar was rebuilt underneath us
+
+    # ----- transcript bundles (.tscript) ------------------------------------
+    def _write_bundle(self, feed, rows, day, suggested):
+        """Shared tail of both bundle exports: ask where, write on a thread."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save transcript file",
+            defaultextension=core.TRANSCRIPT_EXT, initialfile=suggested,
+            filetypes=[("Transcriber transcript", f"*{core.TRANSCRIPT_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        store = self._clip_store()
+        self._set_status(f"Writing {len(rows)} line(s) to "
+                         f"{os.path.basename(path)}…")
+
+        def _go():
+            try:
+                res = core.write_transcript_bundle(
+                    path, feed, [(ts, text, cid) for ts, text, cid, _f in rows],
+                    store, app_version=APP_VERSION, day=day)
+            except Exception as e:
+                self.events.put(("bundle_done", (False, str(e), None)))
+                return
+            self.events.put(("bundle_done",
+                             (True, os.path.basename(path), res)))
+
+        threading.Thread(target=_go, daemon=True, name="bundlewrite").start()
+
+    def _export_selected_bundle(self):
+        """Save the selected rows -- text and audio together -- as one file."""
+        rows = self._selected_rows()
+        if not rows:
+            messagebox.showinfo(
+                "Save transcript file",
+                "Select one or more transcript lines first.\n\nThe saved file "
+                "keeps the text and the audio together, so it can be opened "
+                "later even after the clips have been purged.",
+                parent=self.root)
+            return
+        feeds = {r[3] for r in rows}
+        feed = feeds.pop() if len(feeds) == 1 else "(multiple feeds)"
+        day = self.past_day[1] if self.past_day else \
+            _dt.datetime.now().strftime("%Y%m%d")
+        stem = core.safe_filename(feed if len(feeds) == 0 else "transcript")
+        self._write_bundle(feed, rows, day,
+                           f"{stem}-{day}-{len(rows)}lines{core.TRANSCRIPT_EXT}")
+
+    def _export_day_bundle(self):
+        """Archive a whole day for one feed, audio included."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Save transcript file", "No feeds to export.")
+            return
+        dlg = PastDayDialog(self.root, self, names,
+                            title="Save a whole day as a transcript file")
+        if not dlg.result:
+            return
+        feed, day = dlg.result
+        rows = core.load_day(feed, day, clips=self._clip_store())
+        if not rows:
+            messagebox.showinfo("Save transcript file",
+                                f"No saved transcript for “{feed}” on "
+                                f"{_fmt_day(day)}.", parent=self.root)
+            return
+        self._write_bundle(feed, [(ts, text, cid, feed) for ts, text, cid in rows],
+                           day, f"{core.safe_filename(feed)}-{day}"
+                                f"{core.TRANSCRIPT_EXT}")
+
+    def _handle_bundle_done(self, ok, msg, res):
+        if not ok:
+            messagebox.showerror("Save transcript file", msg, parent=self.root)
+            self._set_status("Transcript file failed.")
+            return
+        mb = res["bytes"] / 1e6
+        note = (f"Saved {res['lines']} line(s) and {res['clips']} clip(s) "
+                f"to {msg} ({mb:.1f} MB)")
+        if res["missing"]:
+            note += f" — {len(res['missing'])} clip(s) already purged"
+        self._set_status(note)
+
+    def _open_bundle(self):
+        """Open a .tscript for review: same view as a past day, audio included."""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Open transcript file",
+            filetypes=[("Transcriber transcript", f"*{core.TRANSCRIPT_EXT}"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            bundle = core.TranscriptBundle(path)
+        except ValueError as e:
+            messagebox.showerror("Open transcript file", str(e),
+                                 parent=self.root)
+            return
+        if not bundle.rows:
+            bundle.close()
+            messagebox.showinfo("Open transcript file",
+                                "That transcript file has no lines in it.",
+                                parent=self.root)
+            return
+        self._close_bundle()
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()                 # a new file starts from its first line
+        self.bundle = bundle
+        self.past_day = (bundle.feed, bundle.day)
+        self._past_rows = bundle.rows
+        self._bundle_name = os.path.basename(path)
+        self._build_view()
+        n_clips = sum(1 for r in bundle.rows if r[2])
+        self._set_status(f"Opened {self._bundle_name}: {len(bundle.rows)} lines, "
+                         f"{n_clips} with audio.")
+
+    def _close_bundle(self):
+        if self.bundle is not None:
+            self.bundle.close()
+            self.bundle = None
+            self._bundle_name = ""
+
+    # ----- reviewing a past day ---------------------------------------------
+    def _open_past_day(self):
+        """Streams → 'Open a past day…': pick a feed + day and review it."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Open a past day", "No feeds to review.")
+            return
+        dlg = PastDayDialog(self.root, self, names)
+        if not dlg.result:
+            return
+        feed, day = dlg.result
+        rows = core.load_day(feed, day, clips=self._clip_store())
+        if not rows:
+            messagebox.showinfo("Open a past day",
+                                f"No saved transcript for “{feed}” on "
+                                f"{_fmt_day(day)}.", parent=self.root)
+            return
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()                 # a new day starts from its first line
+        self.past_day = (feed, day)
+        self._past_rows = rows
+        self._build_view()
+        n_clips = sum(1 for r in rows if r[2])
+        self._set_status(f"Viewing {_fmt_day(day)} — {feed}: {len(rows)} lines, "
+                         f"{n_clips} with audio.")
+
+    def _exit_past_day(self):
+        """Back to the live transcript. Lines that arrived while reviewing were
+        still recorded to history, so they appear on the way back."""
+        # Stop play-through first: it would otherwise keep stepping through rows
+        # that are no longer on screen, talking over the live feed.
+        self._pb_running = False
+        self._pb_silence()
+        self._pb_reset()
+        self._pb_widgets = None
+        self.past_day = None
+        self._past_rows = []
+        self._close_bundle()             # release the archive's file handle
+        if self.engine:
+            self.engine.stop_clip()      # don't leave a clip playing over live
+        self._build_view()
+        self._set_status("Back to live.")
+
+    def _clip_store(self):
+        """Where clip audio should be read from right now.
+
+        An open bundle wins: its clips live inside the archive and may no longer
+        exist on disk at all, which is the whole point of having saved it. It
+        exposes the same load_pcm/clip_info/path_for surface, so playback, MP3
+        export and re-bundling all work unchanged."""
+        if self.bundle is not None:
+            return self.bundle
+        store = getattr(self.engine, "clips", None)
+        return store if store is not None else \
+            core.ClipStore(self.cfg, clip_dir=self._clip_dir())
+
+    # ----- clip recording ---------------------------------------------------
+    def _clip_dir(self):
+        """Where clips live. Read from the engine when it has a store, so this
+        follows a relocated data dir instead of guessing. Falls back to the
+        default before the engine is up (the settings dialog opens either way)."""
+        store = getattr(self.engine, "clips", None)
+        return store.dir if store is not None else core.CLIP_DIR
+
+    def _open_clip_settings(self):
+        dlg = ClipSettingsDialog(self.root, self)
+        if not dlg.result:
+            return
+        clips = dict(self.cfg.get("clips") or {})
+        clips.update(dlg.result)
+        self.cfg["clips"] = clips
+        self._save_cfg()
+        if self.engine is not None:
+            self.engine.set_clips_enabled(clips["enabled"])
+        state = "on" if clips["enabled"] else "off"
+        self._set_status(f"Clip recording {state}.")
+
+    def _open_retention(self, parent=None):
+        """Set how long transcripts and clips are kept. Takes effect at once:
+        the engine reads these live, so the next size-cap sweep uses them."""
+        dlg = RetentionDialog(parent or self.root, self)
+        if not dlg.result:
+            return
+        self.cfg["log_retention_days"] = dlg.result["log_days"]
+        clips = dict(self.cfg.get("clips") or {})
+        clips["retention_days"] = dlg.result["clip_days"]
+        clips["max_gb"] = dlg.result["max_gb"]
+        self.cfg["clips"] = clips
+        self._save_cfg()
+        if self.engine is not None:
+            self.engine.clips.retention_days = clips["retention_days"]
+            self.engine.clips.max_gb = clips["max_gb"]
+        def _for(days):
+            return "forever" if not days else f"{days:g} day(s)"
+
+        cap = f", capped at {clips['max_gb']:g} GB" if clips["max_gb"] else ""
+        self._set_status(f"Retention: transcripts {_for(dlg.result['log_days'])}, "
+                         f"clips {_for(clips['retention_days'])}{cap}.")
+
+    def _recording_feeds(self):
+        """Names of feeds with recording opted in (regardless of the global switch)."""
+        return {s["name"] for s in self.streams if s.get("record")}
+
+    # ----- transcript -> PDF -----------------------------------------------
+    def _export_pdf(self, name=None):
+        """Save one feed's transcript as a PDF: either the current on-screen
+        session, or the saved daily logs."""
+        names = [e["name"] for e in self.library] or \
+                [s["name"] for s in self.streams]
+        if not names:
+            messagebox.showinfo("Save as PDF", "No feeds to export.")
+            return
+        dlg = PdfExportDialog(self.root, self, names, preselect=name)
+        if not dlg.result:
+            return
+        feed, source, days = dlg.result
+
+        # The header reports the first and last TRANSMISSION, not the day range:
+        # exporting a whole day whose traffic ran 10:38-11:05 should say so.
+        # Logs only store the time, so entries carry the day from the filename.
+        if source == "session":
+            # history rows are (name, color, text, ts, unit, clip_id); the PDF
+            # wants the same "[HH:MM:SS] text" shape the disk logs use.
+            today = _dt.datetime.now().strftime("%Y%m%d")
+            entries = [(today, ts, text)
+                       for nm, _c, text, ts, _u, _cl in self.history if nm == feed]
+        else:
+            entries = core.read_log_entries(
+                [(d, p) for d, p in core.log_files_for(feed) if d in days])
+        lines = [f"[{ts}] {text}" for _d, ts, text in entries]
+        span = core.format_transcript_span(*core.transcript_span(entries))
+        count = f"{len(lines)} transmission{'s' if len(lines) != 1 else ''}"
+        subtitle = f"{span}  ·  {count}" if span else count
+        if not lines:
+            messagebox.showinfo("Save as PDF",
+                                f"No transcript lines for “{feed}”.",
+                                parent=self.root)
+            return
+
+        default = f"{core.safe_filename(feed)}-transcript.pdf"
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title=f"Save “{feed}” transcript as PDF",
+            defaultextension=".pdf", initialfile=default,
+            filetypes=[("PDF document", "*.pdf"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            pages = core.write_transcript_pdf(path, feed, lines, subtitle=subtitle)
+        except Exception as e:
+            messagebox.showerror("PDF export failed", str(e))
+            return
+        self._set_status(f"Saved {len(lines)} lines to "
+                         f"{os.path.basename(path)} ({pages} page"
+                         f"{'s' if pages != 1 else ''})")
+
     # ----- UI construction -------------------------------------------------
     def _build_menu(self):
         m = tk.Menu(self.root)
         streams_menu = tk.Menu(m, tearoff=0)
         streams_menu.add_command(label="Feeds...", command=self._open_library)
         streams_menu.add_command(label="Broadcastify login...", command=self._open_login)
+        streams_menu.add_separator()
+        streams_menu.add_command(label="Export feed list...", command=self._export_feeds)
+        streams_menu.add_command(label="Import feed list...", command=self._import_feeds)
+        streams_menu.add_separator()
+        streams_menu.add_command(label="Open a past day...",
+                                 command=self._open_past_day)
+        streams_menu.add_command(label="Open transcript file...",
+                                 command=self._open_bundle)
+        streams_menu.add_command(label="Save whole day as transcript file...",
+                                 command=self._export_day_bundle)
+        streams_menu.add_command(label="Audio recording...",
+                                 command=self._open_clip_settings)
+        streams_menu.add_command(label="Retention...",
+                                 command=self._open_retention)
+        streams_menu.add_command(label="Export selected audio as MP3...",
+                                 command=self._export_selected_mp3)
+        streams_menu.add_command(label="Save transcript as PDF...",
+                                 command=self._export_pdf)
         streams_menu.add_separator()
         streams_menu.add_command(label="Save config", command=self._save_cfg)
         m.add_cascade(label="Streams", menu=streams_menu)
@@ -1494,11 +3069,23 @@ class TranscriberGUI:
                             "follow just that unit)", bg=BG2, fg=MUTED).pack(side="left", padx=8)
 
         # Model picker (right side). Switching reloads Whisper live.
-        self.model_combo = ttk.Combobox(bar2, textvariable=self.model_var,
-                                        values=MODEL_CHOICES, state="readonly", width=16)
+        self.model_combo = ttk.Combobox(
+            bar2, textvariable=self.model_var,
+            values=model_choices(self.cfg, self.model_var.get()),
+            state="readonly", width=16)
         self.model_combo.pack(side="right", padx=6, pady=3)
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
         tk.Label(bar2, text="Model:", bg=BG2, fg=MUTED).pack(side="right")
+
+        # Device picker -- faster-whisper/x64 path only. On the whisper.cpp/ARM
+        # backend the device is always CPU/NPU, so don't show a control for it.
+        self.device_combo = None
+        if core.select_backend(self.cfg) != "whispercpp":
+            self.device_combo = ttk.Combobox(bar2, textvariable=self.device_var,
+                                             values=DEVICE_CHOICES, state="readonly", width=6)
+            self.device_combo.pack(side="right", padx=6, pady=3)
+            self.device_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+            tk.Label(bar2, text="Device:", bg=BG2, fg=MUTED).pack(side="right")
 
         self.update_btn = tk.Button(bar2, text="Check updates",
                                     command=self._check_updates_manual,
@@ -1518,40 +3105,250 @@ class TranscriberGUI:
         for w in self.body.winfo_children():
             w.destroy()
         self.sector_panels.clear()
+        # Link tags belong to the widgets being destroyed; the replay re-creates
+        # them, so clearing here keeps this from growing all session.
+        self._link_targets.clear()
+
+        # Reviewing a past day takes over the body entirely: one feed, one day,
+        # read-only. Every rebuild path (view toggle, font change, feed edit)
+        # comes through here, so the past view survives all of them until the
+        # user clicks "Back to live".
+        if self.past_day:
+            self._build_past_view()
+            return
 
         active = self._enabled_streams()
         if self.view_mode.get() == "unified":
             self.unified = self._make_text(self.body)
             self.unified.pack(fill="both", expand=True, padx=6, pady=6)
             # Color tags are configured lazily per line in _render_line.
+            self._bind_transcript_menu(self.unified)
         else:
-            panels = active or [{"name": "(no active streams)", "color": "grey"}]
-            self._sector_headers = []   # (frame, stream_name, hdr) for drag hit-test
-            for i, s in enumerate(panels):
+            groups = self._active_groups() or ["(no active streams)"]
+            self._sector_headers = []   # (frame, group_key, hdr) for drag hit-test
+            # Feeds drawn in a shared column get a per-line channel tag, or you
+            # couldn't tell Tower from Ground.
+            self._grouped_feeds = set()
+            for i, g in enumerate(groups):
+                members = self._group_members(g)
                 col = tk.Frame(self.body, bg=BG)
                 col.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
                 self.body.grid_columnconfigure(i, weight=1)
                 self.body.grid_rowconfigure(0, weight=1)
-                hdr = tk.Label(col, text=("⠿ " + s["name"]), bg=BG2,
-                               fg=COLOR_HEX.get(s.get("color", "white"), FG),
+                # A single-feed column keeps that feed's colour; a shared column
+                # is neutral, since its lines carry their own colours.
+                head_fg = (COLOR_HEX.get(members[0].get("color", "white"), FG)
+                           if len(members) == 1 else FG)
+                title = g if len(members) <= 1 else f"{g}  ({len(members)})"
+                hdr = tk.Label(col, text=("⠿ " + title), bg=BG2, fg=head_fg,
                                font=("Segoe UI", 10, "bold"), cursor="fleur")
                 hdr.pack(side="top", fill="x")
                 txt = self._make_text(col)
                 txt.pack(fill="both", expand=True)
                 if active:
-                    self.sector_panels[s["name"]] = txt
-                    self._sector_headers.append((col, s["name"], hdr))
+                    for m in members:
+                        self.sector_panels[m["name"]] = txt
+                    if len(members) > 1:
+                        self._grouped_feeds.update(m["name"] for m in members)
+                    self._sector_headers.append((col, g, hdr))
                     # Drag the header to reorder columns.
                     hdr.bind("<ButtonPress-1>",
-                             lambda e, n=s["name"], c=s.get("color", "white"):
+                             lambda e, n=g, c=(members[0].get("color", "white")
+                                               if members else "white"):
                              self._drag_start(n, c, e))
                     hdr.bind("<B1-Motion>", self._drag_motion)
                     hdr.bind("<ButtonRelease-1>", self._drag_drop)
                     # Right-click for the sector context menu.
-                    hdr.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
-                    txt.bind("<Button-3>", lambda e, n=s["name"]: self._sector_menu(e, n))
+                    hdr.bind("<Button-3>", lambda e, n=g: self._sector_menu(e, n))
+                    txt.bind("<Button-3>", lambda e, n=g: self._sector_menu(e, n))
+                else:
+                    self._bind_transcript_menu(txt)
 
         self._replay_history()
+
+    def _bind_transcript_menu(self, widget):
+        """Right-click menu for a transcript pane that has no sector menu of its
+        own (unified view, and the past-day view)."""
+        widget.bind("<Button-3>", lambda e, w=widget: self._transcript_menu(e, w))
+
+    # ----- whole-row selection in transcript panes ---------------------------
+    # Transmissions are the unit here: a line either goes in the MP3 or it
+    # doesn't, so Tk's default character-level drag (which happily selects half a
+    # sentence) only invites confusion. These bindings snap selection to whole
+    # lines -- click takes a row, drag extends by rows, shift-click extends from
+    # the last anchor -- and return "break" so the default Text behaviour, which
+    # lives in the class bindings, never runs.
+    @staticmethod
+    def _line_no(index):
+        try:
+            return int(str(index).split(".")[0])
+        except ValueError:
+            return 1
+
+    def _select_rows(self, widget, a, b):
+        """Select every whole line between two indices, in either drag direction."""
+        lo, hi = sorted((self._line_no(a), self._line_no(b)))
+        widget.tag_remove("sel", "1.0", "end")
+        widget.tag_add("sel", f"{lo}.0", f"{hi}.0 lineend")
+
+    def _click_targets(self, widget, index):
+        """Dispatch a click on the interactive spans of a line.
+
+        A widget-level <Button-1> preempts Text TAG bindings entirely (verified:
+        with the widget handler returning "break", tag_bind handlers never fire).
+        Since row-selection needs that binding, the clickable spans -- the 🔊
+        marker, address map-links, and unit labels -- are dispatched here instead
+        of relying on their tag_bind. Their <Enter>/<Leave> cursor bindings are
+        untouched and still work."""
+        for tag in widget.tag_names(index):
+            if tag.startswith("clip:"):
+                self._play_clip(tag[len("clip:"):])
+                return True
+            if tag.startswith("addr:") and tag in self._link_targets:
+                kind, value, location = self._link_targets[tag]
+                if kind == "air":
+                    self._open_url(core.aircraft_url(value))
+                else:
+                    self._open_map(value, location)
+                return True
+            if tag.startswith("u:") and self.color_mode.get() == "unit":
+                self.set_unit_filter(tag[len("u:"):])
+                return True
+        return False
+
+    def _row_press(self, event, widget):
+        idx = widget.index(f"@{event.x},{event.y}")
+        # Acting on a link/marker shouldn't also move the selection -- and a unit
+        # filter rebuilds the view, so the widget may be gone after this.
+        if self._click_targets(widget, idx):
+            return "break"
+        widget._row_anchor = idx
+        self._select_rows(widget, idx, idx)
+        widget.focus_set()
+        return "break"
+
+    def _row_motion(self, event, widget):
+        anchor = getattr(widget, "_row_anchor", None)
+        if anchor is None:
+            return "break"
+        # Dragging past the top or bottom edge scrolls, so a selection can run
+        # beyond one screenful.
+        if event.y < 0:
+            widget.yview_scroll(-1, "units")
+        elif event.y > widget.winfo_height():
+            widget.yview_scroll(1, "units")
+        self._select_rows(widget, anchor,
+                          widget.index(f"@{event.x},{event.y}"))
+        return "break"
+
+    def _row_shift_press(self, event, widget):
+        """Shift-click extends the selection to the clicked row."""
+        anchor = getattr(widget, "_row_anchor", None)
+        idx = widget.index(f"@{event.x},{event.y}")
+        self._select_rows(widget, anchor or idx, idx)
+        widget.focus_set()
+        return "break"
+
+    def _bind_row_selection(self, widget):
+        widget.bind("<Button-1>", lambda e, w=widget: self._row_press(e, w))
+        widget.bind("<B1-Motion>", lambda e, w=widget: self._row_motion(e, w))
+        widget.bind("<Shift-Button-1>",
+                    lambda e, w=widget: self._row_shift_press(e, w))
+        # Double/triple click would otherwise fall through to the class bindings
+        # and re-introduce word/character selection.
+        widget.bind("<Double-Button-1>", lambda e, w=widget: self._row_press(e, w))
+        widget.bind("<Triple-Button-1>", lambda e, w=widget: self._row_press(e, w))
+
+    def _add_export_items(self, menu, widget):
+        """The clip-export entries, shared by every transcript right-click menu
+        (unified, past-day, and each sector column) so they can't drift apart."""
+        n = len(self._selected_clip_ids())
+        label = (f"Export selected audio as MP3 ({n} clip"
+                 f"{'s' if n != 1 else ''})…") if n else \
+                "Export selected audio as MP3…"
+        menu.add_command(label=label, command=self._export_selected_mp3,
+                         state="normal" if n else "disabled")
+        # Rows, not clips: a transcript file keeps lines that have no audio too.
+        rows = len(self._selected_rows())
+        menu.add_command(
+            label=(f"Save selected as transcript file ({rows} line"
+                   f"{'s' if rows != 1 else ''})…") if rows else
+                  "Save selected as transcript file…",
+            command=self._export_selected_bundle,
+            state="normal" if rows else "disabled")
+        if widget is not None:
+            menu.add_command(label="Select all", command=lambda w=widget: (
+                w.tag_add("sel", "1.0", "end"), w.focus_set()))
+
+    def _transcript_menu(self, event, widget):
+        menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
+                       activebackground="#3a3d44", activeforeground=FG)
+        self._add_export_items(menu, widget)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_past_view(self):
+        """The read-only transcript of one past day, with a banner back to live."""
+        feed, day = self.past_day
+        rows = self._past_rows
+        n_clips = sum(1 for r in rows if r[2])
+
+        bar = tk.Frame(self.body, bg="#3a3320")     # amber: not live
+        bar.pack(side="top", fill="x")
+        if self.bundle is not None:
+            audio = f"{n_clips} with audio"
+            what = f"  Transcript file: {self._bundle_name} — {feed}"
+        else:
+            audio = (f"{n_clips} with audio" if n_clips else
+                     "no audio kept for this day")
+            what = f"  Viewing {_fmt_day(day)} — {feed}"
+        tk.Label(bar, text=f"{what}   ({len(rows)} lines, {audio})",
+                 bg="#3a3320", fg="#f0d79a", anchor="w",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", pady=4)
+        tk.Button(bar, text="Back to live", command=self._exit_past_day,
+                  bg=BG2, fg=FG, relief="flat").pack(side="right", padx=6, pady=3)
+
+        # Transport: play the recorded audio, or have the voice read the text.
+        # Only meaningful while reviewing, so it lives on this bar.
+        tp = tk.Frame(self.body, bg=BG2)
+        tp.pack(side="top", fill="x")
+        b_audio = tk.Button(tp, text="▶ Play audio",
+                            command=lambda: self._pb_start("audio"),
+                            bg=BG2, fg=FG, relief="flat")
+        b_audio.pack(side="left", padx=(8, 2), pady=3)
+        b_tts = tk.Button(tp, text="🗣 Read aloud",
+                          command=lambda: self._pb_start("tts"),
+                          bg=BG2, fg=FG, relief="flat")
+        b_tts.pack(side="left", padx=2, pady=3)
+        b_pause = tk.Button(tp, text="⏸ Pause", command=self._pb_pause,
+                            bg=BG2, fg=FG, relief="flat", state="disabled")
+        b_pause.pack(side="left", padx=2, pady=3)
+        tk.Button(tp, text="⏹ Stop", command=self._pb_stop,
+                  bg=BG2, fg=FG, relief="flat").pack(side="left", padx=2, pady=3)
+        pos = tk.Label(tp, text="", bg=BG2, fg=MUTED)
+        pos.pack(side="left", padx=10)
+        tk.Label(tp, text="Select a line first to start there.",
+                 bg=BG2, fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
+        self._pb_widgets = {"audio": b_audio, "tts": b_tts, "pause": b_pause,
+                            "pos": pos}
+        self._pb_update_controls()
+
+        txt = self._make_text(self.body)
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+        self.unified = txt                     # so font resizing still applies
+        self._bind_transcript_menu(txt)         # select + export works here too
+        color = (self._lib_find(feed) or {}).get("color", "white")
+        txt.configure(state="normal")
+        txt.tag_config("ts", foreground=MUTED)
+        for ts, text, clip_id in rows:
+            txt.insert("end", f"[{ts}] ", ("ts",))
+            if clip_id:
+                self._insert_clip_marker(txt, clip_id)
+            self._insert_message_text(txt, feed, text, ())
+        txt.configure(state="disabled")
+        txt.see("1.0")                          # start at the top of the day
 
     def _make_text(self, parent):
         frame = tk.Frame(parent, bg=BG)
@@ -1562,6 +3359,8 @@ class TranscriberGUI:
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
+        # Every transcript pane selects by whole rows (unified, sectors, past).
+        self._bind_row_selection(txt)
         # Return a thin wrapper that .pack/.grid forwards to the frame.
         txt.frame = frame
         txt.pack = frame.pack
@@ -1576,18 +3375,39 @@ class TranscriberGUI:
             self._save_cfg()
 
     # ----- sector right-click menu ----------------------------------------
-    def _sector_menu(self, event, name):
-        s = self._find(name)
-        if not s:
+    def _sector_menu(self, event, group):
+        """Right-click on a column. `group` is the column key, which may stand
+        for several feeds -- so feed-specific actions become submenus."""
+        members = self._group_members(group)
+        if not members:
             return
         menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
                        activebackground="#3a3d44", activeforeground=FG)
-        if s.get("type") == "pcaudio":
-            menu.add_command(label="Change audio source…",
-                             command=lambda n=name: self._change_audio_source(n))
-            menu.add_separator()
-        menu.add_command(label=f"Remove “{name}”",
-                         command=lambda n=name: self._remove_one(n))
+        # Sectors is the default view, so this menu -- not _transcript_menu --
+        # is what most right-clicks on a transcript actually hit. It carries the
+        # clip export too, or the feature would be invisible where it's used most.
+        self._add_export_items(menu, self.sector_panels.get(members[0]["name"]))
+        menu.add_separator()
+
+        def _sub(label, action, only=None):
+            """One entry per feed when the column is shared, else a plain item."""
+            eligible = [m for m in members if only is None or only(m)]
+            if not eligible:
+                return
+            if len(members) == 1:
+                menu.add_command(label=f"{label} “{eligible[0]['name']}”",
+                                 command=lambda n=eligible[0]["name"]: action(n))
+                return
+            sub = tk.Menu(menu, tearoff=0, bg=BG2, fg=FG,
+                          activebackground="#3a3d44", activeforeground=FG)
+            for m in eligible:
+                sub.add_command(label=m["name"],
+                                command=lambda n=m["name"]: action(n))
+            menu.add_cascade(label=f"{label}…", menu=sub)
+
+        _sub("Change audio source", self._change_audio_source,
+             only=lambda m: m.get("type") == "pcaudio")
+        _sub("Remove", self._remove_one)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1689,19 +3509,28 @@ class TranscriberGUI:
             return
         self._reorder_streams(name, target)
 
-    def _reorder_streams(self, name, target_name):
-        """Move stream `name` to the target column's position. Direction-aware:
-        dropping onto a column to the RIGHT lands after it; to the LEFT, before
-        it. So the dragged column ends up exactly where you dropped it."""
-        names = [s["name"] for s in self.streams]
-        if name == target_name or name not in names or target_name not in names:
+    def _reorder_streams(self, group, target_group):
+        """Move a whole COLUMN to the target column's position. A column may hold
+        several feeds (a group), and they move together keeping their relative
+        order -- otherwise dragging a grouped column would split it apart.
+        Direction-aware: dropping onto a column to the RIGHT lands after it; to
+        the LEFT, before it."""
+        if group == target_group:
             return
-        src = names.index(name)
-        dragging_right = src < names.index(target_name)
-        moving = self.streams.pop(src)
-        # Recompute the target's index in the now-shortened list.
-        t = next(i for i, s in enumerate(self.streams) if s["name"] == target_name)
-        self.streams.insert(t + 1 if dragging_right else t, moving)
+        moving = [s for s in self.streams if self._feed_group(s) == group]
+        rest = [s for s in self.streams if self._feed_group(s) != group]
+        if not moving:
+            return
+        positions = [i for i, s in enumerate(rest)
+                     if self._feed_group(s) == target_group]
+        if not positions:
+            return
+        first_src = next(i for i, s in enumerate(self.streams)
+                         if self._feed_group(s) == group)
+        first_tgt = next(i for i, s in enumerate(self.streams)
+                         if self._feed_group(s) == target_group)
+        at = positions[-1] + 1 if first_src < first_tgt else positions[0]
+        self.streams = rest[:at] + moving + rest[at:]
         self._save_cfg()
         self._rebuild_body()
 
@@ -1710,7 +3539,8 @@ class TranscriberGUI:
         try:
             self.engine = core.Engine(
                 self.cfg,
-                on_line=lambda n, c, t, ts: self.events.put(("line", (n, c, t, ts))),
+                on_line=lambda n, c, t, ts, clip=None: self.events.put(
+                    ("line", (n, c, t, ts, clip))),
                 on_status=lambda m: self.events.put(("status", m)),
                 console=False, file_logging=True, enable_audio=True,
             )
@@ -1736,8 +3566,18 @@ class TranscriberGUI:
                     self._append_line(*payload)
                 elif kind == "status":
                     self._set_status(payload)
+                elif kind == "mp3_done":
+                    self._handle_mp3_done(*payload)
+                elif kind == "bundle_done":
+                    self._handle_bundle_done(*payload)
                 elif kind == "ready":
-                    self._set_status("Model ready. Listening.")
+                    n, n_clips = getattr(self, "_restored", (0, 0))
+                    if n:
+                        extra = f", {n_clips} with audio" if n_clips else ""
+                        self._set_status(f"Model ready. Listening. "
+                                         f"(Restored {n} line(s) from today{extra}.)")
+                    else:
+                        self._set_status("Model ready. Listening.")
                     self._refresh_listen_choices()
                     self._dismiss_splash()
                     self.root.after(400, self._maybe_prompt_login)
@@ -1749,6 +3589,11 @@ class TranscriberGUI:
                     else:
                         # Revert the dropdown to whatever is actually loaded.
                         self.model_var.set(self.engine.cfg.get("model", "large-v3"))
+                    self._set_status(msg)
+                elif kind == "device_done":
+                    ok, msg, label = payload
+                    if self.device_combo is not None:
+                        self.device_combo.config(state="readonly")
                     self._set_status(msg)
                 elif kind == "update_result":
                     results, manual = payload
@@ -1784,13 +3629,28 @@ class TranscriberGUI:
         """A line is shown if no unit filter is active or its unit matches."""
         return self.filter_unit is None or unit == self.filter_unit
 
-    def _append_line(self, name, color, text, ts):
+    def _feed_profile(self, name):
+        """The service profile for a feed by name. Reviewing a bundle or past day
+        has no live stream dict, so it falls back to the default profile."""
+        return core.service_profile(self._find(name) or self._lib_find(name) or {},
+                                    self.cfg)
+
+    def _append_line(self, name, color, text, ts, clip_id=None):
         # Compute the call sign ONCE here so coloring is consistent on replay.
-        unit = core.extract_callsign(text, self.extra_prefixes)
+        # Which SHAPE of call sign depends on the feed: an ATC feed wants
+        # "DELTA 510", not the police unit prefixes.
+        unit = core.extract_callsign(text, self.extra_prefixes,
+                                     style=self._feed_profile(name)["callsigns"])
         # Always record to history (filter affects display only, not the record).
-        self.history.append((name, color, text, ts, unit))
+        self.history.append((name, color, text, ts, unit, clip_id))
+        # While reviewing a past day the body belongs to that day -- keep
+        # recording, but don't scribble live traffic into it. History replays on
+        # the way back, so nothing is lost.
+        if self.past_day:
+            return
         if self._passes_filter(unit):
-            self._render_line(name, color, text, ts, unit, autoscroll=True)
+            self._render_line(name, color, text, ts, unit, autoscroll=True,
+                              clip_id=clip_id)
 
     def _line_fg(self, stream_color, unit):
         """Resolve the foreground color for a line per the current color mode."""
@@ -1857,9 +3717,14 @@ class TranscriberGUI:
         return self.cfg.get("default_location") or None
 
     def _open_map(self, query, location):
+        self._open_url(core.maps_url(query, location))
+
+    def _open_url(self, url):
         import webbrowser
+        if not url:
+            return
         try:
-            webbrowser.open(core.maps_url(query, location))
+            webbrowser.open(url)
         except Exception:
             pass
 
@@ -1867,7 +3732,18 @@ class TranscriberGUI:
         """Insert the message body into `widget`, turning detected addresses into
         clickable Google-Maps links. `base_tags` are applied to normal text; each
         address also gets a unique clickable link tag."""
-        addrs = core.extract_addresses(text)
+        # Which spans are linkable depends on the feed's service: street
+        # addresses are meaningless on ATC (a tail number would otherwise become
+        # a map link), and aircraft only exist there.
+        profile = self._feed_profile(name)
+        addrs = []
+        if profile["address_links"]:
+            addrs += [(span, ("map", query))
+                      for span, query in core.extract_addresses(text)]
+        if profile["aircraft_links"]:
+            addrs += [(span, ("air", ident))
+                      for span, ident, _label in core.extract_aircraft(text)]
+            addrs.sort(key=lambda a: text.find(a[0]))
         if not addrs:
             widget.insert("end", f"  {text}\n", base_tags)
             return
@@ -1880,14 +3756,20 @@ class TranscriberGUI:
                 continue
             if i > pos:
                 widget.insert("end", text[pos:i], base_tags)
-            # Unique tag per link so each opens its own address.
+            # Unique tag per link so each opens its own target. The target is
+            # also kept by tag name: row-selection owns <Button-1> on the widget,
+            # which preempts tag bindings, so the click is dispatched from there
+            # and needs to look it up rather than close over it.
+            kind, value = query
             self._link_seq = getattr(self, "_link_seq", 0) + 1
             tag = f"addr:{self._link_seq}"
-            widget.tag_config(tag, foreground=LINK_FG, underline=True)
+            self._link_targets[tag] = (kind, value, location)
+            # Aircraft get their own colour so the two kinds of link stay
+            # distinguishable at a glance.
+            widget.tag_config(tag, underline=True,
+                              foreground=AIRCRAFT_FG if kind == "air" else LINK_FG)
             widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
             widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
-            widget.tag_bind(tag, "<Button-1>",
-                            lambda e, q=query, loc=location: self._open_map(q, loc))
             widget.insert("end", span, base_tags + (tag,))
             pos = i + len(span)
         if pos < len(text):
@@ -1907,7 +3789,30 @@ class TranscriberGUI:
         except Exception:
             return True
 
-    def _render_line(self, name, color, text, ts, unit=None, autoscroll=True):
+    def _play_clip(self, clip_id):
+        """Click handler for a line's 🔊 marker: hear that transmission."""
+        if not self.engine:
+            return
+        if not self.engine.audio_available():
+            self._set_status("No audio device available for playback.")
+            return
+        # An open bundle plays its own audio, straight out of the archive.
+        if self.engine.play_clip(clip_id, source=self.bundle):
+            self._set_status("Playing saved audio for that line…")
+
+    def _insert_clip_marker(self, widget, clip_id):
+        """Prefix a line with a clickable 🔊. One tag per clip id, so a tag that
+        already exists (the same line redrawn on a view switch) just rebinds."""
+        tag = f"clip:{clip_id}"
+        widget.tag_config(tag, foreground=CLIP_FG)
+        widget.tag_bind(tag, "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
+        widget.tag_bind(tag, "<Leave>", lambda e, w=widget: w.config(cursor=""))
+        widget.tag_bind(tag, "<Button-1>",
+                        lambda e, c=clip_id: self._play_clip(c))
+        widget.insert("end", "🔊 ", (tag,))
+
+    def _render_line(self, name, color, text, ts, unit=None, autoscroll=True,
+                     clip_id=None):
         """
         Draw a single transcript line into the active view (no history write).
 
@@ -1935,6 +3840,8 @@ class TranscriberGUI:
                 self._bind_unit_click(t, label_tag, unit)
             t.configure(state="normal")
             t.insert("end", f"[{ts}] ", ("ts",))
+            if clip_id:
+                self._insert_clip_marker(t, clip_id)
             t.insert("end", f"{label:<16}", (label_tag,))
             self._insert_message_text(t, name, text, text_tag)
             if autoscroll and stick:
@@ -1951,14 +3858,20 @@ class TranscriberGUI:
                 if clickable:
                     self._bind_unit_click(t, label_tag, unit)
                 t.configure(state="normal")
-                # In unit mode, prefix the line with the clickable unit label.
+                t.insert("end", f"[{ts}] ", ("ts2",))
+                if clip_id:
+                    self._insert_clip_marker(t, clip_id)
+                # A shared column carries several feeds, so name the channel --
+                # in the feed's own colour, which is what distinguishes Tower
+                # from Ground at a glance.
+                if name in getattr(self, "_grouped_feeds", ()):
+                    chan = f"chan:{name}"
+                    t.tag_config(chan, foreground=COLOR_HEX.get(color, FG))
+                    t.insert("end", f"{name:<14}", (chan,))
+                # In unit mode, also prefix the clickable unit label.
                 if clickable:
-                    t.insert("end", f"[{ts}] ", ("ts2",))
                     t.insert("end", f"{unit}", (label_tag,))
-                    self._insert_message_text(t, name, text, text_tag)
-                else:
-                    t.insert("end", f"[{ts}] ", ("ts2",))
-                    self._insert_message_text(t, name, text, text_tag)
+                self._insert_message_text(t, name, text, text_tag)
                 if autoscroll and stick:
                     t.see("end")
                 t.configure(state="disabled")
@@ -1967,12 +3880,13 @@ class TranscriberGUI:
         """Re-draw retained lines after the body is rebuilt. Disabled feeds'
         panels don't exist in sectors view, so those lines are simply skipped."""
         active = {s["name"] for s in self._enabled_streams()}
-        for name, color, text, ts, unit in self.history:
+        for name, color, text, ts, unit, clip_id in self.history:
             if self.view_mode.get() == "sectors" and name not in active:
                 continue
             if not self._passes_filter(unit):
                 continue
-            self._render_line(name, color, text, ts, unit, autoscroll=False)
+            self._render_line(name, color, text, ts, unit, autoscroll=False,
+                              clip_id=clip_id)
         # Snap each visible panel to the bottom once at the end.
         if self.view_mode.get() == "unified":
             self.unified.see("end")
@@ -2041,6 +3955,36 @@ class TranscriberGUI:
 
     def _enabled_streams(self):
         return [s for s in self.streams if core.is_enabled(s)]
+
+    # ----- feed groups (several feeds sharing one column) --------------------
+    # ATC splits an airport across Tower / Ground / Approach / Clearance, each
+    # of them silent much of the time. Grouping puts them in ONE column, tagged
+    # per channel, instead of four mostly-empty ones. Purely a display concern:
+    # every feed still has its own worker, log, clips and export.
+    @staticmethod
+    def _feed_group(stream):
+        """The column a feed belongs to. Ungrouped feeds are their own column."""
+        return (stream.get("group") or "").strip() or stream.get("name", "")
+
+    def _group_members(self, group):
+        return [s for s in self._enabled_streams()
+                if self._feed_group(s) == group]
+
+    def _active_groups(self):
+        """Column keys in stream order, de-duplicated."""
+        out, seen = [], set()
+        for s in self._enabled_streams():
+            g = self._feed_group(s)
+            if g not in seen:
+                seen.add(g)
+                out.append(g)
+        return out
+
+    def _known_groups(self):
+        """Every group name in use, for the picker in the feed dialog."""
+        names = {(s.get("group") or "").strip()
+                 for s in list(self.streams) + list(self.library)}
+        return sorted(n for n in names if n)
 
     def _do_add(self, stream):
         """Add a feed to the ACTIVE streams (and remember it in the library).
@@ -2148,6 +4092,7 @@ class TranscriberGUI:
         self._save_cfg()
         e = self.engine
         if e:
+            e.set_tts_engine(self.tts_cfg.get("engine", "auto"))  # before voice/enable
             e.set_tts_voice(self.tts_cfg.get("voice"))
             e.set_tts_feeds(self.tts_cfg.get("feeds", []))
             e.set_tts_keywords(self._effective_keywords())   # presets + extras
@@ -2189,12 +4134,31 @@ class TranscriberGUI:
             target=lambda: self.engine.set_model(target, on_done=done),
             daemon=True).start()
 
+    def _on_device_change(self, _evt=None):
+        """Switch the compute device (GPU/CPU/Auto) live. Reloads the model on a
+        bg thread; feeds keep running. Persists the choice to config.json."""
+        label = self.device_var.get()
+        device = _DEVICE_LABEL_TO_CFG.get(label, "auto")
+        self.cfg["device"] = device
+        self._save_cfg()                         # persist the choice
+        if not self.engine:
+            return
+        self.device_combo.config(state="disabled")
+        self._set_status(f"Switching to {label} (reloading model, feeds keep running)...")
+
+        def done(ok, msg):
+            self.events.put(("device_done", (ok, msg, label)))
+
+        threading.Thread(
+            target=lambda: self.engine.set_device(device, on_done=done),
+            daemon=True).start()
+
     # ----- update checks ---------------------------------------------------
     def _run_update_check(self, manual):
         """Background worker: query PyPI, post result to the event queue.
         manual=True -> always show a popup; manual=False -> quiet status only."""
         try:
-            results = core.check_for_updates()
+            results = core.check_for_updates(cfg=self.cfg)
         except Exception as e:
             results = [{"package": "?", "installed": None, "latest": None,
                         "update_available": False, "error": str(e)}]
