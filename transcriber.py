@@ -294,6 +294,34 @@ def _seed_from_example(target, example_name):
             pass
 
 
+# Top-level config blocks a newer version may introduce. An EXISTING config is
+# never overwritten on upgrade -- that's deliberate, so feeds and settings
+# survive -- but it means a release that adds a feature governed by a new block
+# leaves every existing install without it. When 2.0 added clip recording,
+# upgraded installs had no "clips" block at all: recording fell back to
+# defaults (off), the per-feed checkboxes did nothing, and the UI gave no hint
+# why. Absent blocks are filled in below so the feature is merely OFF rather
+# than invisible.
+#
+# Only whole missing keys are added. Existing values are never touched, and this
+# does NOT recurse into a block the user already has -- if they have "clips",
+# clip_settings() merges the per-key defaults at read time anyway.
+CONFIG_DEFAULT_BLOCKS = {
+    "clips": lambda: dict(CLIP_DEFAULTS),
+}
+
+
+def apply_config_defaults(cfg):
+    """Add any top-level blocks this version expects but the file lacks.
+    Returns (cfg, added_keys) -- the caller persists it if anything was added."""
+    added = []
+    for key, make in CONFIG_DEFAULT_BLOCKS.items():
+        if key not in cfg:
+            cfg[key] = make()
+            added.append(key)
+    return cfg, added
+
+
 def load_config(path=CONFIG_PATH):
     # First run of an installed build: seed config + credentials from examples.
     # On native ARM64 prefer config.example.arm.json (small CPU model default) if
@@ -306,7 +334,17 @@ def load_config(path=CONFIG_PATH):
     _seed_from_example(CONFIG_PATH, example)
     _seed_from_example(CREDENTIALS_PATH, "credentials.example.json")
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    cfg, added = apply_config_defaults(cfg)
+    if added:
+        # Write it back so the settings dialogs reflect what's actually in force,
+        # and so the next version can tell "absent" from "set to off".
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except OSError:
+            pass                    # read-only dir: run with the in-memory copy
+    return cfg
 
 
 # Characters illegal in Windows filenames -> stream names can contain any of them.

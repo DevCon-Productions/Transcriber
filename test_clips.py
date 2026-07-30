@@ -294,6 +294,44 @@ def run():
                                                       clips=pstore,
                                                       log_dir=pdir) == [])
 
+    # ---- upgrade path: a config written before clips existed ---------------
+    # 2.0 added clip recording, but an EXISTING config is never overwritten on
+    # upgrade (deliberate -- feeds must survive). That left upgraded installs with
+    # no "clips" block at all: recording fell back to defaults (off), the per-feed
+    # checkboxes did nothing, and nothing in the UI said why. load_config now
+    # fills in absent blocks so the feature is merely OFF, not invisible.
+    updir = os.path.join(d, "upgrade")
+    os.makedirs(updir)
+    old_cfg = os.path.join(updir, "config.json")
+    with open(old_cfg, "w", encoding="utf-8") as f:
+        json.dump({"model": "base.en", "log_retention_days": 14,
+                   "streams": [{"name": "A", "url": "u", "record": True}]}, f)
+    up = core.load_config(old_cfg)
+    results["upgrade_adds_block"] = (up.get("clips") == core.CLIP_DEFAULTS)
+    results["upgrade_persists"] = (
+        "clips" in json.load(open(old_cfg, encoding="utf-8")))
+    # Filling the gap must not silently switch recording ON.
+    results["upgrade_stays_off"] = (up["clips"]["enabled"] is False)
+    results["upgrade_keeps_rest"] = (up["model"] == "base.en"
+                                     and up["streams"][0]["record"] is True)
+    # An existing block is authoritative -- never overwritten or re-defaulted.
+    mine = os.path.join(updir, "mine.json")
+    with open(mine, "w", encoding="utf-8") as f:
+        json.dump({"model": "x", "clips": {"enabled": True, "retention_days": 3}}, f)
+    got = core.load_config(mine)
+    results["upgrade_respects_existing"] = (
+        got["clips"] == {"enabled": True, "retention_days": 3})
+    results["upgrade_no_needless_write"] = (
+        json.load(open(mine, encoding="utf-8"))["clips"]
+        == {"enabled": True, "retention_days": 3})
+    # Per-key defaults still fill in at read time for a partial block.
+    results["upgrade_partial_merged"] = (core.clip_settings(got)["bitrate"]
+                                         == core.CLIP_DEFAULTS["bitrate"])
+    # Idempotent: loading again changes nothing.
+    before = open(old_cfg, encoding="utf-8").read()
+    core.load_config(old_cfg)
+    results["upgrade_idempotent"] = (open(old_cfg, encoding="utf-8").read() == before)
+
     # ---- retention: size cap and the combined policy -----------------------
     import time as _t2
     sdir = os.path.join(d, "sizecap")
