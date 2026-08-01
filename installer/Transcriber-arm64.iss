@@ -3,7 +3,7 @@
 ;   .venv-arm64\Scripts\python.exe -E -m PyInstaller Transcriber-arm64.spec --noconfirm
 ; Then compile this:
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\Transcriber-arm64.iss
-; Output installer:  installer\Output\Transcriber-ARM64-Setup-1.3-arm64.exe
+; Output installer:  installer\Output\Transcriber-ARM64-Setup-2.0.1-arm64.exe
 ;
 ; Distinct from the x64 installer (Transcriber.iss): its OWN AppId (so x64 and ARM
 ; are separate products and either can be installed independently), arm64-only
@@ -12,7 +12,7 @@
 
 #define MyAppName "Transcriber"
 #define MyAppNameFull "Transcriber (ARM64)"
-#define MyAppVersion "2.0-arm64"
+#define MyAppVersion "2.0.1-arm64"
 #define MyAppPublisher "DevCon Productions"
 #define MyAppExeName "Transcriber.exe"
 
