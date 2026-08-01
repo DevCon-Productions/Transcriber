@@ -249,6 +249,13 @@ _user_voices = os.path.join(DATA_DIR, "tts_voices")
 _bundled_voices = os.path.join(HERE, "tts_voices")
 TTS_VOICE_DIR = _user_voices if os.path.isdir(_user_voices) else _bundled_voices
 
+# A complete, realistic browser User-Agent for stream HTTP requests. A bare
+# "Mozilla/5.0" reads as a bot to Cloudflare (which fronts LiveATC), earning a
+# 403; a full UA passes. Used for the ffmpeg stream fetch.
+HTTP_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36")
+
 SAMPLE_RATE = 16000          # Whisper wants 16 kHz mono
 FRAME_MS = 30                # VAD frame size
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
@@ -2900,7 +2907,10 @@ class StreamWorker(threading.Thread):
         cmd = [
             self.ffmpeg,
             "-nostdin", "-loglevel", "error",
-            "-user_agent", "Mozilla/5.0",
+            # Full browser UA, not a bare "Mozilla/5.0": LiveATC (and other
+            # Cloudflare-fronted streams) return 403 Forbidden to the bare/bot
+            # string, which showed up as a feed that "never connects".
+            "-user_agent", HTTP_USER_AGENT,
             "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
         ]
