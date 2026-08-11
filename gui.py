@@ -4269,6 +4269,10 @@ def _show_splash(root):
 
 
 def main():
+    # If the frozen exe was re-invoked as the soundcard isolation worker, run only
+    # that and exit -- BEFORE Tk/COM init (Tk is exactly what makes the ARM soundcard
+    # crash worse, and the worker must not build a GUI). No-op on a normal launch.
+    core._maybe_run_soundcard_worker()
     core.enable_windows_ansi()
     _set_app_user_model_id()
     root = tk.Tk()

@@ -128,6 +128,34 @@ def run():
     r["enabled_by_output_device"] = core.is_enabled(
         {"type": "pcaudio", "output_device": "Speakers"}) is True
 
+    # --- soundcard subprocess isolation (ARM 0xC0000374 containment) ---------
+    # On ARM the enumeration/probe run in a child that OFTEN crashes at teardown
+    # (0xC0000374) AFTER writing its result. The parent MUST trust marked JSON from
+    # stdout regardless of the crash exit code -- guard that so a future "just check
+    # returncode" edit can't silently break ARM. Arch-neutral: subprocess is mocked.
+    import types as _types
+    CRASH = 3221226356          # 0xC0000374 heap corruption
+    good = (CRASH, (core._SCJSON_MARKER + '[["Spk", true]]').encode())
+    _real_run = core.subprocess.run
+    try:
+        core.subprocess.run = lambda *a, **k: _types.SimpleNamespace(
+            returncode=good[0], stdout=good[1], stderr=b"")
+        r["worker_trusts_stdout_despite_crash"] = (
+            core._soundcard_worker_once("list", 0.5, 5) == [["Spk", True]])
+        # Crash BEFORE writing (no marker) -> None -> caller degrades to [].
+        core.subprocess.run = lambda *a, **k: _types.SimpleNamespace(
+            returncode=CRASH, stdout=b"", stderr=b"")
+        r["worker_none_when_no_output"] = (
+            core._soundcard_worker_once("list", 0.5, 5) is None)
+        # Retry across fresh spawns: 1st attempt fails, 2nd succeeds -> data.
+        _seq = [(CRASH, b""), good]
+        core.subprocess.run = lambda *a, **k: _types.SimpleNamespace(
+            returncode=(_p := _seq.pop(0))[0], stdout=_p[1], stderr=b"")
+        r["worker_retries_to_success"] = (
+            core._soundcard_worker("list", attempts=2) == [["Spk", True]])
+    finally:
+        core.subprocess.run = _real_run
+
     # --- per-application capture (type=app) ---------------------------------
     r["proctap_available_bool"] = isinstance(core.proctap_available(), bool)
     apps = core.list_audio_apps()

@@ -3228,6 +3228,9 @@ class DeviceWorker(threading.Thread):
 # that device here.
 # --------------------------------------------------------------------------
 def soundcard_available():
+    # The bare import is SAFE on ARM64 (verified) -- the 0xC0000374 heap crash only
+    # happens when ENUMERATING/recording devices, which on ARM is isolated into a
+    # child process (see _soundcard_worker). So this check stays in-process.
     try:
         import soundcard  # noqa: F401
         return True
@@ -3235,37 +3238,27 @@ def soundcard_available():
         return False
 
 
-_OUTPUT_DEVICES = None          # cached [(name, is_default)]; see warm_audio_devices
+_OUTPUT_DEVICES = None          # cached [(name, is_default)]; populated on first success
+
+# --------------------------------------------------------------------------
+# Subprocess isolation for soundcard device enumeration/probing on ARM64.
+#
+# Enumerating output devices through soundcard (-> WASAPI/COM, cffi ABI mode)
+# heap-corrupts on Windows-on-ARM64 -> 0xC0000374, killing the whole process. It's
+# flaky (heap-state dependent) and happens with OR without Tk (so it's not just the
+# old "Tk inits OLE first" theory). To contain it, on ARM we run the enumeration/
+# probe in a short-lived CHILD process: if the child dies, the parent just gets an
+# empty list and stays alive. x64/dev keep the in-process path unchanged.
+# --------------------------------------------------------------------------
+SOUNDCARD_WORKER_FLAG = "--soundcard-worker"
+_SCJSON_MARKER = "__SCJSON__"   # child prints this + JSON; robust against stray output
 
 
-def warm_audio_devices():
-    """Enumerate output devices ONCE, before any Tk window exists.
-
-    On Windows-on-ARM64, enumerating through soundcard AFTER Tk has started
-    corrupts the heap and kills the process (0xC0000374) -- Tk initialises OLE,
-    and soundcard's COM use conflicts when it initialises second. Doing it first
-    and serving a cache afterwards avoids the collision entirely. It's also just
-    faster: the add/edit dialog no longer re-queries WASAPI every time it opens.
-
-    Call this before creating the root window. Safe to call more than once."""
-    return list_output_devices(force=True)
-
-
-def list_output_devices(force=False):
-    """Return [(name, is_default)] of output devices that can be loopback-captured
-    via soundcard. Empty if soundcard is unavailable. Names are de-duplicated.
-
-    Served from the cache once warmed (see warm_audio_devices) -- so a device
-    plugged in mid-session won't appear until restart, which is the price of not
-    crashing the app on ARM."""
-    global _OUTPUT_DEVICES
-    if _OUTPUT_DEVICES is not None and not force:
-        return list(_OUTPUT_DEVICES)
-    try:
-        import soundcard as sc
-    except Exception:
-        _OUTPUT_DEVICES = []
-        return []
+def _list_output_devices_inproc():
+    """Enumerate output devices via soundcard IN THIS PROCESS -> [(name, is_default)],
+    de-duplicated. On ARM this is the call that can heap-crash; ARM callers reach it
+    only inside the isolated worker child, never in the main process."""
+    import soundcard as sc
     try:
         default_name = sc.default_speaker().name
     except Exception:
@@ -3286,7 +3279,8 @@ def _sc_loopback_mic(name):
 
 
 def probe_output_level(name, seconds=0.5):
-    """RMS level currently coming out of output device `name` (0.0 on failure)."""
+    """RMS level currently coming out of output device `name` (0.0 on failure).
+    In-process soundcard use; on ARM it runs only inside the worker child."""
     try:
         import soundcard as sc, numpy as _np  # noqa
         mic = _sc_loopback_mic(name)
@@ -3299,14 +3293,138 @@ def probe_output_level(name, seconds=0.5):
         return 0.0
 
 
-def probe_output_levels(seconds=0.5):
-    """Probe every output device's current loopback level; loudest first.
-    Returns [(name, rms, is_default)]."""
+def _probe_output_levels_inproc(seconds=0.5):
+    """Probe every output device's loopback level IN THIS PROCESS; loudest first."""
     results = []
-    for name, is_def in list_output_devices():
+    for name, is_def in _list_output_devices_inproc():
         results.append((name, probe_output_level(name, seconds), is_def))
     results.sort(key=lambda r: r[1], reverse=True)
     return results
+
+
+def _run_soundcard_worker(op, seconds=0.5):
+    """CHILD entry point: do ONE soundcard op in isolation, print `marker + JSON`.
+    Uses the in-process path directly and never re-spawns (recursion guard)."""
+    try:
+        if op == "probe":
+            data = _probe_output_levels_inproc(seconds)
+        else:                                   # "list"
+            data = _list_output_devices_inproc()
+    except Exception:
+        data = []
+    sys.stdout.write(_SCJSON_MARKER + json.dumps(data))
+    sys.stdout.flush()
+
+
+def _maybe_run_soundcard_worker():
+    """If launched with SOUNDCARD_WORKER_FLAG, run the worker and exit(0) BEFORE any
+    Tk/COM init. Must be called first thing in every process entry point. No-op
+    (returns) for a normal launch."""
+    argv = sys.argv
+    if SOUNDCARD_WORKER_FLAG not in argv:
+        return
+    i = argv.index(SOUNDCARD_WORKER_FLAG)
+    op = argv[i + 1] if i + 1 < len(argv) else "list"
+    try:
+        seconds = float(argv[i + 2]) if i + 2 < len(argv) else 0.5
+    except ValueError:
+        seconds = 0.5
+    _run_soundcard_worker(op, seconds)
+    sys.exit(0)
+
+
+def _soundcard_worker_once(op, seconds, timeout):
+    """One isolated child run. Returns the parsed JSON list, or None on
+    spawn-failure / timeout / crash-before-writing / garbled output."""
+    if getattr(sys, "frozen", False):
+        # Frozen: sys.executable is the app exe; re-invoke it with the worker flag
+        # (its entry point intercepts the flag before any GUI init).
+        argv = [sys.executable, SOUNDCARD_WORKER_FLAG, op, str(seconds)]
+    else:
+        # Dev: spawn a fresh interpreter running THIS module as __main__.
+        argv = [sys.executable, os.path.abspath(__file__),
+                SOUNDCARD_WORKER_FLAG, op, str(seconds)]
+    try:
+        p = subprocess.run(argv, capture_output=True, timeout=timeout,
+                           **_no_window_kwargs())
+    except Exception:                           # spawn failure / timeout (hung child killed)
+        return None
+    # The child often crashes at teardown with 0xC0000374 (soundcard/cffi cleanup
+    # corrupts the heap on ARM) -- but only AFTER it has written and flushed its result
+    # to stdout. Those bytes are already in the OS pipe; the child's heap corruption
+    # can't touch them. So we trust the marked JSON regardless of the exit code, and
+    # treat only a missing/garbled marker (crash BEFORE writing, or no output) as failure.
+    out = (p.stdout or b"").decode("utf-8", "replace")
+    idx = out.find(_SCJSON_MARKER)
+    if idx < 0:
+        return None
+    try:
+        return json.loads(out[idx + len(_SCJSON_MARKER):])
+    except Exception:
+        return None
+
+
+def _soundcard_worker(op, seconds=0.5, timeout=None, attempts=2):
+    """PARENT: run a soundcard op in a short-lived child so an ARM heap-corruption
+    crash (0xC0000374) costs a device list, not the app. Each spawn is a fresh
+    process with a fresh heap, so a failed attempt is retried (enumeration completes
+    reliably; recording currently never does -> returns None after `attempts`).
+    Returns the parsed JSON list, or None if every attempt failed."""
+    if timeout is None:
+        # probe records `seconds` per device -> allow for several devices.
+        timeout = 30.0 if op == "probe" else 12.0
+    for _ in range(max(1, attempts)):
+        data = _soundcard_worker_once(op, seconds, timeout)
+        if data is not None:
+            return data
+    return None
+
+
+def warm_audio_devices():
+    """Pre-populate the output-device cache (optional; the cache also fills lazily on
+    first use). On ARM this enumerates in an isolated child (see _soundcard_worker),
+    so it can't crash the app. Safe to call more than once."""
+    return list_output_devices(force=True)
+
+
+def list_output_devices(force=False):
+    """Return [(name, is_default)] of output devices that can be loopback-captured via
+    soundcard; [] if soundcard is unavailable. Names are de-duplicated. Cached after
+    the first success -- so a device plugged in mid-session won't appear until a forced
+    refresh/restart, the price of not re-enumerating (which on ARM is the crash-prone
+    path). On ARM the enumeration runs in an isolated child, so a WASAPI/cffi heap crash
+    yields [] instead of killing the app."""
+    global _OUTPUT_DEVICES
+    if _OUTPUT_DEVICES is not None and not force:
+        return list(_OUTPUT_DEVICES)
+    if not soundcard_available():
+        _OUTPUT_DEVICES = []
+        return []
+    if interpreter_is_arm64():
+        data = _soundcard_worker("list")
+        if data is None:                        # child crashed/timed out -> don't cache; allow retry
+            return []
+        devices = [tuple(d) for d in data]
+    else:
+        try:
+            devices = _list_output_devices_inproc()
+        except Exception:
+            return []                           # transient failure -> don't cache
+    _OUTPUT_DEVICES = devices
+    return list(devices)
+
+
+def probe_output_levels(seconds=0.5):
+    """Probe every output device's current loopback level; loudest first.
+    Returns [(name, rms, is_default)]. On ARM the probing (opening a soundcard loopback
+    recorder per device -- the main crash trigger) runs in an isolated child; a crash
+    yields [] and the app stays alive."""
+    if interpreter_is_arm64():
+        data = _soundcard_worker("probe", seconds)
+        if not isinstance(data, list):
+            return []
+        return [tuple(d) for d in data]
+    return _probe_output_levels_inproc(seconds)
 
 
 class LoopbackWorker(threading.Thread):
@@ -3330,6 +3448,17 @@ class LoopbackWorker(threading.Thread):
         self.own_stop.set()
 
     def run(self):
+        # Windows-on-ARM64: soundcard's record() path (WASAPI/cffi) heap-corrupts
+        # (0xC0000374) and would take the whole app down. Device SETUP is safe now
+        # (enumeration is subprocess-isolated, see _soundcard_worker), but live
+        # loopback CAPTURE can't be isolated the same way -- it's a continuous
+        # in-process stream. Fail gracefully with a message instead of crashing,
+        # until capture is isolated (or soundcard is replaced) on ARM.
+        if interpreter_is_arm64():
+            self.out.status(f"[{self.name_}] PC-audio speaker capture isn't supported "
+                            "on Windows-on-ARM yet (it would crash the app); "
+                            "use a URL/stream feed instead.")
+            return
         try:
             import soundcard as sc  # noqa
         except Exception as e:
@@ -4315,6 +4444,9 @@ class Engine:
 # CLI entry point
 # --------------------------------------------------------------------------
 def main():
+    # If this process was spawned as the soundcard isolation worker, do only that
+    # and exit -- before any other init. (The dev-mode child runs this module.)
+    _maybe_run_soundcard_worker()
     enable_windows_ansi()
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_PATH
     cfg = load_config(cfg_path)
