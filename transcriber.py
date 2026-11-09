@@ -2907,6 +2907,16 @@ class SpeechGate:
         return None
 
 
+# Hosts whose audio is fetched in Python and piped to ffmpeg (see StreamWorker).
+_PYTHON_FETCH_HOSTS = ("liveatc.net",)
+
+
+def _uses_python_fetch(url):
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _PYTHON_FETCH_HOSTS)
+
+
 # --------------------------------------------------------------------------
 # Stream worker: ffmpeg URL -> PCM -> SpeechGate -> transcription queue
 # --------------------------------------------------------------------------
@@ -2928,6 +2938,12 @@ class StreamWorker(threading.Thread):
         self.own_stop = threading.Event()  # per-worker stop (dynamic removal)
         self.player = player
         self._proc = None
+        # LiveATC's stream servers (s1-bos.liveatc.net etc.) reset the
+        # connection when ffmpeg's GnuTLS client reads the response (the server
+        # asks for TLS renegotiation; GnuTLS refuses). Python's TLS handles it,
+        # so for those hosts we fetch the bytes ourselves and pipe them into
+        # ffmpeg's stdin for decoding only.
+        self.python_fetch = _uses_python_fetch(self.url)
 
     def _stopping(self):
         return self.stop_evt.is_set() or self.own_stop.is_set()
@@ -2942,6 +2958,8 @@ class StreamWorker(threading.Thread):
                 pass
 
     def _spawn_ffmpeg(self):
+        if self.python_fetch:
+            return self._spawn_piped_ffmpeg()
         cmd = [
             self.ffmpeg,
             "-nostdin", "-loglevel", "error",
@@ -2967,6 +2985,49 @@ class StreamWorker(threading.Thread):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=FRAME_BYTES * 8, **_no_window_kwargs(),
         )
+
+    def _spawn_piped_ffmpeg(self):
+        """ffmpeg decoding from stdin, fed by a Python HTTP fetch thread.
+        When the fetch ends or fails, stdin closes, ffmpeg exits, and run()'s
+        normal reconnect loop takes over."""
+        cmd = [
+            self.ffmpeg, "-loglevel", "error",
+            "-i", "pipe:0",
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ac", "1", "-ar", str(SAMPLE_RATE),
+            "-",
+        ]
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=FRAME_BYTES * 8,
+            **_no_window_kwargs(),
+        )
+        threading.Thread(target=self._pump_http, args=(proc,), daemon=True,
+                         name=f"{self.name_}-fetch").start()
+        return proc
+
+    def _pump_http(self, proc):
+        import urllib.request
+        resp = None
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": HTTP_USER_AGENT})
+            resp = urllib.request.urlopen(req, timeout=15)   # follows the 302
+            while not self._stopping() and proc.poll() is None:
+                data = resp.read(8192)
+                if not data:
+                    break
+                proc.stdin.write(data)
+                proc.stdin.flush()
+        except Exception as e:
+            if not self._stopping():
+                self.out.status(f"[{self.name_}] stream fetch error: {e}")
+        finally:
+            for closer in (getattr(resp, "close", None), proc.stdin.close):
+                try:
+                    if closer:
+                        closer()
+                except Exception:
+                    pass
 
     def run(self):
         backoff = 1.0
